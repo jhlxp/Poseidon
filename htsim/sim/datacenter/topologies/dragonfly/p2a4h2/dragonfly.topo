@@ -1,0 +1,16 @@
+# Dragonfly
+p 2
+a 4
+h 2
+
+Switch_latency_ns 500
+
+# Default - link speed
+Link_speed_global_Gbps 400
+Link_speed_local_Gbps 400
+Link_speed_host_Gbps 400
+
+# Default - link latency
+Link_latency_global_ns 500
+Link_latency_local_ns 25
+Link_latency_host_ns 25

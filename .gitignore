@@ -1,0 +1,81 @@
+# Build products
+build/
+**/build/
+**/build-*/
+*.o
+*.a
+*.bin
+*.tmp
+\#*\#
+*_test
+parse_output
+htsim_*
+oxc_ocs_*_dump
+htsim/sim/datacenter/htsim_*
+htsim/sim/datacenter/oxc_ocs_*_dump
+htsim/sim/lgs/LogGOPSim
+htsim/sim/lgs/txt2bin
+
+# Runtime logs and simulator outputs
+*.dat
+*.log
+*.out
+*.err
+*.cm
+idmap.txt
+logout.dat
+sim_progress.log
+core_*
+htsim/sim/datacenter/core_*
+htsim/sim/datacenter/output_metrics/
+htsim/sim/datacenter/experiments_output*/
+output_metrics/
+paper_plots/
+
+# Test and experiment outputs
+logs/
+tests/log/*
+!tests/log/.gitkeep
+tests/**/output_metrics/
+tests/**/plots/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local editor and OS metadata
+.vscode/
+*:Zone.Identifier
+**/*:Zone.Identifier
+
+# External cloned project used as local reference only
+atlahs/
+
+# Generated or raw test data
+tests/data/decode_*.csv
+tests/data/empirical_pooled_distribution_plot.png
+!tests/data/empirical_pooled_distribution.csv
+
+# Generic generated artifacts
+*.csv
+*.json
+*.png
+*.pdf
+!example_validate.json
+!tests/data/empirical_pooled_distribution.csv
+!tests/data_eplb/empirical_pooled_distribution.csv
+
+# LaTeX build products
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.xdv
+*.synctex.gz
+
+# Generated C++ helper build products
+dc_oxc_lpt_solver/.build/
+
+# Validation traffic matrices
+**/validation/**/*.cm
