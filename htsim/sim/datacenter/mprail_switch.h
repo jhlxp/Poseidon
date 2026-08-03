@@ -35,7 +35,8 @@ public:
 
     void addRoute(int dst, Route* egress, packet_direction direction);
     void addHostRoute(int dst, int flowid, Route* egress);
-    void addFlowRoute(int dst, int flowid, Route* egress, packet_direction direction);
+    void addExplicitRoute(
+            int dst, int flowid, Route* egress, packet_direction direction);
     void addHostPort(int addr, int flowid, PacketSink* transport) override;
 
     void permute_paths(vector<FibEntry*>* routes);
@@ -50,11 +51,11 @@ private:
     uint32_t _hash_salt;
     unordered_map<Packet*, bool> _packets;
 
-    struct FlowFibEntry {
+    struct ExplicitRouteEntry {
         Route* egress = nullptr;
-        packet_direction direction = UP;
+        packet_direction direction = static_cast<packet_direction>(0);
     };
-    unordered_map<int, unordered_map<int, FlowFibEntry>> _flow_routes;
+    unordered_map<uint64_t, ExplicitRouteEntry> _explicit_routes;
 
     static routing_strategy _strategy;
 };

@@ -3,10 +3,12 @@
 #define OXC_DAG_MANAGER_H
 
 #include "eventlist.h"
+#include "mprail_route_spec.h"
 
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -15,12 +17,12 @@ struct OxcDagTask {
     int stage_id = 0;
     int32_t src_rank = -1;
     int32_t dst_rank = -1;
-    int32_t compute_rank = -1;
-    uint64_t bytes = 0;
+    uint64_t transfer_bytes = 0;
     double compute_us = 0.0;
     std::vector<int> predecessor_stages;
+    std::optional<MpRailRouteSpec> route;
 
-    bool has_network() const { return bytes > 0; }
+    bool has_network() const { return transfer_bytes > 0; }
     bool has_compute() const { return compute_us > 0.0; }
 };
 
@@ -30,13 +32,15 @@ struct OxcDagTask {
 class OxcDagManager {
 public:
     using NetworkLauncher = std::function<void(const OxcDagTask&)>;
+    using NetworkValidator = std::function<void(const OxcDagTask&)>;
 
     OxcDagManager(EventList& eventlist, uint32_t node_count);
 
     // One non-comment task per line:
-    // task_id stage_id src_rank dst_rank compute_rank bytes compute_us
-    // [predecessor_stage ... | -]
+    // task_id stage_id | src_rank dst_rank | transfer_bytes compute_us |
+    // predecessor_stage ... | -
     void load_from_file(const std::string& path);
+    void validate_network_tasks(const NetworkValidator& validator) const;
     void set_network_launcher(NetworkLauncher launcher);
     void start();
     void notify_network_task_done(uint32_t task_id);

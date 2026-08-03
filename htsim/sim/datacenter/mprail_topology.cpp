@@ -144,22 +144,23 @@ uint32_t MpRailTopology::select_plane(
     return stable_choice(_cfg.planes, flowid, src, dst, 0x504c414e45ULL);
 }
 
-uint32_t MpRailTopology::select_spine(
-        uint32_t flowid, uint32_t src, uint32_t dst) const {
-    return stable_choice(_cfg.l1_eps_per_plane, flowid, src, dst, 0x5350494e45ULL);
-}
-
-uint32_t MpRailTopology::select_bundle(
-        uint32_t flowid, uint32_t src, uint32_t dst) const {
-    return stable_choice(_cfg.l0_l1_links_per_spine, flowid, src, dst, 0x42554e444c45ULL);
-}
-
 void MpRailTopology::connect_endpoints(
         uint32_t src,
         uint32_t dst,
         UecSrc& uec_src,
         UecSink& uec_snk,
-        simtime_picosec start_time) {
+        simtime_picosec start_time,
+        const MpRailRouteSpec* route) {
+    if (route) {
+        if (route->mode != MpRailRouteMode::EXPLICIT) {
+            throw invalid_argument(
+                    "server_forward must be expanded before connecting MpRail endpoints");
+        }
+        connect_explicit_endpoints(
+                src, dst, uec_src, uec_snk, start_time, *route);
+        return;
+    }
+
     const uint32_t src_server = rank_server(src);
     const uint32_t dst_server = rank_server(dst);
     if (src_server == dst_server) {
@@ -179,7 +180,9 @@ void MpRailTopology::connect_endpoints(
     const uint32_t src_rail = rank_rail(src);
     const uint32_t dst_rail = rank_rail(dst);
     const uint32_t preferred_plane = select_plane(uec_src.flowId(), src, dst);
-    uec_src.setPreferredNicPort(preferred_plane);
+    if (!_cfg.packet_spray) {
+        uec_src.setPreferredNicPort(preferred_plane);
+    }
 
     for (uint32_t plane = 0; plane < _cfg.planes; ++plane) {
         const uint32_t src_l0 = l0_id(src_rail, plane);
@@ -196,39 +199,201 @@ void MpRailTopology::connect_endpoints(
                 src_l0, src, uec_snk.flowId(), plane, uec_src.getPort(plane));
 
         if (src_rail != dst_rail) {
-            const uint32_t fwd_spine = select_spine(uec_src.flowId(), src, dst);
-            const uint32_t fwd_bundle = select_bundle(uec_src.flowId(), src, dst);
-            const uint32_t fwd_l1 = l1_id(plane, fwd_spine);
-            install_l0_flow_up_route(
-                    src_l0, dst, uec_src.flowId(), fwd_l1, fwd_bundle);
-            install_l1_flow_down_route(
-                    fwd_l1, dst, uec_src.flowId(), dst_l0, fwd_bundle);
-
-            const uint32_t rev_spine = select_spine(uec_snk.flowId(), dst, src);
-            const uint32_t rev_bundle = select_bundle(uec_snk.flowId(), dst, src);
-            const uint32_t rev_l1 = l1_id(plane, rev_spine);
-            install_l0_flow_up_route(
-                    dst_l0, src, uec_snk.flowId(), rev_l1, rev_bundle);
-            install_l1_flow_down_route(
-                    rev_l1, src, uec_snk.flowId(), src_l0, rev_bundle);
+            for (uint32_t spine = 0;
+                    spine < _cfg.l1_eps_per_plane; ++spine) {
+                const uint32_t l1 = l1_id(plane, spine);
+                for (uint32_t bundle = 0;
+                        bundle < _cfg.l0_l1_links_per_spine; ++bundle) {
+                    install_l0_ecmp_up_route(src_l0, dst, l1, bundle);
+                    install_l1_ecmp_down_route(l1, dst, dst_l0, bundle);
+                    install_l0_ecmp_up_route(dst_l0, src, l1, bundle);
+                    install_l1_ecmp_down_route(l1, src, src_l0, bundle);
+                }
+            }
         }
     }
+
+    const char* routing_mode = _cfg.packet_spray
+            ? "packet_spray_ecmp" : "flow_ecmp";
 
     if (src_rail == dst_rail) {
         cout << "MPRAIL_FLOW flow=" << uec_src.flowId()
              << " src=" << src << " dst=" << dst
              << " scope=same_rail rail=" << src_rail
-             << " plane=" << preferred_plane << " spine=-1" << endl;
+             << " routing=" << routing_mode
+             << " plane=" << (_cfg.packet_spray ? -1 : static_cast<int>(preferred_plane))
+             << " spine=-1" << endl;
     } else {
         cout << "MPRAIL_FLOW flow=" << uec_src.flowId()
              << " src=" << src << " dst=" << dst
              << " scope=cross_rail src_rail=" << src_rail
              << " dst_rail=" << dst_rail
-             << " plane=" << preferred_plane
-             << " spine=" << select_spine(uec_src.flowId(), src, dst)
-             << " bundle=" << select_bundle(uec_src.flowId(), src, dst)
+             << " routing=" << routing_mode
+             << " plane=" << (_cfg.packet_spray ? -1 : static_cast<int>(preferred_plane))
+             << " ecmp_spines=" << _cfg.l1_eps_per_plane
+             << " ecmp_bundles=" << _cfg.l0_l1_links_per_spine
              << endl;
     }
+}
+
+void MpRailTopology::validate_route_spec(
+        uint32_t src, uint32_t dst, const MpRailRouteSpec& route) const {
+    const uint32_t src_server = rank_server(src);
+    const uint32_t dst_server = rank_server(dst);
+    if (route.mode == MpRailRouteMode::SERVER_FORWARD) {
+        if (src_server == dst_server) {
+            throw invalid_argument(
+                    "server_forward requires logical endpoints on different servers");
+        }
+        if (rank_server(route.src_relay) != src_server) {
+            throw invalid_argument("src_relay is not on the logical source server");
+        }
+        if (rank_server(route.dst_relay) != dst_server) {
+            throw invalid_argument("dst_relay is not on the logical destination server");
+        }
+        return;
+    }
+
+    const vector<MpRailRouteNode>& nodes = route.explicit_nodes;
+    auto require_rank = [&](size_t index, uint32_t expected) {
+        if (nodes.at(index).type != MpRailRouteNodeType::RANK
+                || nodes.at(index).rank != expected
+                || nodes.at(index).egress_bundle.has_value()) {
+            throw invalid_argument("explicit route endpoint rank does not match the flow");
+        }
+    };
+    require_rank(0, src);
+    require_rank(nodes.size() - 1, dst);
+
+    if (src_server == dst_server) {
+        if (nodes.size() != 2) {
+            throw invalid_argument(
+                    "same-server explicit route must contain exactly two rank nodes");
+        }
+        return;
+    }
+
+    const uint32_t src_rail = rank_rail(src);
+    const uint32_t dst_rail = rank_rail(dst);
+    if (src_rail == dst_rail) {
+        if (nodes.size() != 3 || nodes[1].type != MpRailRouteNodeType::L0
+                || nodes[1].rail != src_rail
+                || nodes[1].plane >= _cfg.planes
+                || nodes[1].egress_bundle.has_value()) {
+            throw invalid_argument(
+                    "same-rail explicit route must be rank L0 rank without a bundle");
+        }
+        return;
+    }
+
+    if (nodes.size() != 5
+            || nodes[1].type != MpRailRouteNodeType::L0
+            || nodes[2].type != MpRailRouteNodeType::L1
+            || nodes[3].type != MpRailRouteNodeType::L0) {
+        throw invalid_argument(
+                "cross-rail explicit route must be rank L0 L1 L0 rank");
+    }
+    const MpRailRouteNode& src_l0 = nodes[1];
+    const MpRailRouteNode& l1 = nodes[2];
+    const MpRailRouteNode& dst_l0 = nodes[3];
+    if (src_l0.rail != src_rail || dst_l0.rail != dst_rail) {
+        throw invalid_argument("explicit route L0 rail does not match its endpoint");
+    }
+    if (src_l0.plane >= _cfg.planes || l1.plane >= _cfg.planes
+            || dst_l0.plane >= _cfg.planes
+            || src_l0.plane != l1.plane || l1.plane != dst_l0.plane) {
+        throw invalid_argument("explicit route must remain within one valid plane");
+    }
+    if (l1.spine >= _cfg.l1_eps_per_plane) {
+        throw invalid_argument("explicit route spine is outside the configured range");
+    }
+    if (!src_l0.egress_bundle.has_value()
+            || src_l0.egress_bundle.value() >= _cfg.l0_l1_links_per_spine
+            || !l1.egress_bundle.has_value()
+            || l1.egress_bundle.value() >= _cfg.l0_l1_links_per_spine) {
+        throw invalid_argument(
+                "explicit switch-to-switch hops require valid bundle coordinates");
+    }
+    if (dst_l0.egress_bundle.has_value()) {
+        throw invalid_argument("destination L0 to rank must not specify a bundle");
+    }
+}
+
+void MpRailTopology::connect_explicit_endpoints(
+        uint32_t src,
+        uint32_t dst,
+        UecSrc& uec_src,
+        UecSink& uec_snk,
+        simtime_picosec start_time,
+        const MpRailRouteSpec& route) {
+    validate_route_spec(src, dst, route);
+    const vector<MpRailRouteNode>& nodes = route.explicit_nodes;
+    if (rank_server(src) == rank_server(dst)) {
+        Route* routeout = make_local_route(src, dst, uec_snk.getPort(0));
+        Route* routeback = make_local_route(dst, src, uec_src.getPort(0));
+        routeout->set_reverse(routeback);
+        routeback->set_reverse(routeout);
+        for (uint32_t port = 0; port < _cfg.planes; ++port) {
+            uec_src.connectPort(port, *routeout, *routeback, uec_snk, start_time);
+        }
+        cout << "MPRAIL_EXPLICIT_FLOW flow=" << uec_src.flowId()
+             << " src=" << src << " dst=" << dst
+             << " path=" << mprail_route_spec_to_string(route) << endl;
+        return;
+    }
+
+    const uint32_t plane = nodes[1].plane;
+    const uint32_t src_l0_id = l0_id(rank_rail(src), plane);
+    const uint32_t dst_l0_id = l0_id(rank_rail(dst), plane);
+    Route* routeout = make_initial_route(src, src_l0_id, plane);
+    Route* routeback = make_initial_route(dst, dst_l0_id, plane);
+    routeout->set_reverse(routeback);
+    routeback->set_reverse(routeout);
+    for (uint32_t port = 0; port < _cfg.planes; ++port) {
+        uec_src.connectPort(port, *routeout, *routeback, uec_snk, start_time);
+    }
+    uec_src.setPreferredNicPort(plane);
+
+    install_l0_host_route(
+            dst_l0_id, dst, uec_src.flowId(), plane, uec_snk.getPort(plane));
+    install_l0_host_route(
+            src_l0_id, src, uec_snk.flowId(), plane, uec_src.getPort(plane));
+
+    if (rank_rail(src) != rank_rail(dst)) {
+        const MpRailRouteNode& src_l0 = nodes[1];
+        const MpRailRouteNode& l1_node = nodes[2];
+        const uint32_t l1_switch_id = l1_id(plane, l1_node.spine);
+        MpRailSwitch* src_switch = _l0_switches.at(src_l0_id);
+        MpRailSwitch* spine_switch = _l1_switches.at(l1_switch_id);
+        MpRailSwitch* dst_switch = _l0_switches.at(dst_l0_id);
+
+        Route* forward_up = make_switch_route(
+                l0_name(src_l0.rail, plane), l1_name(plane, l1_node.spine),
+                src_l0.egress_bundle.value(), src_switch, spine_switch);
+        Route* forward_down = make_switch_route(
+                l1_name(plane, l1_node.spine), l0_name(nodes[3].rail, plane),
+                l1_node.egress_bundle.value(), spine_switch, dst_switch);
+        Route* reverse_up = make_switch_route(
+                l0_name(nodes[3].rail, plane), l1_name(plane, l1_node.spine),
+                l1_node.egress_bundle.value(), dst_switch, spine_switch);
+        Route* reverse_down = make_switch_route(
+                l1_name(plane, l1_node.spine), l0_name(src_l0.rail, plane),
+                src_l0.egress_bundle.value(), spine_switch, src_switch);
+
+        install_explicit_route(
+                src_switch, dst, uec_src.flowId(), forward_up, UP);
+        install_explicit_route(
+                spine_switch, dst, uec_src.flowId(), forward_down, DOWN);
+        install_explicit_route(
+                dst_switch, src, uec_snk.flowId(), reverse_up, UP);
+        install_explicit_route(
+                spine_switch, src, uec_snk.flowId(), reverse_down, DOWN);
+    }
+
+    cout << "MPRAIL_EXPLICIT_FLOW flow=" << uec_src.flowId()
+         << " src=" << src << " dst=" << dst
+         << " plane=" << plane
+         << " path=" << mprail_route_spec_to_string(route) << endl;
 }
 
 Route* MpRailTopology::make_initial_route(
@@ -343,15 +508,13 @@ void MpRailTopology::install_l0_host_route(
     _l0_switches.at(l0)->addHostRoute(dst_rank, flowid, route);
 }
 
-void MpRailTopology::install_l0_flow_up_route(
+void MpRailTopology::install_l0_ecmp_up_route(
         uint32_t l0,
         uint32_t dst_rank,
-        int flowid,
         uint32_t l1,
         uint32_t bundle) {
     const string key = "up:" + to_string(l0) + ":" + to_string(l1)
-                       + ":" + to_string(dst_rank) + ":" + to_string(flowid)
-                       + ":" + to_string(bundle);
+                       + ":" + to_string(dst_rank) + ":" + to_string(bundle);
     if (!_installed_routes.insert(key).second) {
         return;
     }
@@ -361,18 +524,16 @@ void MpRailTopology::install_l0_flow_up_route(
     Route* route = make_switch_route(
             l0_name(rail, plane), l1_name(plane, spine), bundle,
             _l0_switches.at(l0), _l1_switches.at(l1));
-    _l0_switches.at(l0)->addFlowRoute(dst_rank, flowid, route, UP);
+    _l0_switches.at(l0)->addRoute(dst_rank, route, UP);
 }
 
-void MpRailTopology::install_l1_flow_down_route(
+void MpRailTopology::install_l1_ecmp_down_route(
         uint32_t l1,
         uint32_t dst_rank,
-        int flowid,
         uint32_t l0,
         uint32_t bundle) {
     const string key = "down:" + to_string(l1) + ":" + to_string(l0)
-                       + ":" + to_string(dst_rank) + ":" + to_string(flowid)
-                       + ":" + to_string(bundle);
+                       + ":" + to_string(dst_rank) + ":" + to_string(bundle);
     if (!_installed_routes.insert(key).second) {
         return;
     }
@@ -382,7 +543,16 @@ void MpRailTopology::install_l1_flow_down_route(
     Route* route = make_switch_route(
             l1_name(plane, spine), l0_name(rail, plane), bundle,
             _l1_switches.at(l1), _l0_switches.at(l0));
-    _l1_switches.at(l1)->addFlowRoute(dst_rank, flowid, route, DOWN);
+    _l1_switches.at(l1)->addRoute(dst_rank, route, DOWN);
+}
+
+void MpRailTopology::install_explicit_route(
+        MpRailSwitch* sw,
+        uint32_t dst_rank,
+        int flowid,
+        Route* route,
+        packet_direction direction) {
+    sw->addExplicitRoute(dst_rank, flowid, route, direction);
 }
 
 string MpRailTopology::host_src_name(uint32_t rank) {

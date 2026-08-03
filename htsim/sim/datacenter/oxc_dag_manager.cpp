@@ -9,11 +9,7 @@
 
 namespace {
 
-int32_t parse_optional_rank(const std::string& value, uint32_t node_count) {
-    if (value == "-" || value == "-1") {
-        return -1;
-    }
-
+int32_t parse_rank(const std::string& value, uint32_t node_count) {
     try {
         size_t consumed = 0;
         const long long rank = std::stoll(value, &consumed);
@@ -25,6 +21,35 @@ int32_t parse_optional_rank(const std::string& value, uint32_t node_count) {
     } catch (const std::exception&) {
         throw std::invalid_argument("invalid rank: " + value);
     }
+}
+
+std::string trim(const std::string& value) {
+    const size_t first = value.find_first_not_of(" \t\r");
+    if (first == std::string::npos) {
+        return "";
+    }
+    const size_t last = value.find_last_not_of(" \t\r");
+    return value.substr(first, last - first + 1);
+}
+
+std::vector<std::string> split_groups(const std::string& line) {
+    std::vector<std::string> groups;
+    std::istringstream input(line);
+    std::string group;
+    while (std::getline(input, group, '|')) {
+        groups.push_back(trim(group));
+    }
+    return groups;
+}
+
+std::vector<std::string> split_words(const std::string& value) {
+    std::vector<std::string> words;
+    std::istringstream input(value);
+    std::string word;
+    while (input >> word) {
+        words.push_back(word);
+    }
+    return words;
 }
 
 }  // namespace
@@ -60,47 +85,69 @@ void OxcDagManager::load_from_file(const std::string& path) {
             continue;
         }
 
-        std::istringstream fields(line.substr(first));
+        const size_t comment = line.find('#', first);
+        const std::string task_line = line.substr(
+                first, comment == std::string::npos ? std::string::npos : comment - first);
+        const std::vector<std::string> groups = split_groups(task_line);
+        if (groups.size() != 4 && groups.size() != 5) {
+            throw std::invalid_argument(
+                    "malformed DAG task at " + path + ":" + std::to_string(line_number)
+                    + ": expected four groups plus an optional route group");
+        }
+
         OxcDagTask task;
         std::string src_rank;
         std::string dst_rank;
-        std::string compute_rank;
-        if (!(fields >> task.id >> task.stage_id >> src_rank >> dst_rank >> compute_rank
-              >> task.bytes >> task.compute_us)) {
+        std::string extra;
+        std::istringstream identity(groups[0]);
+        std::istringstream endpoints(groups[1]);
+        std::istringstream operation(groups[2]);
+        if (!(identity >> task.id >> task.stage_id) || (identity >> extra)
+                || !(endpoints >> src_rank >> dst_rank) || (endpoints >> extra)
+                || !(operation >> task.transfer_bytes >> task.compute_us)
+                || (operation >> extra)) {
             throw std::invalid_argument(
                     "malformed DAG task at " + path + ":" + std::to_string(line_number));
         }
         if (task.id == 0 || tasks_.count(task.id)) {
             throw std::invalid_argument("DAG task IDs must be unique positive values");
         }
-        task.src_rank = parse_optional_rank(src_rank, node_count_);
-        task.dst_rank = parse_optional_rank(dst_rank, node_count_);
-        task.compute_rank = parse_optional_rank(compute_rank, node_count_);
+        task.src_rank = parse_rank(src_rank, node_count_);
+        task.dst_rank = parse_rank(dst_rank, node_count_);
         if (task.compute_us < 0.0) {
             throw std::invalid_argument("DAG compute_us must be non-negative");
         }
         if (task.has_network() == task.has_compute()) {
             throw std::invalid_argument(
-                    "DAG task must contain exactly one of network bytes or compute time");
+                    "DAG task must contain exactly one of transfer_bytes or compute_us");
         }
-        if (task.has_network() && (task.src_rank < 0 || task.dst_rank < 0)) {
-            throw std::invalid_argument("DAG network task requires src_rank and dst_rank");
+        if (task.has_network() && task.src_rank == task.dst_rank) {
+            throw std::invalid_argument(
+                    "DAG network task requires src_rank != dst_rank");
         }
-        if (!task.has_network() && (task.src_rank >= 0 || task.dst_rank >= 0)) {
-            throw std::invalid_argument("DAG compute-only task must use '-' for src_rank and dst_rank");
-        }
-        if (task.has_compute() && task.compute_rank < 0) {
-            throw std::invalid_argument("DAG compute task requires compute_rank");
-        }
-        if (!task.has_compute() && task.compute_rank >= 0) {
-            throw std::invalid_argument("DAG network-only task must use '-' for compute_rank");
+        if (task.has_compute() && task.src_rank != task.dst_rank) {
+            throw std::invalid_argument(
+                    "DAG compute task requires src_rank == dst_rank");
         }
 
         std::set<int> dependencies;
+        bool saw_predecessor = false;
+        bool saw_no_predecessor = false;
+        std::istringstream predecessor_fields(groups[3]);
         std::string dependency;
-        while (fields >> dependency) {
-            if (dependency == "-" || dependency[0] == '#') {
-                break;
+        while (predecessor_fields >> dependency) {
+            saw_predecessor = true;
+            if (dependency == "-") {
+                if (saw_no_predecessor || !dependencies.empty()) {
+                    throw std::invalid_argument(
+                            "DAG '-' predecessor cannot be combined with stage IDs");
+                }
+                saw_no_predecessor = true;
+                continue;
+            }
+            if (saw_no_predecessor) {
+                throw std::invalid_argument(
+                        "DAG '-' predecessor cannot be combined with stage IDs");
             }
             try {
                 size_t consumed = 0;
@@ -118,7 +165,22 @@ void OxcDagManager::load_from_file(const std::string& path) {
                         + std::to_string(line_number));
             }
         }
+        if (!saw_predecessor) {
+            throw std::invalid_argument(
+                    "DAG task requires '-' or at least one predecessor stage");
+        }
         task.predecessor_stages.assign(dependencies.begin(), dependencies.end());
+
+        if (groups.size() == 5) {
+            if (!task.has_network()) {
+                throw std::invalid_argument(
+                        "DAG compute task cannot carry a route at " + path + ":"
+                        + std::to_string(line_number));
+            }
+            task.route = parse_mprail_route_spec(
+                    split_words(groups[4]),
+                    "DAG route at " + path + ":" + std::to_string(line_number));
+        }
         tasks_.emplace(task.id, TaskRecord{std::move(task)});
     }
 
@@ -201,6 +263,18 @@ void OxcDagManager::set_network_launcher(NetworkLauncher launcher) {
     network_launcher_ = std::move(launcher);
 }
 
+void OxcDagManager::validate_network_tasks(
+        const NetworkValidator& validator) const {
+    if (!loaded_) {
+        throw std::logic_error("cannot validate an unloaded DAG");
+    }
+    for (const auto& entry : tasks_) {
+        if (entry.second.task.has_network()) {
+            validator(entry.second.task);
+        }
+    }
+}
+
 uint32_t OxcDagManager::network_task_count() const {
     uint32_t count = 0;
     for (const auto& entry : tasks_) {
@@ -264,8 +338,7 @@ void OxcDagManager::launch_task(uint32_t task_id) {
               << " stage=" << task.stage_id
               << " src_rank=" << task.src_rank
               << " dst_rank=" << task.dst_rank
-              << " compute_rank=" << task.compute_rank
-              << " bytes=" << task.bytes
+              << " transfer_bytes=" << task.transfer_bytes
               << " compute_us=" << task.compute_us
               << " time_us=" << timeAsUs(eventlist_.now()) << std::endl;
 

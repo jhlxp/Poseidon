@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <limits>
 #include <list>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -1189,6 +1190,7 @@ int main(int argc, char **argv) {
         }
         planes = mprail_cfg.planes;
         ports = planes;
+        mprail_cfg.packet_spray = load_balancing_algo != ECMP;
         mprail_cfg.nodes = no_of_nodes;
         mprail_cfg.external_linkspeed = linkspeed;
         mprail_cfg.local_linkspeed = local_linkspeed;
@@ -1283,6 +1285,13 @@ int main(int argc, char **argv) {
         cout << "l1_eps_per_plane " << mprail_cfg.l1_eps_per_plane << endl;
         cout << "l0_l1_links_per_spine "
              << mprail_cfg.l0_l1_links_per_spine << endl;
+        cout << "routing_mode "
+             << (mprail_cfg.packet_spray ? "packet_spray_ecmp" : "flow_ecmp")
+             << endl;
+        cout << "switch_strategy "
+             << (MpRailSwitch::strategy() == MpRailSwitch::RR
+                     ? "rr" : "ecmp_hash")
+             << endl;
         cout << "external_linkspeed_gbps " << linkspeed / 1000000000 << endl;
         cout << "aggregate_rank_bandwidth_gbps "
              << mprail_cfg.planes * (linkspeed / 1000000000) << endl;
@@ -1666,7 +1675,252 @@ int main(int argc, char **argv) {
 
     mem_b cwnd_b = cwnd * Packet::data_packet_size();
     vector<connection*>* all_conns = conns->getAllConnections();
+    if (!conn_reuse) {
+        set<flowid_t> user_flow_ids;
+        for (const connection* item : *all_conns) {
+            if (item->flowid && !user_flow_ids.insert(item->flowid).second) {
+                cerr << "Duplicate flow ID in connection matrix: "
+                     << item->flowid << endl;
+                exit(1);
+            }
+        }
+    }
     vector <UecSrc*> uec_srcs;
+
+    struct MpRailFlowHandle {
+        UecSrc* source = nullptr;
+        UecSink* sink = nullptr;
+    };
+
+    auto make_uec_multipath = [&](bool fixed_explicit_path) {
+        unique_ptr<UecMultipath> mp;
+        if (fixed_explicit_path) {
+            mp = make_unique<UecMpEcmp>(1, UecSrc::_debug);
+        } else if (load_balancing_algo == BITMAP) {
+            mp = make_unique<UecMpBitmap>(path_entropy_size, UecSrc::_debug);
+        } else if (load_balancing_algo == REPS
+                   || load_balancing_algo == REPS_LEGACY) {
+            mp = make_unique<UecMpRepsLegacy>(path_entropy_size, UecSrc::_debug);
+        } else if (load_balancing_algo == FREEZING) {
+            mp = make_unique<UecMpReps>(
+                    path_entropy_size, UecSrc::_debug, !disable_trim);
+        } else if (load_balancing_algo == OBLIVIOUS) {
+            mp = make_unique<UecMpOblivious>(path_entropy_size, UecSrc::_debug);
+        } else if (load_balancing_algo == MIXED) {
+            mp = make_unique<UecMpMixed>(path_entropy_size, UecSrc::_debug);
+        } else if (load_balancing_algo == ECMP) {
+            mp = make_unique<UecMpEcmp>(path_entropy_size, UecSrc::_debug);
+        } else {
+            throw logic_error("unsupported UEC multipath algorithm");
+        }
+        return mp;
+    };
+
+    auto create_mprail_flow = [&] (
+            uint32_t src,
+            uint32_t dst,
+            uint64_t bytes,
+            optional<flowid_t> requested_flow_id,
+            simtime_picosec start_time,
+            const string& name,
+            const MpRailRouteSpec* explicit_route,
+            function<void()> completion_callback) {
+        if (!mprail_topology) {
+            throw logic_error("MpRail route flow requested without MpRail topology");
+        }
+        auto* flow_src = new UecSrc(
+                traffic_logger, eventlist,
+                make_uec_multipath(explicit_route != nullptr),
+                *nics.at(src), ports);
+        if (requested_flow_id.has_value()) {
+            flow_src->setFlowId(requested_flow_id.value());
+        }
+        flow_src->setFlowsize(bytes);
+        flow_src->setSrc(src);
+        flow_src->setDst(dst);
+        flow_src->setName(name);
+        logfile.writeName(*flow_src);
+
+        UecSink* flow_sink = nullptr;
+        if (receiver_driven) {
+            flow_sink = new UecSink(
+                    NULL, pacers.at(dst).get(), *nics.at(dst), ports);
+        } else {
+            flow_sink = new UecSink(
+                    NULL, linkspeed, 1.1,
+                    UecBasePacket::unquantize(UecSink::_credit_per_pull),
+                    eventlist, *nics.at(dst), ports);
+        }
+        if (requested_flow_id.has_value()) {
+            flow_sink->setFlowId(requested_flow_id.value());
+        }
+        flow_sink->setSrc(src);
+        ((DataReceiver*)flow_sink)->setName(name + "_sink");
+        logfile.writeName(*(DataReceiver*)flow_sink);
+
+        const simtime_picosec base_rtt = calculate_mprail_pair_rtt(
+                mprail_cfg, src, dst);
+        if (receiver_driven) {
+            flow_src->initRccc(cwnd_b, enable_accurate_base_rtt
+                    ? base_rtt : network_max_unloaded_rtt);
+        }
+        if (sender_driven) {
+            flow_src->initNscc(cwnd_b, enable_accurate_base_rtt
+                    ? base_rtt : network_max_unloaded_rtt);
+        }
+        if (log_flow_events && event_logger) {
+            flow_src->logFlowEvents(*event_logger);
+        }
+        if (UecSink::_model_pcie) {
+            flow_sink->setPCIeModel(pcie_models.at(dst));
+        }
+        if (UecSink::_oversubscribed_cc) {
+            flow_sink->setOversubscribedCC(oversubscribed_ccs.at(dst));
+        }
+        if (completion_callback) {
+            flow_src->setCompletionCallback(move(completion_callback));
+        }
+
+        mprail_topology->connect_endpoints(
+                src, dst, *flow_src, *flow_sink, start_time, explicit_route);
+        if (sink_logger) {
+            sink_logger->monitorSink(flow_sink);
+        }
+        if (mprail_topology->rank_server(src)
+                == mprail_topology->rank_server(dst)) {
+            ++local_flow_count;
+        } else {
+            ++fabric_flow_count;
+        }
+        uec_srcs.push_back(flow_src);
+        return MpRailFlowHandle{flow_src, flow_sink};
+    };
+
+    struct ServerForwardPhase {
+        string name;
+        uint32_t src = 0;
+        uint32_t dst = 0;
+        MpRailFlowHandle flow;
+    };
+    struct ServerForwardState {
+        flowid_t logical_flow_id = 0;
+        uint64_t bytes = 0;
+        vector<ServerForwardPhase> phases;
+        function<void()> final_callback;
+    };
+
+    auto create_server_forward = [&] (
+            uint32_t src,
+            uint32_t dst,
+            uint64_t bytes,
+            optional<flowid_t> requested_flow_id,
+            simtime_picosec start_time,
+            const MpRailRouteSpec& route,
+            function<void()> final_callback,
+            Trigger* start_trigger,
+            Trigger* send_done_trigger,
+            Trigger* recv_done_trigger) {
+        mprail_topology->validate_route_spec(src, dst, route);
+
+        struct PhaseDescription {
+            string name;
+            uint32_t src;
+            uint32_t dst;
+            bool is_fabric;
+        };
+        vector<PhaseDescription> descriptions;
+        if (src != route.src_relay) {
+            descriptions.push_back({"src_local", src, route.src_relay, false});
+        }
+        descriptions.push_back(
+                {"fabric", route.src_relay, route.dst_relay, true});
+        if (route.dst_relay != dst) {
+            descriptions.push_back({"dst_local", route.dst_relay, dst, false});
+        }
+
+        auto state = make_shared<ServerForwardState>();
+        state->bytes = bytes;
+        state->final_callback = move(final_callback);
+        size_t fabric_index = 0;
+        for (size_t index = 0; index < descriptions.size(); ++index) {
+            const PhaseDescription& description = descriptions[index];
+            if (description.is_fabric) {
+                fabric_index = index;
+            }
+            optional<flowid_t> phase_flow_id;
+            if (description.is_fabric && requested_flow_id.has_value()) {
+                phase_flow_id = requested_flow_id.value();
+            }
+            const simtime_picosec phase_start = index == 0
+                    ? start_time : TRIGGER_START;
+            MpRailFlowHandle phase_flow = create_mprail_flow(
+                    description.src,
+                    description.dst,
+                    bytes,
+                    phase_flow_id,
+                    phase_start,
+                    "ServerForward_" + description.name + "_"
+                            + ntoa(description.src) + "_" + ntoa(description.dst),
+                    nullptr,
+                    {});
+            state->phases.push_back(ServerForwardPhase{
+                    description.name, description.src, description.dst, phase_flow});
+        }
+        state->logical_flow_id = requested_flow_id.has_value()
+                ? requested_flow_id.value()
+                : state->phases.at(fabric_index).flow.source->flowId();
+
+        cout << "SERVER_FORWARD_BEGIN flow=" << state->logical_flow_id
+             << " src=" << src
+             << " src_relay=" << route.src_relay
+             << " dst_relay=" << route.dst_relay
+             << " dst=" << dst
+             << " bytes=" << bytes
+             << " phases=" << state->phases.size() << endl;
+
+        for (size_t index = 0; index < state->phases.size(); ++index) {
+            ServerForwardPhase& phase = state->phases[index];
+            phase.flow.source->setStartCallback([state, index]() {
+                const ServerForwardPhase& current = state->phases.at(index);
+                cout << "SERVER_FORWARD_PHASE_START flow="
+                     << state->logical_flow_id
+                     << " phase=" << current.name
+                     << " src=" << current.src
+                     << " dst=" << current.dst
+                     << " time_us=" << timeAsUs(eventlist.now()) << endl;
+            });
+            phase.flow.source->setCompletionCallback([state, index]() {
+                const ServerForwardPhase& current = state->phases.at(index);
+                cout << "SERVER_FORWARD_PHASE_DONE flow="
+                     << state->logical_flow_id
+                     << " phase=" << current.name
+                     << " time_us=" << timeAsUs(eventlist.now()) << endl;
+                if (index + 1 < state->phases.size()) {
+                    eventlist.triggerIsPending(
+                            *state->phases.at(index + 1).flow.source);
+                    return;
+                }
+                cout << "SERVER_FORWARD_DONE flow=" << state->logical_flow_id
+                     << " time_us=" << timeAsUs(eventlist.now()) << endl;
+                if (state->final_callback) {
+                    state->final_callback();
+                }
+            });
+        }
+
+        ServerForwardPhase& first_phase = state->phases.front();
+        ServerForwardPhase& last_phase = state->phases.back();
+        if (start_trigger) {
+            start_trigger->add_target(*first_phase.flow.source);
+        }
+        if (send_done_trigger) {
+            last_phase.flow.source->setEndTrigger(*send_done_trigger);
+        }
+        if (recv_done_trigger) {
+            last_phase.flow.sink->setEndTrigger(*recv_done_trigger);
+        }
+        return state;
+    };
 
     map<flowid_t, pair<UecSrc*, UecSink*>> flowmap;
     map<flowid_t, UecPdcSes*> flow_pdc_map;
@@ -1681,6 +1935,19 @@ int main(int argc, char **argv) {
         try {
             oxc_dag_manager = make_unique<OxcDagManager>(eventlist, no_of_nodes);
             oxc_dag_manager->load_from_file(dag_file);
+            oxc_dag_manager->validate_network_tasks([&](const OxcDagTask& task) {
+                if (!task.route.has_value()) {
+                    return;
+                }
+                if (!mprail_topology) {
+                    throw invalid_argument(
+                            "DAG route fields are supported only by MpRail topology");
+                }
+                mprail_topology->validate_route_spec(
+                        static_cast<uint32_t>(task.src_rank),
+                        static_cast<uint32_t>(task.dst_rank),
+                        task.route.value());
+            });
         } catch (const exception& e) {
             cerr << "Failed to load DAG: " << e.what() << endl;
             exit(1);
@@ -1689,6 +1956,45 @@ int main(int argc, char **argv) {
         oxc_dag_manager->set_network_launcher([&](const OxcDagTask& task) {
             const uint32_t src = static_cast<uint32_t>(task.src_rank);
             const uint32_t dst = static_cast<uint32_t>(task.dst_rank);
+            OxcDagManager* manager = oxc_dag_manager.get();
+            if (mprail_topology) {
+                if (task.route.has_value()
+                        && task.route->mode == MpRailRouteMode::SERVER_FORWARD) {
+                    create_server_forward(
+                            src,
+                            dst,
+                            task.transfer_bytes,
+                            optional<flowid_t>(task.id),
+                            eventlist.now(),
+                            task.route.value(),
+                            [manager, task_id = task.id]() {
+                                manager->notify_network_task_done(task_id);
+                            },
+                            nullptr,
+                            nullptr,
+                            nullptr);
+                } else {
+                    const MpRailRouteSpec* explicit_route = task.route.has_value()
+                            ? &task.route.value() : nullptr;
+                    create_mprail_flow(
+                            src,
+                            dst,
+                            task.transfer_bytes,
+                            optional<flowid_t>(task.id),
+                            eventlist.now(),
+                            "Dag_" + ntoa(src) + "_" + ntoa(dst)
+                                    + "_" + ntoa(task.id),
+                            explicit_route,
+                            [manager, task_id = task.id]() {
+                                manager->notify_network_task_done(task_id);
+                            });
+                }
+                return;
+            }
+            if (task.route.has_value()) {
+                throw invalid_argument(
+                        "DAG route fields are supported only by MpRail topology");
+            }
             unique_ptr<UecMultipath> mp;
             if (load_balancing_algo == BITMAP) {
                 mp = make_unique<UecMpBitmap>(path_entropy_size, UecSrc::_debug);
@@ -1708,7 +2014,7 @@ int main(int argc, char **argv) {
 
             auto* dag_src = new UecSrc(traffic_logger, eventlist, move(mp), *nics.at(src), ports);
             dag_src->setFlowId(task.id);
-            dag_src->setFlowsize(task.bytes);
+            dag_src->setFlowsize(task.transfer_bytes);
             dag_src->setSrc(src);
             dag_src->setDst(dst);
             dag_src->setName("Dag_" + ntoa(src) + "_" + ntoa(dst)
@@ -1757,7 +2063,6 @@ int main(int argc, char **argv) {
                 dag_snk->setOversubscribedCC(oversubscribed_ccs.at(dst));
             }
 
-            OxcDagManager* manager = oxc_dag_manager.get();
             dag_src->setCompletionCallback([manager, task_id = task.id]() {
                 manager->notify_network_task_done(task_id);
             });
@@ -1878,6 +2183,72 @@ int main(int argc, char **argv) {
         connection* crt = all_conns->at(c);
         int src = crt->src;
         int dest = crt->dst;
+        if (crt->route.has_value()) {
+            if (!mprail_topology) {
+                cerr << "CM route fields are supported only by MpRail topology" << endl;
+                exit(1);
+            }
+            if (conn_reuse || crt->msgid.has_value()) {
+                cerr << "CM route fields do not support -conn_reuse or msg" << endl;
+                exit(1);
+            }
+            if (crt->size <= 0) {
+                cerr << "CM routed flow requires a positive size" << endl;
+                exit(1);
+            }
+            try {
+                mprail_topology->validate_route_spec(
+                        static_cast<uint32_t>(src),
+                        static_cast<uint32_t>(dest),
+                        crt->route.value());
+            } catch (const exception& error) {
+                cerr << "Invalid CM route: " << error.what() << endl;
+                exit(1);
+            }
+
+            const optional<flowid_t> requested_flow_id = crt->flowid
+                    ? optional<flowid_t>(crt->flowid) : optional<flowid_t>();
+            Trigger* start_trigger = crt->trigger
+                    ? conns->getTrigger(crt->trigger, eventlist) : nullptr;
+            Trigger* send_done_trigger = crt->send_done_trigger
+                    ? conns->getTrigger(crt->send_done_trigger, eventlist) : nullptr;
+            Trigger* recv_done_trigger = crt->recv_done_trigger
+                    ? conns->getTrigger(crt->recv_done_trigger, eventlist) : nullptr;
+
+            if (crt->route->mode == MpRailRouteMode::SERVER_FORWARD) {
+                create_server_forward(
+                        src,
+                        dest,
+                        crt->size,
+                        requested_flow_id,
+                        crt->start,
+                        crt->route.value(),
+                        {},
+                        start_trigger,
+                        send_done_trigger,
+                        recv_done_trigger);
+            } else {
+                MpRailFlowHandle routed_flow = create_mprail_flow(
+                        src,
+                        dest,
+                        crt->size,
+                        requested_flow_id,
+                        crt->start,
+                        "Explicit_" + ntoa(src) + "_" + ntoa(dest),
+                        &crt->route.value(),
+                        {});
+                if (start_trigger) {
+                    start_trigger->add_target(*routed_flow.source);
+                }
+                if (send_done_trigger) {
+                    routed_flow.source->setEndTrigger(*send_done_trigger);
+                }
+                if (recv_done_trigger) {
+                    routed_flow.sink->setEndTrigger(*recv_done_trigger);
+                }
+            }
+            continue;
+        }
         uint32_t route_tray_size = oxc_topology
                 ? oxc_ocs_cfg.ranks_per_tray
                 : local_tray_size;

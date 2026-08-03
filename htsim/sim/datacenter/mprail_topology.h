@@ -3,6 +3,7 @@
 #define MPRAIL_TOPOLOGY_H
 
 #include "mprail_switch.h"
+#include "mprail_route_spec.h"
 #include "pipe.h"
 #include "queue.h"
 #include "topology.h"
@@ -20,6 +21,7 @@ struct MpRailTopologyConfig {
     uint32_t servers_per_rail = 1;
     uint32_t l1_eps_per_plane = 1;
     uint32_t l0_l1_links_per_spine = 1;
+    bool packet_spray = false;
 
     linkspeed_bps external_linkspeed = 100000000000ULL;
     linkspeed_bps local_linkspeed = 3200000000000ULL;
@@ -45,7 +47,11 @@ public:
             uint32_t dst,
             UecSrc& uec_src,
             UecSink& uec_snk,
-            simtime_picosec start_time);
+            simtime_picosec start_time,
+            const MpRailRouteSpec* route = nullptr);
+
+    void validate_route_spec(
+            uint32_t src, uint32_t dst, const MpRailRouteSpec& route) const;
 
     uint32_t server_count() const { return _server_count; }
     uint32_t rail_count() const { return _rail_count; }
@@ -80,8 +86,6 @@ private:
     void validate_config() const;
     void init_switches();
     uint32_t select_plane(uint32_t flowid, uint32_t src, uint32_t dst) const;
-    uint32_t select_spine(uint32_t flowid, uint32_t src, uint32_t dst) const;
-    uint32_t select_bundle(uint32_t flowid, uint32_t src, uint32_t dst) const;
 
     Route* make_initial_route(uint32_t rank, uint32_t l0, uint32_t plane);
     Route* make_local_route(
@@ -110,18 +114,29 @@ private:
             int flowid,
             uint32_t plane,
             PacketSink* final_sink);
-    void install_l0_flow_up_route(
+    void install_l0_ecmp_up_route(
             uint32_t l0,
             uint32_t dst_rank,
-            int flowid,
             uint32_t l1,
             uint32_t bundle);
-    void install_l1_flow_down_route(
+    void install_l1_ecmp_down_route(
             uint32_t l1,
             uint32_t dst_rank,
-            int flowid,
             uint32_t l0,
             uint32_t bundle);
+    void install_explicit_route(
+            MpRailSwitch* sw,
+            uint32_t dst_rank,
+            int flowid,
+            Route* route,
+            packet_direction direction);
+    void connect_explicit_endpoints(
+            uint32_t src,
+            uint32_t dst,
+            UecSrc& uec_src,
+            UecSink& uec_snk,
+            simtime_picosec start_time,
+            const MpRailRouteSpec& route);
 
     static std::string host_src_name(uint32_t rank);
     static std::string host_dst_name(uint32_t rank);

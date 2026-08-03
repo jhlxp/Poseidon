@@ -206,23 +206,25 @@ def validate_cross_rail(log: str, returncode: int) -> str:
     )
 
 
-def validate_hash(log: str, returncode: int) -> str:
+def validate_flow_routing_mode(log: str, returncode: int) -> str:
     assert_success(log, returncode)
-    choices = re.findall(
-        r"scope=cross_rail .*? plane=(\d+) spine=(\d+) bundle=(\d+)", log
-    )
-    require(len(choices) == 16, f"预期 16 个跨 rail flow，实际 {len(choices)}")
-    require(len({plane for plane, _, _ in choices}) >= 2,
-            "flow hash 没有分散到至少两个 plane")
-    require(len({spine for _, spine, _ in choices}) == 2,
-            "flow hash 没有覆盖两个 spine")
-    require(len({bundle for _, _, bundle in choices}) == 2,
-            "flow hash 没有覆盖两条 L0/L1 并行链路")
-    return (
-        f"16 flows 覆盖 {len({p for p, _, _ in choices})} 个 planes、"
-        f"{len({s for _, s, _ in choices})} 个 spines、"
-        f"{len({b for _, _, b in choices})} 个 bundles"
-    )
+    require("routing_mode flow_ecmp" in log, "全局路由模式不是 flow_ecmp")
+    require(re.search(r"routing=flow_ecmp plane=\d+", log) is not None,
+            "flow ECMP 没有固定 preferred plane")
+    require("ecmp_spines=2 ecmp_bundles=2" in log,
+            "flow ECMP 下一跳维度错误")
+    return "UEC ECMP：固定一个 plane，L0/L1 使用 2 spines x 2 bundles ECMP"
+
+
+def validate_spray_routing_mode(log: str, returncode: int) -> str:
+    assert_success(log, returncode)
+    require("routing_mode packet_spray_ecmp" in log,
+            "全局路由模式不是 packet_spray_ecmp")
+    require("routing=packet_spray_ecmp plane=-1" in log,
+            "packet spray 仍固定 preferred plane")
+    require("ecmp_spines=2 ecmp_bundles=2" in log,
+            "packet spray ECMP 下一跳维度错误")
+    return "UEC spray：不固定 plane，L0/L1 使用 2 spines x 2 bundles ECMP"
 
 
 def parse_event_times(log: str, prefix: str) -> dict[int, float]:
@@ -258,6 +260,21 @@ def validate_dag(log: str, returncode: int) -> str:
     )
 
 
+def validate_multiple_predecessors(log: str, returncode: int) -> str:
+    assert_success(log, returncode)
+    require("DAG_SUMMARY tasks=3 stages=3 makespan_us=25" in log,
+            "多前驱 DAG 没有完整结束")
+    stage_starts = parse_event_times(log, "DAG_STAGE_START")
+    stage_dones = parse_event_times(log, "DAG_STAGE_DONE")
+    require(stage_starts[0] == 0 and stage_starts[1] == 0,
+            "两个 root stage 没有同时启动")
+    require(stage_dones[0] == 10 and stage_dones[1] == 20,
+            "root stage 完成时刻错误")
+    require(stage_starts[2] == 20 and stage_dones[2] == 25,
+            "stage 2 没有等待 stage 0 和 stage 1")
+    return "stage2 前驱集合={0,1}，20us 启动，25us 完成"
+
+
 def expect_failure(marker: str, expected_code: int | None = None) -> Callable[[str, int], str]:
     def validator(log: str, returncode: int) -> str:
         require(returncode != 0, "非法输入意外成功")
@@ -291,7 +308,7 @@ def write_report(run_dir: Path, results: list[CaseResult], config: dict) -> None
         "## 测试目的",
         "",
         "验证服务器内部高速 FullMesh、同 rail L0 转发、跨 rail L0-L1-L0 转发、"
-        "plane 隔离、flow hash、静态流以及 DAG stage barrier。",
+        "plane 隔离、UEC flow/spray ECMP、静态流以及 DAG stage barrier。",
         "",
         "## 拓扑规模",
         "",
@@ -323,10 +340,10 @@ def write_report(run_dir: Path, results: list[CaseResult], config: dict) -> None
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path,
-                        help="指定日志运行目录；默认创建 logs/run_*_mprail")
+                        help="指定日志运行目录；默认创建 test_logs/run_*_mprail")
     args = parser.parse_args()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    run_dir = (args.run_dir or ROOT / "logs" / f"run_{stamp}_mprail").resolve()
+    run_dir = (args.run_dir or ROOT / "test_logs" / f"run_{stamp}_mprail").resolve()
     run_dir.mkdir(parents=True, exist_ok=False)
 
     config = {
@@ -360,14 +377,17 @@ def main() -> int:
             connection_matrix(["0->8 id 3 start 0 size 16384"]),
             validate_cross_rail,
         )
-        hash_flows = [
-            f"0->8 id {100 + flow} start 0 size 4096"
-            for flow in range(16)
-        ]
         suite.run_case(
-            "hash_distribution",
-            connection_matrix(hash_flows),
-            validate_hash,
+            "flow_routing_mode",
+            connection_matrix(["0->8 id 100 start 0 size 16384"]),
+            validate_flow_routing_mode,
+            extra_args=["-load_balancing_algo", "ecmp"],
+        )
+        suite.run_case(
+            "spray_routing_mode",
+            connection_matrix(["0->8 id 101 start 0 size 16384"]),
+            validate_spray_routing_mode,
+            extra_args=["-load_balancing_algo", "oblivious"],
         )
 
         empty_matrix = connection_matrix([])
@@ -376,50 +396,78 @@ def main() -> int:
             empty_matrix,
             validate_dag,
             dag=(
-                "1 0 0 8 - 16384 0 -\n"
-                "2 0 0 9 - 16384 0 -\n"
-                "3 0 - - 0 0 20 -\n"
-                "4 0 - - 1 0 30 -\n"
-                "5 1 8 0 - 16384 0 0\n"
-                "6 1 - - 8 0 10 0\n"
+                "1 0 | 0 8 | 16384 0 | -\n"
+                "2 0 | 0 9 | 16384 0 | -\n"
+                "3 0 | 0 0 | 0 20 | -\n"
+                "4 0 | 1 1 | 0 30 | -\n"
+                "5 1 | 8 0 | 16384 0 | 0\n"
+                "6 1 | 8 8 | 0 10 | 0\n"
+            ),
+        )
+        suite.run_case(
+            "dag_multiple_predecessors",
+            empty_matrix,
+            validate_multiple_predecessors,
+            dag=(
+                "1 0 | 0 0 | 0 10 | -\n"
+                "2 1 | 1 1 | 0 20 | -\n"
+                "3 2 | 2 2 | 0 5 | 0 1\n"
             ),
         )
         suite.run_case(
             "reject_joint_task",
             empty_matrix,
-            expect_failure("exactly one of network bytes or compute time"),
-            dag="1 0 0 8 0 1024 10 -\n",
+            expect_failure("exactly one of transfer_bytes or compute_us"),
+            dag="1 0 | 0 8 | 1024 10 | -\n",
         )
         suite.run_case(
             "reject_empty_task",
             empty_matrix,
-            expect_failure("exactly one of network bytes or compute time"),
-            dag="1 0 - - - 0 0 -\n",
+            expect_failure("exactly one of transfer_bytes or compute_us"),
+            dag="1 0 | 0 0 | 0 0 | -\n",
         )
         suite.run_case(
             "reject_cycle",
             empty_matrix,
             expect_failure("DAG contains a cycle"),
-            dag="1 0 - - 0 0 1 1\n2 1 - - 1 0 1 0\n",
+            dag="1 0 | 0 0 | 0 1 | 1\n2 1 | 1 1 | 0 1 | 0\n",
         )
         suite.run_case(
             "reject_missing_predecessor",
             empty_matrix,
             expect_failure("depends on a stage that has no tasks"),
-            dag="1 0 - - 0 0 1 99\n",
+            dag="1 0 | 0 0 | 0 1 | 99\n",
         )
         suite.run_case(
             "reject_rank_out_of_range",
             empty_matrix,
             expect_failure("invalid rank: 16"),
-            dag="1 0 0 16 - 1024 0 -\n",
+            dag="1 0 | 0 16 | 1024 0 | -\n",
         )
         suite.run_case(
             "detect_dag_timeout",
             empty_matrix,
             expect_failure("DAG did not finish before the simulation stopped", 2),
-            dag="1 0 - - 0 0 100 -\n",
+            dag="1 0 | 0 0 | 0 100 | -\n",
             end_us=10,
+        )
+        suite.run_case(
+            "reject_same_rank_network",
+            empty_matrix,
+            expect_failure("network task requires src_rank != dst_rank"),
+            dag="1 0 | 0 0 | 1024 0 | -\n",
+        )
+        suite.run_case(
+            "reject_cross_rank_compute",
+            empty_matrix,
+            expect_failure("compute task requires src_rank == dst_rank"),
+            dag="1 0 | 0 1 | 0 10 | -\n",
+        )
+        suite.run_case(
+            "reject_missing_group_separators",
+            empty_matrix,
+            expect_failure("malformed DAG task"),
+            dag="1 0 0 8 1024 0 -\n",
         )
         suite.run_case(
             "reject_invalid_dimension",

@@ -33,7 +33,7 @@ output_metrics/
 paper_plots/
 
 # Test and experiment outputs
-logs/
+test_logs/
 tests/log/*
 !tests/log/.gitkeep
 tests/**/output_metrics/

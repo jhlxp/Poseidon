@@ -98,12 +98,17 @@ void MpRailSwitch::addHostRoute(int dst, int flowid, Route* egress) {
     _fib->addHostRoute(dst, egress, flowid);
 }
 
-void MpRailSwitch::addFlowRoute(
+void MpRailSwitch::addExplicitRoute(
         int dst, int flowid, Route* egress, packet_direction direction) {
     if (!egress) {
-        throw invalid_argument("MpRailSwitch::addFlowRoute got null egress route");
+        throw invalid_argument("MpRailSwitch::addExplicitRoute got null egress route");
     }
-    _flow_routes[dst][flowid] = FlowFibEntry{egress, direction};
+    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(dst)) << 32)
+                         | static_cast<uint32_t>(flowid);
+    if (!_explicit_routes.emplace(
+                key, ExplicitRouteEntry{egress, direction}).second) {
+        throw invalid_argument("duplicate MpRail explicit route for switch/dst/flow");
+    }
 }
 
 void MpRailSwitch::addHostPort(int addr, int flowid, PacketSink* transport) {
@@ -126,13 +131,13 @@ void MpRailSwitch::permute_paths(vector<FibEntry*>* routes) {
 Route* MpRailSwitch::getNextHop(Packet& pkt, BaseQueue* ingress_port) {
     (void)ingress_port;
 
-    auto dst_it = _flow_routes.find(pkt.dst());
-    if (dst_it != _flow_routes.end()) {
-        auto flow_it = dst_it->second.find(pkt.flow_id());
-        if (flow_it != dst_it->second.end()) {
-            pkt.set_direction(flow_it->second.direction);
-            return flow_it->second.egress;
-        }
+    const uint64_t explicit_key =
+            (static_cast<uint64_t>(static_cast<uint32_t>(pkt.dst())) << 32)
+            | static_cast<uint32_t>(pkt.flow_id());
+    const auto explicit_entry = _explicit_routes.find(explicit_key);
+    if (explicit_entry != _explicit_routes.end()) {
+        pkt.set_direction(explicit_entry->second.direction);
+        return explicit_entry->second.egress;
     }
 
     HostFibEntry* host_entry = _fib->getHostRoute(pkt.dst(), pkt.flow_id());

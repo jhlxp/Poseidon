@@ -165,6 +165,9 @@ public:
     void setCompletionCallback(std::function<void()> callback) {
         _completion_callback = std::move(callback);
     }
+    void setStartCallback(std::function<void()> callback) {
+        _start_callback = std::move(callback);
+    }
     void timeToSend(const Route& route);
     void receivePacket(Packet& pkt, uint32_t portnum);
     void doNextEvent();
@@ -346,6 +349,7 @@ public:
     // unlike in the NDP simulator, we maintain all the main quantities in bytes
     mem_b _flow_size;
     bool _done_sending;  // make sure we only trigger once
+    std::function<void()> _start_callback;
     std::function<void()> _completion_callback;
     optional<UecMsgTracker*> _msg_tracker;  
     mem_b _backlog;      // how much we need to send, not including retransmissions

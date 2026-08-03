@@ -2003,6 +2003,9 @@ void UecSrc::startConnection() {
     assert(!hasStarted());
     _last_event_time.emplace(eventlist().now());
     _flow_start_time = eventlist().now();
+    if (_start_callback) {
+        _start_callback();
+    }
 
     /* cout << "Flow " << _name << " flowId " << flowId() << " " << _nodename << " starting at "
          << timeAsUs(eventlist().now()) << endl; */

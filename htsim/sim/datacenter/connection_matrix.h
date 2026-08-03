@@ -8,6 +8,7 @@
 #include "randomqueue.h"
 #include "fat_tree_switch.h"
 #include "eventlist.h"
+#include "mprail_route_spec.h"
 #include <list>
 #include <map>
 #include <optional>
@@ -24,6 +25,7 @@ struct connection{
     triggerid_t trigger;
     simtime_picosec start;
     int priority;
+    optional<MpRailRouteSpec> route;
 };
 
 typedef enum {UNSPECIFIED, SINGLE_SHOT, MULTI_SHOT, BARRIER} trigger_type;

@@ -16,6 +16,7 @@ set(LIB_SOURCES
     dragonfly_topology.cpp
     dragonfly_switch.cpp
     generic_topology.cpp
+    mprail_route_spec.cpp
     mprail_switch.cpp
     mprail_topology.cpp
     oxc_dag_manager.cpp

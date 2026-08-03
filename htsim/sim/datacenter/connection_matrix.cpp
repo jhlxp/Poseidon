@@ -741,6 +741,7 @@ bool ConnectionMatrix::load(istream& file){
             connection * c = new connection;
             conn_count++;
             c->flowid = 0;
+            c->size = 0;
             c->send_done_trigger = 0;
             c->recv_done_trigger = 0;
             c->trigger = 0;
@@ -802,6 +803,22 @@ bool ConnectionMatrix::load(istream& file){
                 } else if (tokens[i] == "prio") {
                     i++;
                     c->priority = stoi(tokens[i]);
+                } else if (tokens[i] == "route") {
+                    vector<string> route_tokens;
+                    for (++i; i < tokens.size(); ++i) {
+                        if (!tokens[i].empty()) {
+                            route_tokens.push_back(tokens[i]);
+                        }
+                    }
+                    try {
+                        c->route = parse_mprail_route_spec(
+                                route_tokens,
+                                "connection route at line " + to_string(linecount));
+                    } catch (const exception& error) {
+                        cerr << "Error: " << error.what() << endl;
+                        exit(1);
+                    }
+                    break;
                 } else {
                     cerr << "Error: unknown token: " << tokens[i] << " at line "
                          << linecount << endl;
@@ -969,4 +986,3 @@ ConnectionMatrix::getTrigger(triggerid_t id, EventList& eventlist) {
     }
     return t->trigger;
 }
-
