@@ -15,6 +15,7 @@
 | [07_DAG任务与执行模型.md](07_DAG任务与执行模型.md) | `.cm` 纯 flow 与 `.dag` 一体化 workload、barrier 依赖和完成语义 |
 | [08_MpRail源路由与服务器转发.md](08_MpRail源路由与服务器转发.md) | CM/DAG 显式路径、服务器内部 relay 转发、校验与完成语义 |
 | [09_测试与日志规范.md](09_测试与日志规范.md) | Python 功能测试分类及 `test_logs/` 产物结构 |
+| [10_MpRail链路负载可视化.md](10_MpRail链路负载可视化.md) | link-load 采样、五面板吞吐图、坐标解析和统计口径 |
 
 ## 仿真器的两种输入模式
 
@@ -62,3 +63,14 @@ python3 pysrc/generate_moe_dag.py \
 ```bash
 python3 tests/run_workload_generator.py
 ```
+
+## 绘制 MpRail 链路负载
+
+```bash
+python3 visualization/mprail_link_load.py \
+  --metrics-dir <run-dir>/output_metrics \
+  --output-dir <run-dir>/visualization
+```
+
+采样开关、五类面板和统计语义见
+[10_MpRail链路负载可视化.md](10_MpRail链路负载可视化.md)。
