@@ -1,0 +1,232 @@
+# DAG 工作负载生成总体设计
+
+## 1. 结论
+
+MoE workload 生成器与 HTSim/MpRail 仿真器应当解耦。
+
+生成器负责：
+
+- 描述模型、并行布局、expert placement 和 router 输出；
+- 把 DeepEP、MoonEP 等算法展开成计算与通信任务图；
+- 用 H100 SXM dense BF16 理论峰值把算子 FLOP 数换算成固定 `compute_us` 占位；
+- 根据 tensor 形状、数据类型、去重、padding 和转发方案计算 `transfer_bytes`；
+- 最终输出 HTSim 可读取的 `.dag` 和空 `.cm`。
+
+HTSim 负责：
+
+- 根据 `.dag` 的依赖启动任务；
+- 对 network task 执行真实 UEC/MpRail 网络仿真；
+- 对 compute task 执行固定时长事件；
+- 输出 FCT、链路负载和 DAG makespan。
+
+两者不是零耦合，而是只通过一个稳定的输出契约耦合：rank 编号、`.dag` 字段、route 语义和时间/字节单位。生成器不能依赖 HTSim 内部的 C++ 类。
+
+## 2. 两层架构
+
+```text
+第二层：模型到 workload
+  模型结构 + 并行配置 + batch/sequence + router trace + 硬件 cost
+                            |
+                            v
+  Transformer block / iteration 的逻辑任务图
+                            |
+                            v
+第一层：MoE 算法建模
+  MoE invocation + expert placement + token routes + algorithm config
+                            |
+                            v
+  DeepEP / MoonEP 等算法专属 phase graph
+                            |
+                            v
+共享 lowering
+  task-level IR -> barrier DAG + empty CM + manifest
+                            |
+                            v
+HTSim / MpRail
+```
+
+第一层可以独立使用：给定一次 MoE invocation，直接生成仅包含 router、dispatch、expert、combine 的小型 workload。
+
+第二层复用第一层：构造 attention、norm、residual、MoE 等完整 block，再将多个 block、microbatch 或训练阶段拼接起来。
+
+## 3. 当前代码目录
+
+Python 代码位于仓库根目录的 `pysrc/`：
+
+```text
+pysrc/
+├── generate_moe_dag.py
+├── moe_dag/
+│   ├── __init__.py
+│   ├── schema.py
+│   ├── graph.py
+│   ├── cost.py
+│   ├── emitter.py
+│   ├── algorithms/
+│   │   ├── common.py
+│   │   ├── deepep.py
+│   │   └── moonep.py
+│   └── models/
+│       └── transformer.py
+tests/
+└── run_workload_generator.py
+```
+
+`schema.py` 保存 placement、routing assignment 和 invocation；`graph.py` 是
+task-level IR；`emitter.py` 负责 barrier lowering 和五类输出；算法与模型层不依赖
+HTSim C++ 类。
+
+当前 CLI 示例：
+
+```bash
+python3 pysrc/generate_moe_dag.py \
+  --output generated_workloads/deepep_demo \
+  --algorithm deepep-hybrid \
+  --num-ranks 16 --gpus-per-server 8 \
+  --num-experts 16 --topk 8 \
+  --tokens-per-rank 128 --micro-batches 2 \
+  --chunk-tokens 32
+```
+
+## 4. 输入与输出
+
+### 4.1 输入
+
+生成一次 workload 至少需要四类输入：
+
+| 输入 | 主要内容 |
+|---|---|
+| 模型规格 | hidden、FFN hidden、head、layer、expert、top-k、激活和 dtype |
+| 并行与 placement | DP/TP/PP/EP、rank 到 server 的映射、expert 到 rank 的映射 |
+| token routing | 每个 source rank 的 token 选择了哪些 expert；来自 trace 或合成分布 |
+| 硬件 cost | 首版固定为 H100 SXM、dense BF16、`989 TFLOP/s/GPU` |
+
+算法配置是第一层的额外输入。当前代码已接受：
+
+- `deepep-hybrid` 与 `deepep-direct` forward；
+- dispatch、combine、weight dtype 与 `chunk_tokens`；
+- MoonEP forward 的 `replicas_per_rank` 和 `token_padding`。
+
+DeepEP low-latency/backward、MoonEP backward、expanded metadata、zero-copy 和
+remote-direct 尚未实现，CLI 不提供对应开关。
+
+### 4.2 输出
+
+每次生成应输出一个完整、可复现的目录：
+
+```text
+generated_workloads/<name>/
+├── workload.dag
+├── nodes.cm
+├── manifest.json
+├── task_map.json
+└── 生成报告.md
+```
+
+| 文件 | 用途 |
+|---|---|
+| `workload.dag` | HTSim 的计算通信任务输入 |
+| `nodes.cm` | `Nodes N`、`Connections 0`，满足当前 DAG CLI 契约 |
+| `manifest.json` | 完整输入、随机种子、版本、算法配置和 cost 来源 |
+| `task_map.json` | task 与 barrier 到模型 layer、kernel、通信 phase 的映射 |
+| `生成报告.md` | 中文汇总 token、字节、计算时间、关键假设和降级项 |
+
+`.dag` 本身不携带足够的算法语义，因此 `manifest.json` 和 `task_map.json` 不是可选调试文件，而是可审计性的必要组成。
+
+## 5. 核心设计选择
+
+### 5.1 共享语义，不共享固定流程
+
+不能让每个算法从头实现 token、expert、rank 和 byte 计算，否则同一模型在不同算法间不可比较。
+
+也不能定义一个固定的 `dispatch -> expert -> combine` 模板后只替换路由。MoonEP 还包含在线规划、动态冗余 expert、权重预取和训练梯度归并；DeepEP hybrid 包含按 scale-out domain 去重和 scale-up 转发。这些不是普通 all-to-all 的参数变化。
+
+因此采用：
+
+```text
+共享：MoE 数学语义、placement、routing trace、IR、cost 接口、DAG emitter
+独立：每个算法的 planner、phase graph、去重/复制规则、通信聚合规则
+```
+
+### 5.2 Task graph 直接映射到 barrier DAG
+
+生成器内部使用 task 级前驱，输出时再分配 `barrier_id`。原因是算法中存在：
+
+- attention 与另一个 microbatch 的 dispatch 重叠；
+- MoonEP planning、prefetch 与 dispatch 的组合；
+- 分块转发和多条并行通信；
+- shared expert 与 routed expert 分支后汇合。
+
+HTSim 的 `barrier_id` 不是时间阶段。默认让每个 task 使用独立 barrier 后，任意 task edge 都可以无损转换为 predecessor barrier edge：
+
+```text
+task A -> task B
+barrier(A) -> barrier(B)
+```
+
+多个 task 只有在启动前驱完全相同，并且所有消费者都应等待它们全部完成时，才能显式合并到同一个 barrier。emitter 不按可视化时间层做 levelize，也不能为了减少 barrier 数而引入交叉等待。
+
+### 5.3 首版 compute 只使用固定时长理论占位
+
+首版不建立真实 kernel 性能模型。生成器先计算每个算子的理论 FLOP 数，再按单张 H100 SXM 的 dense BF16 Tensor Core 峰值换算。普通计算使用完整峰值；明确与通信 kernel 重叠的计算使用固定 SM 预留后的峰值：
+
+```text
+peak_flops_per_gpu = 989e12 FLOP/s
+h100_sms = 132
+communication_sms = 20
+overlap_compute_sms = 112
+overlap_peak_flops = 989e12 * 112 / 132 ~= 839.15e12 FLOP/s
+
+compute_us_normal  = operation_flops / 989e12 * 1e6
+compute_us_overlap = operation_flops / 839.15e12 * 1e6
+```
+
+`communication_sms=20` 是本项目的首版仿真假设，不是 DeepEP 对所有模式和拓扑的固定值。它按“每个 rank 上的逻辑通信 kernel/phase”预留一次；同一个 dispatch/combine phase 拆出的多个 flow 或 chunk 共享这 20 SM，不能按 flow 数重复扣减。
+
+换算结果写入 `.dag` 后就是固定时长事件。HTSim 不做运行时 SM 调度：被标记为 overlap 的 compute task 在整个固定时长内都按 112 SM 计算，即使 network task 较早结束，也不动态恢复到 132 SM。network task 的 FCT 仍完全由 UEC/MpRail 决定，20 SM 只影响计算占位时间。
+
+该占位仍不考虑 Tensor Core 实际利用率、HBM、kernel launch、融合、padding、warp、抢占或 cache，因此只是简化理论下界。profiling 和完整 GPU 资源模型留到后续开发。
+
+## 6. 当前 HTSim 能力边界
+
+| 需求 | 当前状态 | 首版处理 |
+|---|---|---|
+| rank 间网络传输 | 已支持 | network task |
+| 同服务器 rank 间传输 | 已支持高速 FullMesh | 普通 local flow 或显式 local route |
+| 固定完整路径 | 已支持 | `explicit` route |
+| 严格消息级服务器转发 | 已支持 | `server_forward` route |
+| 任意 task 级依赖 | 已支持 | 默认每个 task 分配独立 barrier |
+| chunk 级流水转发 | 已支持表达 | 显式拆成多个 network task，每个 flow 完成后释放自己的 barrier |
+| 单 flow 内部流式事件 | 不支持且首版不需要 | 不监听第 N 个 packet；需要时拆 chunk flow |
+| GPU compute | 固定时长事件 | 普通任务按 989 TFLOP/s，overlap 任务按 839.15 TFLOP/s |
+| 通信/计算 SM 竞争 | 静态近似 | 每 rank 的逻辑通信 phase 固定预留 20/132 SM |
+| HBM/NVLink memory contention | 未支持 | 不进入首版 compute 占位，报告中标注 |
+| multicast/one-to-many 原语 | 未支持 | 展开为经过正确去重后的点到点 flow |
+
+单个 `server_forward` 是完整消息的三阶段 store-and-forward。DeepEP 的 forwarding kernel 若按 chunk 流水化，需要拆成 fabric/local chunk task；使用单个 `server_forward` 时只能标为 coarse baseline。
+
+MpRail 的 server-local FullMesh 也只是对 NVLink rank-to-rank 数据移动的网络级近似。UEC flow 的可靠传输、ACK 和拥塞控制不等价于 NVLink load/store、TMA 或 symmetric-memory 语义。首版可以研究字节、依赖和本地带宽竞争，但不能把理论 compute 占位或节点内 FCT 宣称为真实 DeepEP/MoonEP kernel latency。
+
+## 7. 开发顺序
+
+1. 实现 schema、placement、routing assignment、task-level graph 和确定性 ID。
+2. 实现 HTSim emitter、manifest 和静态校验。
+3. 实现 DeepEP hierarchical forward 的 byte-accurate coarse 模型。
+4. 实现单个 MoE sublayer：router、dispatch、expert、combine。
+5. 实现完整 transformer block forward：attention、residual、norm、MoE。
+6. 实现 H100 dense BF16 峰值和通信预留 20 SM 的固定时长占位。
+7. 实现 MoonEP planning、token dispatch、weight prefetch 和 combine。
+8. 再增加训练 backward 和 gradient reduce。
+
+## 8. 首版非目标
+
+- 不解释或执行真实 PyTorch/CUDA kernel。
+- 不从模型权重推断 router 决策；router trace 必须输入或合成。
+- 不在生成器中复制 HTSim 的链路/FCT 计算。
+- 不宣称理论 FLOP 模型等价于真实 kernel profiling。
+- 不在首版实现 profiling、roofline、HBM 或动态 SM 资源调度；SM 只使用固定 20/132 预留。
+- 不支持单条 flow 内部按 packet 到达释放依赖；chunk pipeline 使用显式 flow task。
+- 不把所有 CUDA microkernel 都拆成 DAG task；拆分粒度以依赖、资源类型和可测 cost 是否不同为准。
+- 不在第一版同时支持任意 DP/TP/PP/EP 组合。
+
+首个可验收目标是：单服务器 EP=8、固定 placement、TP=1、PP=1 的一个 transformer block forward，在相同 token routing 下生成 DeepEP 和 MoonEP 两份可比较 workload。DeepEP 的 2 服务器 EP=16 hierarchical forwarding 作为紧随其后的独立多节点验收，不与当前只支持单 NVLink domain 的 MoonEP 混成同一组对比。

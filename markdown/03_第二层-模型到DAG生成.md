@@ -1,0 +1,327 @@
+# 第二层：模型到 DAG 生成
+
+## 1. 第二层的职责
+
+第二层把真实模型结构、并行策略和执行场景转换为完整 workload，并在遇到 MoE sublayer 时调用第一层算法插件。
+
+它需要回答：
+
+```text
+一个 block、多个 block 或一次 iteration 中，
+每张 GPU 何时执行哪个 kernel、产生多少 token、调用哪次 EP 通信，
+以及这些操作之间如何依赖或重叠？
+```
+
+当前实现位于 `pysrc/moe_dag/models/transformer.py`。它生成一个 forward MoE
+block 的 Attention、Router 和算法专属 Dispatch/Expert/Combine，并支持多个
+microbatch。当前不是下面完整算子清单的逐 kernel 实现：norm、RoPE、residual、
+shared expert、TP/PP 和 backward 仍是后续范围。
+
+当前合成 routing 为确定性的 uniform assignment。真实 trace、Zipf/hot-expert
+provider 尚未接入 CLI；第一层 API 可以直接传入完整 `RoutingAssignment`。
+
+## 2. 模型规格
+
+初始配置建议使用 YAML，核心字段如下：
+
+```yaml
+model:
+  name: example_moe
+  num_layers: 1
+  hidden: 7168
+  ffn_hidden: 2048
+  num_attention_heads: 56
+  num_kv_heads: 8
+  head_dim: 128
+  num_experts: 256
+  topk: 8
+  shared_experts: 1
+  activation: silu
+  norm: rmsnorm
+
+execution:
+  mode: prefill       # train | prefill | decode
+  micro_batch: 1
+  sequence_length: 4096
+  dtype: bf16
+  dispatch_dtype: fp8
+  combine_dtype: bf16
+
+hardware:
+  gpu: h100_sxm
+  compute_placeholder: bf16_dense_peak
+  peak_tflops_per_gpu: 989
+  total_sms_per_gpu: 132
+  communication_sms_per_rank: 20
+
+parallel:
+  dp: 1
+  tp: 1
+  pp: 1
+  ep: 16
+  gpus_per_server: 8
+
+moe_algorithm:
+  name: deepep
+  mode: v2_hybrid
+```
+
+首版限制为 `TP=1`、`PP=1`。先把 EP、router 和完整 block 依赖做对，再扩展 TP collectives 和 PP microbatch pipeline。
+
+## 3. 一个 block 的逻辑结构
+
+推荐的 forward 粒度：
+
+```text
+input
+  -> RMSNorm
+  -> QKV projection
+  -> RoPE
+  -> attention core
+  -> output projection
+  -> residual add
+  -> RMSNorm
+  -> router projection
+  -> top-k / routing
+  -> MoE algorithm: planning + dispatch
+  -> routed expert gate/up GEMM
+  -> activation
+  -> routed expert down GEMM
+  -> MoE algorithm: combine
+  -> shared expert branch merge
+  -> residual add
+  -> output
+```
+
+不是每一行都必须成为独立 compute task。拆分条件是至少满足一个：
+
+- 中间存在通信或依赖边界；
+- 可与另一分支重叠；
+- 需要单独核算理论 FLOP 数；
+- shape 或资源类型显著不同；
+- 需要观察该阶段的完成时间。
+
+例如 QKV projection 可作为一个 fused task；expert gate/up 可以按实际 kernel 是否 fused 决定一个或两个 task。
+
+## 4. Token 数
+
+对无 sequence parallel 的简单场景：
+
+```text
+tokens_per_rank = micro_batch * sequence_length / data_parallel_shard_factor
+```
+
+实际实现必须显式处理：
+
+- padding 和变长 sequence；
+- prefill 与 decode 的 token 数差异；
+- sequence/context parallel 的 token shard；
+- pipeline microbatch；
+- dropped token 或 capacity factor；
+- shared expert 是否处理全部 token。
+
+模型层只决定 source token tensor；top-k assignment 交给 routing provider。
+
+## 5. Router 输入来源
+
+支持三类 routing provider：
+
+### 5.1 Trace
+
+输入真实模型采集的：
+
+```text
+(layer, step, src_rank, token_id) -> [(expert_id, weight), ...]
+```
+
+这是准确性最高的方式。trace metadata 必须记录模型版本、batch、sequence、并行布局和采集 commit。
+
+### 5.2 合成分布
+
+用于功能测试和参数扫描：
+
+- perfectly balanced；
+- uniform random；
+- Zipf/skew；
+- hot expert；
+- group-limited top-k；
+- layer-correlated 或 step-correlated routing。
+
+合成器必须使用显式 seed，并输出每 expert/rank/server 的 token histogram。
+
+### 5.3 仅计数输入
+
+只有 `tokens_per_expert` 不足以恢复精确通信矩阵，因为不知道 token 来自哪个 source rank，也不知道同一个 token 的多个 expert 是否位于相同 rank/node。
+
+因此仅计数输入只能用于 approximate 模式，manifest 必须标记：
+
+```text
+routing_fidelity = histogram_only
+```
+
+## 6. Compute 固定时长占位
+
+### 6.1 固定硬件口径
+
+首版不做 kernel profiling、roofline、HBM 或动态 SM 调度。统一采用 H100 SXM 的 dense BF16 Tensor Core 理论峰值，并为重叠通信固定预留 20 SM：
+
+```text
+per_gpu_peak = 989 TFLOP/s = 989e12 FLOP/s
+eight_gpu_peak = 7.912 PFLOP/s
+total_sms_per_gpu = 132
+communication_sms_per_rank = 20
+overlap_compute_sms = 112
+overlap_compute_peak = 989 * 112 / 132 ~= 839.15 TFLOP/s
+```
+
+NVIDIA 当前 H100 产品规格给出的 BF16/FP16 `1,979 TFLOP/s` 带结构化稀疏；首版不假设模型满足 2:4 sparsity，因此使用约一半的 dense 值 `989 TFLOP/s`。每个 compute task 绑定一张 GPU/rank，所以只使用单卡值。8 卡总值仅写入报告。
+
+`communication_sms_per_rank=20` 是实验配置，不是 DeepEP 的固定事实。当前 DeepEP V2 可以按配置计算或覆盖 `num_sms`；这里固定为 20 是为了用一个参数近似通信 kernel 和计算 kernel 的主要资源竞争。
+
+### 6.2 固定时间换算
+
+生成器离线计算理论 FLOP 数，然后根据 task 是否位于通信 overlap 窗口写入固定 `compute_us`：
+
+```text
+compute_us_normal  = operation_flops / 989e12 * 1e6
+compute_us_overlap = operation_flops / 839.15e12 * 1e6
+```
+
+FMA 按 2 FLOPs 计算。写入 `.dag` 后 HTSim 只等待这个固定时间，不根据并发 task 或 GPU 状态重新计算。首版约定 overlap compute 在整个 task 生命周期中都使用 112 SM；通信提前结束时不恢复额外 SM。
+
+GEMM 的基础 FLOP：
+
+```text
+linear(M, K, N) = 2 * M * K * N
+```
+
+典型 SwiGLU expert 对每个实际计算 token 的主 GEMM FLOP 近似：
+
+```text
+gate: 2 * H * H_ff
+up:   2 * H * H_ff
+down: 2 * H_ff * H
+total ~= 6 * H * H_ff
+```
+
+首版只核算能够明确写出公式的主要计算。activation、bias、kernel launch、padding、内存访问和实际 Tensor Core 利用率暂不修正，所以该时间是乐观理论下界，而不是性能预测。
+
+attention 仍需按 prefill/decode 和实际 shape 计算 FLOP 数，但同样统一除以 `989e12`，不单独建模 KV cache 或内存瓶颈。
+
+### 6.3 与网络的边界
+
+只有模型计算 FLOP 进入 `compute_us`。以下时间不加入 compute task：
+
+- HTSim 已经仿真的 network task FCT；
+- `server_forward` 的网络和本地 flow 时间；
+- 等待 predecessor barrier 的时间。
+
+后续引入 profiling 时，仍不能把包含 RDMA/NVLink 等待的端到端时间直接填入 compute task，否则会重复计算网络时间。
+
+一个逻辑通信 phase 可以展开成多条 destination flow 或 chunk flow。这些 flow 在同一 rank 上共享一次 20 SM 预留，而不是每条 flow 各占 20 SM。phase 归属记录在 `task_map.json`/manifest 中，不修改 `.dag` 行格式。
+
+## 7. 并行分支
+
+### 7.1 Shared expert
+
+shared expert 通常处理全部本地 token，可以与 routed token dispatch 或 routed expert compute 形成并行分支：
+
+```text
+router_done
+  +-> routed dispatch -> routed experts -> combine -+
+  +-> shared expert compute -----------------------+-> merge
+```
+
+是否重叠由 framework 和 stream 语义决定，不能默认。配置应显式选择：
+
+```text
+shared_expert_schedule = serial | overlap_dispatch | overlap_moe
+```
+
+### 7.2 Microbatch overlap
+
+DeepEP low-latency 的 hook 或框架双 batch 调度可以形成：
+
+```text
+microbatch n:   attention -> dispatch -> expert -> combine
+microbatch n+1:             attention -> dispatch -> expert -> combine
+```
+
+当前 barrier DAG 可以直接表达这种 overlap：每个 kernel/task 使用独立 barrier，只连接真实依赖，不按时间层合并。重叠 compute task 使用固定 112 SM 理论时长，network task 使用 HTSim FCT；首版不再引入 CUDA stream 或动态 occupancy 模型。
+
+当前两 microbatch builder 将第一个 microbatch 的 Attention/Router 按 132 SM
+计算；后续 microbatch 的 Attention/Router 因可与前一 microbatch 通信重叠，按
+112 SM 计算。Expert task 同样按 112 SM 计算。该选择是生成时的静态 schedule
+假设，不会根据实际 FCT 动态切换。
+
+## 8. Training 扩展
+
+训练不能只把 forward 反向播放。至少需要：
+
+- combine backward，本质为使用 forward plan 的 dispatch；
+- expert MLP backward；
+- dispatch backward，本质为 combine；
+- router/gate backward；
+- MoonEP duplicated expert grad reduce；
+- TP/DP 参数梯度 collective；
+- activation checkpoint/recompute；
+- optimizer step，若目标是完整 iteration。
+
+因此首版先做 forward。训练作为独立 milestone，并要求算法文档给出 forward/backward 对称与非对称部分。
+
+## 9. 多层与迭代
+
+构造多个 block 时不应简单复制 task ID。模型生成器需要：
+
+```text
+global_task_key = (iteration, microbatch, pipeline_stage, layer, op, rank, shard)
+```
+
+然后稳定映射为整数 task ID。
+
+对于同构 layer，可选择：
+
+- 完整展开，得到真实跨层并发；
+- 只生成一个代表 block；
+- 按 layer group 采样并在报告中外推。
+
+不能只把单 block makespan 乘 layer 数来替代存在 pipeline、cache 或跨层 routing 相关性的 workload。
+
+## 10. 输出校验
+
+模型级生成完成后至少检查：
+
+- 每层每 rank 的输入/输出 token 数守恒；
+- 每 token 恰有 K 个逻辑 routed expert，除非配置允许 drop；
+- expert ID 和 rank placement 合法；
+- dispatch 与 combine 使用同一个 algorithm plan；
+- shared/routed 分支在 merge 前全部完成；
+- 每个 compute task 都记录 `operation_flops`、单卡峰值和理论 `compute_us`；
+- overlap compute task 使用 112/132 SM，普通 compute task 使用 132/132 SM；
+- 同一 rank、同一逻辑通信 phase 的多条 flow 只计一次 20 SM；
+- task graph 无环；
+- HTSim barrier 映射没有未声明的交叉等待或保守串行化；
+- 最终 `.dag` 能通过 parser dry-run。
+
+## 11. 首版示例目标
+
+第一个端到端对比配置建议固定为：
+
+```text
+1 transformer block
+prefill forward
+TP=1, PP=1, EP=8
+1 server x 8 GPUs
+每 rank 4096 tokens
+H=7168, top-k=8
+固定 expert placement
+可重放的 synthetic router assignment
+DeepEP 单节点路径与 MoonEP 两种输出
+```
+
+这个目标用于同条件比较节点内专家通信、负载不均衡和算法差异。第二个独立配置再使用 `EP=16、2 servers x 8 GPUs、DeepEP V2 hybrid` 验证跨服务器去重和 forwarding。这样不会把 MoonEP 扩展到其当前官方实现未覆盖的跨节点范围，也不会过早引入 TP/PP/backward。
+
+## 12. 硬件规格来源
+
+- [NVIDIA H100 产品规格](https://www.nvidia.com/en-us/data-center/h100/)：H100 SXM BF16/FP16 Tensor Core 稀疏峰值为 `1,979 TFLOP/s`，规格页脚注标明使用 sparsity。
+- [NVIDIA Hopper Architecture In-Depth](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/)：H100 SXM 使用 132 SM，BF16 的 dense/sparse 理论口径约为 `1,000/2,000 TFLOP/s`；本文使用量产规格对应的 dense 值 `989 TFLOP/s`。

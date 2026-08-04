@@ -102,7 +102,7 @@ void OxcDagManager::load_from_file(const std::string& path) {
         std::istringstream identity(groups[0]);
         std::istringstream endpoints(groups[1]);
         std::istringstream operation(groups[2]);
-        if (!(identity >> task.id >> task.stage_id) || (identity >> extra)
+        if (!(identity >> task.id >> task.barrier_id) || (identity >> extra)
                 || !(endpoints >> src_rank >> dst_rank) || (endpoints >> extra)
                 || !(operation >> task.transfer_bytes >> task.compute_us)
                 || (operation >> extra)) {
@@ -140,23 +140,23 @@ void OxcDagManager::load_from_file(const std::string& path) {
             if (dependency == "-") {
                 if (saw_no_predecessor || !dependencies.empty()) {
                     throw std::invalid_argument(
-                            "DAG '-' predecessor cannot be combined with stage IDs");
+                            "DAG '-' predecessor cannot be combined with barrier IDs");
                 }
                 saw_no_predecessor = true;
                 continue;
             }
             if (saw_no_predecessor) {
                 throw std::invalid_argument(
-                        "DAG '-' predecessor cannot be combined with stage IDs");
+                        "DAG '-' predecessor cannot be combined with barrier IDs");
             }
             try {
                 size_t consumed = 0;
                 const int predecessor = std::stoi(dependency, &consumed);
                 if (consumed != dependency.size()) {
-                    throw std::invalid_argument("invalid stage ID");
+                    throw std::invalid_argument("invalid barrier ID");
                 }
-                if (predecessor == task.stage_id) {
-                    throw std::invalid_argument("DAG task cannot depend on its own stage");
+                if (predecessor == task.barrier_id) {
+                    throw std::invalid_argument("DAG task cannot depend on its own barrier");
                 }
                 dependencies.insert(predecessor);
             } catch (const std::exception&) {
@@ -167,9 +167,9 @@ void OxcDagManager::load_from_file(const std::string& path) {
         }
         if (!saw_predecessor) {
             throw std::invalid_argument(
-                    "DAG task requires '-' or at least one predecessor stage");
+                    "DAG task requires '-' or at least one predecessor barrier");
         }
-        task.predecessor_stages.assign(dependencies.begin(), dependencies.end());
+        task.predecessor_barriers.assign(dependencies.begin(), dependencies.end());
 
         if (groups.size() == 5) {
             if (!task.has_network()) {
@@ -187,50 +187,50 @@ void OxcDagManager::load_from_file(const std::string& path) {
     if (tasks_.empty()) {
         throw std::invalid_argument("DAG file contains no tasks: " + path);
     }
-    build_stages();
+    build_barriers();
     validate_acyclic();
     loaded_ = true;
     std::cout << "DAG_LOADED tasks=" << tasks_.size()
-              << " stages=" << stages_.size() << std::endl;
+              << " barriers=" << barriers_.size() << std::endl;
 }
 
-void OxcDagManager::build_stages() {
-    std::map<int, std::vector<int>> stage_predecessors;
+void OxcDagManager::build_barriers() {
+    std::map<int, std::vector<int>> barrier_predecessors;
     for (const auto& entry : tasks_) {
         const OxcDagTask& task = entry.second.task;
-        Stage& stage = stages_[task.stage_id];
-        stage.id = task.stage_id;
-        stage.task_ids.push_back(task.id);
+        Barrier& barrier = barriers_[task.barrier_id];
+        barrier.id = task.barrier_id;
+        barrier.task_ids.push_back(task.id);
 
-        const auto existing = stage_predecessors.find(task.stage_id);
-        if (existing == stage_predecessors.end()) {
-            stage_predecessors.emplace(task.stage_id, task.predecessor_stages);
-        } else if (existing->second != task.predecessor_stages) {
+        const auto existing = barrier_predecessors.find(task.barrier_id);
+        if (existing == barrier_predecessors.end()) {
+            barrier_predecessors.emplace(task.barrier_id, task.predecessor_barriers);
+        } else if (existing->second != task.predecessor_barriers) {
             throw std::invalid_argument(
-                    "all tasks in a DAG stage must declare the same predecessor stages");
+                    "all tasks in a DAG barrier must declare the same predecessor barriers");
         }
     }
 
-    for (auto& entry : stages_) {
-        Stage& stage = entry.second;
-        stage.remaining_tasks = static_cast<int>(stage.task_ids.size());
-        const std::vector<int>& predecessors = stage_predecessors.at(stage.id);
-        stage.indegree = static_cast<int>(predecessors.size());
+    for (auto& entry : barriers_) {
+        Barrier& barrier = entry.second;
+        barrier.remaining_tasks = static_cast<int>(barrier.task_ids.size());
+        const std::vector<int>& predecessors = barrier_predecessors.at(barrier.id);
+        barrier.indegree = static_cast<int>(predecessors.size());
         for (int predecessor : predecessors) {
-            const auto predecessor_stage = stages_.find(predecessor);
-            if (predecessor_stage == stages_.end()) {
+            const auto predecessor_barrier = barriers_.find(predecessor);
+            if (predecessor_barrier == barriers_.end()) {
                 throw std::invalid_argument(
-                        "DAG task depends on a stage that has no tasks: "
+                        "DAG task depends on a barrier that has no tasks: "
                         + std::to_string(predecessor));
             }
-            predecessor_stage->second.successors.push_back(stage.id);
+            predecessor_barrier->second.successors.push_back(barrier.id);
         }
     }
 }
 
 void OxcDagManager::validate_acyclic() const {
     std::map<int, int> indegree;
-    for (const auto& entry : stages_) {
+    for (const auto& entry : barriers_) {
         indegree.emplace(entry.first, entry.second.indegree);
     }
 
@@ -243,10 +243,10 @@ void OxcDagManager::validate_acyclic() const {
 
     uint32_t visited = 0;
     while (!ready.empty()) {
-        const int stage_id = ready.back();
+        const int barrier_id = ready.back();
         ready.pop_back();
         ++visited;
-        for (int successor : stages_.at(stage_id).successors) {
+        for (int successor : barriers_.at(barrier_id).successors) {
             int& successor_indegree = indegree.at(successor);
             --successor_indegree;
             if (successor_indegree == 0) {
@@ -254,7 +254,7 @@ void OxcDagManager::validate_acyclic() const {
             }
         }
     }
-    if (visited != stages_.size()) {
+    if (visited != barriers_.size()) {
         throw std::invalid_argument("DAG contains a cycle");
     }
 }
@@ -298,31 +298,31 @@ void OxcDagManager::start() {
 
     started_ = true;
     start_time_ = eventlist_.now();
-    start_ready_stages();
+    start_ready_barriers();
 }
 
-void OxcDagManager::start_ready_stages() {
+void OxcDagManager::start_ready_barriers() {
     std::vector<int> ready;
-    for (const auto& entry : stages_) {
-        const Stage& stage = entry.second;
-        if (stage.indegree == 0 && !stage.started) {
-            ready.push_back(stage.id);
+    for (const auto& entry : barriers_) {
+        const Barrier& barrier = entry.second;
+        if (barrier.indegree == 0 && !barrier.started) {
+            ready.push_back(barrier.id);
         }
     }
-    for (int stage_id : ready) {
-        start_stage(stage_id);
+    for (int barrier_id : ready) {
+        start_barrier(barrier_id);
     }
 }
 
-void OxcDagManager::start_stage(int stage_id) {
-    Stage& stage = stages_.at(stage_id);
-    if (stage.started || stage.indegree != 0) {
+void OxcDagManager::start_barrier(int barrier_id) {
+    Barrier& barrier = barriers_.at(barrier_id);
+    if (barrier.started || barrier.indegree != 0) {
         return;
     }
-    stage.started = true;
-    std::cout << "DAG_STAGE_START stage=" << stage.id
+    barrier.started = true;
+    std::cout << "DAG_BARRIER_START barrier=" << barrier.id
               << " time_us=" << timeAsUs(eventlist_.now()) << std::endl;
-    for (uint32_t task_id : stage.task_ids) {
+    for (uint32_t task_id : barrier.task_ids) {
         launch_task(task_id);
     }
 }
@@ -335,7 +335,7 @@ void OxcDagManager::launch_task(uint32_t task_id) {
     record.state = TaskState::RUNNING;
     const OxcDagTask& task = record.task;
     std::cout << "DAG_TASK_START task=" << task.id
-              << " stage=" << task.stage_id
+              << " barrier=" << task.barrier_id
               << " src_rank=" << task.src_rank
               << " dst_rank=" << task.dst_rank
               << " transfer_bytes=" << task.transfer_bytes
@@ -387,35 +387,35 @@ void OxcDagManager::finish_task(uint32_t task_id) {
     ++completed_tasks_;
     const OxcDagTask& task = record.task;
     std::cout << "DAG_TASK_DONE task=" << task.id
-              << " stage=" << task.stage_id
+              << " barrier=" << task.barrier_id
               << " time_us=" << timeAsUs(eventlist_.now()) << std::endl;
 
-    Stage& stage = stages_.at(task.stage_id);
-    --stage.remaining_tasks;
-    if (stage.remaining_tasks < 0) {
-        throw std::logic_error("DAG stage task accounting underflow");
+    Barrier& barrier = barriers_.at(task.barrier_id);
+    --barrier.remaining_tasks;
+    if (barrier.remaining_tasks < 0) {
+        throw std::logic_error("DAG barrier task accounting underflow");
     }
-    if (stage.remaining_tasks != 0) {
+    if (barrier.remaining_tasks != 0) {
         return;
     }
 
-    stage.finished = true;
-    std::cout << "DAG_STAGE_DONE stage=" << stage.id
+    barrier.finished = true;
+    std::cout << "DAG_BARRIER_DONE barrier=" << barrier.id
               << " time_us=" << timeAsUs(eventlist_.now()) << std::endl;
-    for (int successor : stage.successors) {
-        Stage& next = stages_.at(successor);
+    for (int successor : barrier.successors) {
+        Barrier& next = barriers_.at(successor);
         --next.indegree;
         if (next.indegree < 0) {
-            throw std::logic_error("DAG stage indegree underflow");
+            throw std::logic_error("DAG barrier indegree underflow");
         }
     }
-    start_ready_stages();
+    start_ready_barriers();
 
     if (completed_tasks_ == tasks_.size()) {
         finished_ = true;
         finish_time_ = eventlist_.now();
         std::cout << "DAG_SUMMARY tasks=" << tasks_.size()
-                  << " stages=" << stages_.size()
+                  << " barriers=" << barriers_.size()
                   << " makespan_us=" << makespan_us() << std::endl;
     }
 }

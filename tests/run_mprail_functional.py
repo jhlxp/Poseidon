@@ -231,7 +231,7 @@ def parse_event_times(log: str, prefix: str) -> dict[int, float]:
     return {
         int(item): float(timestamp)
         for item, timestamp in re.findall(
-            rf"^{prefix} (?:task|stage)=(\d+).*?time_us=([0-9.]+)",
+            rf"^{prefix} (?:task|barrier)=(\d+).*?time_us=([0-9.]+)",
             log,
             re.MULTILINE,
         )
@@ -240,39 +240,54 @@ def parse_event_times(log: str, prefix: str) -> dict[int, float]:
 
 def validate_dag(log: str, returncode: int) -> str:
     assert_success(log, returncode)
-    require("DAG_SUMMARY tasks=6 stages=2" in log, "DAG 没有完整结束")
+    require("DAG_SUMMARY tasks=6 barriers=2" in log, "DAG 没有完整结束")
     starts = parse_event_times(log, "DAG_TASK_START")
     dones = parse_event_times(log, "DAG_TASK_DONE")
-    stage_starts = parse_event_times(log, "DAG_STAGE_START")
-    stage_dones = parse_event_times(log, "DAG_STAGE_DONE")
+    barrier_starts = parse_event_times(log, "DAG_BARRIER_START")
+    barrier_dones = parse_event_times(log, "DAG_BARRIER_DONE")
     require(len(starts) == 6 and len(dones) == 6, "DAG task 日志数量不完整")
     require(len({starts[task] for task in (1, 2, 3, 4)}) == 1,
-            "stage 0 的 task 没有同时启动")
-    require(stage_dones[0] == max(dones[task] for task in (1, 2, 3, 4)),
-            "stage 0 没有等待最后一个 task")
-    require(stage_starts[1] >= stage_dones[0],
-            "stage 1 在 stage 0 完成前启动")
-    require(all(starts[task] >= stage_starts[1] for task in (5, 6)),
-            "stage 1 task 启动时刻错误")
+            "barrier 0 的 task 没有同时启动")
+    require(barrier_dones[0] == max(dones[task] for task in (1, 2, 3, 4)),
+            "barrier 0 没有等待最后一个 task")
+    require(barrier_starts[1] >= barrier_dones[0],
+            "barrier 1 在 barrier 0 完成前启动")
+    require(all(starts[task] >= barrier_starts[1] for task in (5, 6)),
+            "barrier 1 task 启动时刻错误")
     return (
-        f"6 tasks/2 stages；stage0 {stage_starts[0]:g}-{stage_dones[0]:g}us，"
-        f"stage1 {stage_starts[1]:g}-{stage_dones[1]:g}us，makespan 40us"
+        f"6 tasks/2 barriers；barrier0 {barrier_starts[0]:g}-{barrier_dones[0]:g}us，"
+        f"barrier1 {barrier_starts[1]:g}-{barrier_dones[1]:g}us，makespan 40us"
     )
 
 
 def validate_multiple_predecessors(log: str, returncode: int) -> str:
     assert_success(log, returncode)
-    require("DAG_SUMMARY tasks=3 stages=3 makespan_us=25" in log,
+    require("DAG_SUMMARY tasks=3 barriers=3 makespan_us=25" in log,
             "多前驱 DAG 没有完整结束")
-    stage_starts = parse_event_times(log, "DAG_STAGE_START")
-    stage_dones = parse_event_times(log, "DAG_STAGE_DONE")
-    require(stage_starts[0] == 0 and stage_starts[1] == 0,
-            "两个 root stage 没有同时启动")
-    require(stage_dones[0] == 10 and stage_dones[1] == 20,
-            "root stage 完成时刻错误")
-    require(stage_starts[2] == 20 and stage_dones[2] == 25,
-            "stage 2 没有等待 stage 0 和 stage 1")
-    return "stage2 前驱集合={0,1}，20us 启动，25us 完成"
+    barrier_starts = parse_event_times(log, "DAG_BARRIER_START")
+    barrier_dones = parse_event_times(log, "DAG_BARRIER_DONE")
+    require(barrier_starts[0] == 0 and barrier_starts[1] == 0,
+            "两个 root barrier 没有同时启动")
+    require(barrier_dones[0] == 10 and barrier_dones[1] == 20,
+            "root barrier 完成时刻错误")
+    require(barrier_starts[2] == 20 and barrier_dones[2] == 25,
+            "barrier 2 没有等待 barrier 0 和 barrier 1")
+    return "barrier2 前驱集合={0,1}，20us 启动，25us 完成"
+
+
+def validate_independent_barriers(log: str, returncode: int) -> str:
+    assert_success(log, returncode)
+    require("DAG_SUMMARY tasks=5 barriers=5 makespan_us=45" in log,
+            "独立 barrier DAG 没有完整结束")
+    starts = parse_event_times(log, "DAG_TASK_START")
+    dones = parse_event_times(log, "DAG_TASK_DONE")
+    require(starts[2] == starts[3] == dones[1],
+            "Dispatch 1 与 Attention 2 没有在共同前驱后并发启动")
+    require(starts[5] == dones[3] == 20,
+            "Dispatch 2 被无关的 Dispatch 1 阻塞")
+    require(starts[4] == dones[2] == 40,
+            "Expert 1 没有只等待 Dispatch 1")
+    return "两个分支独立推进：Dispatch2=20us 启动，Expert1=40us 启动"
 
 
 def expect_failure(marker: str, expected_code: int | None = None) -> Callable[[str, int], str]:
@@ -308,7 +323,7 @@ def write_report(run_dir: Path, results: list[CaseResult], config: dict) -> None
         "## 测试目的",
         "",
         "验证服务器内部高速 FullMesh、同 rail L0 转发、跨 rail L0-L1-L0 转发、"
-        "plane 隔离、UEC flow/spray ECMP、静态流以及 DAG stage barrier。",
+        "plane 隔离、UEC flow/spray ECMP、静态流以及 DAG barrier。",
         "",
         "## 拓扑规模",
         "",
@@ -415,6 +430,18 @@ def main() -> int:
             ),
         )
         suite.run_case(
+            "dag_independent_barriers",
+            empty_matrix,
+            validate_independent_barriers,
+            dag=(
+                "1 0 | 0 0 | 0 10 | -\n"       # Attention 1
+                "2 1 | 0 0 | 0 30 | 0\n"       # Dispatch 1
+                "3 2 | 0 0 | 0 10 | 0\n"       # Attention 2
+                "4 3 | 0 0 | 0 5 | 1\n"        # Expert 1
+                "5 4 | 0 0 | 0 5 | 2\n"        # Dispatch 2
+            ),
+        )
+        suite.run_case(
             "reject_joint_task",
             empty_matrix,
             expect_failure("exactly one of transfer_bytes or compute_us"),
@@ -435,7 +462,7 @@ def main() -> int:
         suite.run_case(
             "reject_missing_predecessor",
             empty_matrix,
-            expect_failure("depends on a stage that has no tasks"),
+            expect_failure("depends on a barrier that has no tasks"),
             dag="1 0 | 0 0 | 0 1 | 99\n",
         )
         suite.run_case(

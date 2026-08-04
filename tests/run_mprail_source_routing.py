@@ -271,8 +271,8 @@ def validate_server_forward_trigger(log: str, returncode: int) -> str:
 def validate_dag_explicit(log: str, returncode: int) -> str:
     explicit_validator("routing_mode packet_spray_ecmp")(log, returncode)
     require("DAG_NETWORK_DONE task=2" in log, "显式 DAG network task 未完成")
-    require("DAG_SUMMARY tasks=1 stages=1" in log, "显式 DAG 未正常收敛")
-    return "DAG 第五组显式路径生效并完成 stage barrier"
+    require("DAG_SUMMARY tasks=1 barriers=1" in log, "显式 DAG 未正常收敛")
+    return "DAG 第五组显式路径生效并完成 barrier"
 
 
 def event_time(log: str, pattern: str) -> float:
@@ -289,11 +289,13 @@ def validate_dag_server_forward(log: str, returncode: int) -> str:
         r"^SERVER_FORWARD_PHASE_DONE flow=3 phase=dst_local time_us=([0-9.]+)$",
     )
     network_done = event_time(log, r"^DAG_NETWORK_DONE task=3 time_us=([0-9.]+)$")
-    stage_one_start = event_time(log, r"^DAG_STAGE_START stage=1 time_us=([0-9.]+)$")
+    barrier_one_start = event_time(
+        log, r"^DAG_BARRIER_START barrier=1 time_us=([0-9.]+)$"
+    )
     require(network_done >= dst_done, "DAG task 在 dst_local 完成前通知完成")
-    require(stage_one_start >= network_done, "后继 stage 在逻辑 flow 完成前启动")
+    require(barrier_one_start >= network_done, "后继 barrier 在逻辑 flow 完成前启动")
     require("DAG_COMPUTE_DONE task=4" in log, "后继 compute task 未完成")
-    return "DAG barrier 等待三阶段最终完成后才启动后继 stage"
+    return "DAG barrier 等待三阶段最终完成后才释放后继 barrier"
 
 
 def expect_failure(fragment: str) -> Callable[[str, int], str]:
@@ -326,7 +328,7 @@ def write_report(run_dir: Path, results: list[CaseResult]) -> None:
         "- 显式路径覆盖 flow ECMP、oblivious spray 和 ecmp_rr。",
         "- 服务器内部 src_local、fabric、dst_local 严格串行与 phase 跳过。",
         "- server_forward 最后 phase 的 CM trigger 链。",
-        "- DAG 后继 stage 等待最终 dst_local 完成。",
+        "- DAG 后继 barrier 等待最终 dst_local 完成。",
         "- 跨 plane 显式路径、错误 relay、compute route 和缺字段确定性失败。",
         "",
         "## 结果",

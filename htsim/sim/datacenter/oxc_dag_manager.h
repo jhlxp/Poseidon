@@ -14,21 +14,21 @@
 
 struct OxcDagTask {
     uint32_t id = 0;
-    int stage_id = 0;
+    int barrier_id = 0;
     int32_t src_rank = -1;
     int32_t dst_rank = -1;
     uint64_t transfer_bytes = 0;
     double compute_us = 0.0;
-    std::vector<int> predecessor_stages;
+    std::vector<int> predecessor_barriers;
     std::optional<MpRailRouteSpec> route;
 
     bool has_network() const { return transfer_bytes > 0; }
     bool has_compute() const { return compute_us > 0.0; }
 };
 
-// A stage-level dependency layer above the selected data plane. Each task owns
-// exactly one network or compute operation; tasks in a ready stage run in
-// parallel and the stage completes after its last task finishes.
+// A barrier DAG above the selected data plane. Each task owns exactly one
+// network or compute operation. Tasks assigned to a ready barrier run in
+// parallel, and the barrier is released after its last task finishes.
 class OxcDagManager {
 public:
     using NetworkLauncher = std::function<void(const OxcDagTask&)>;
@@ -37,8 +37,8 @@ public:
     OxcDagManager(EventList& eventlist, uint32_t node_count);
 
     // One non-comment task per line:
-    // task_id stage_id | src_rank dst_rank | transfer_bytes compute_us |
-    // predecessor_stage ... | -
+    // task_id barrier_id | src_rank dst_rank | transfer_bytes compute_us |
+    // predecessor_barrier ... | -
     void load_from_file(const std::string& path);
     void validate_network_tasks(const NetworkValidator& validator) const;
     void set_network_launcher(NetworkLauncher launcher);
@@ -62,7 +62,7 @@ private:
         TaskState state = TaskState::PENDING;
     };
 
-    struct Stage {
+    struct Barrier {
         int id = 0;
         int indegree = 0;
         int remaining_tasks = 0;
@@ -87,7 +87,7 @@ private:
     uint32_t node_count_;
     NetworkLauncher network_launcher_;
     std::map<uint32_t, TaskRecord> tasks_;
-    std::map<int, Stage> stages_;
+    std::map<int, Barrier> barriers_;
     bool loaded_ = false;
     bool started_ = false;
     bool finished_ = false;
@@ -95,10 +95,10 @@ private:
     simtime_picosec start_time_ = 0;
     simtime_picosec finish_time_ = 0;
 
-    void build_stages();
+    void build_barriers();
     void validate_acyclic() const;
-    void start_ready_stages();
-    void start_stage(int stage_id);
+    void start_ready_barriers();
+    void start_barrier(int barrier_id);
     void launch_task(uint32_t task_id);
     void finish_task(uint32_t task_id);
 };

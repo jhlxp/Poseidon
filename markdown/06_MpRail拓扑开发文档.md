@@ -241,4 +241,4 @@ mprail_topology.h/.cpp
 - 任一正向或反向 packet 一旦进入某个 plane，就不会跨 plane。
 - 任意链路和队列的名称都包含 plane，能够审计 plane 隔离。
 - 不出现光交换相关配置、日志或路径选择。
-- DAG 的 network/compute stage 屏障在 MpRail 下保持正确。
+- DAG 的 network/compute barrier在 MpRail 下保持正确。

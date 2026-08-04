@@ -41,7 +41,7 @@ route 子句必须位于一条 connection 的末尾。
 DAG 在原有四个字段组后增加一个可选 route 组：
 
 ```text
-task_id stage_id | src_rank dst_rank | transfer_bytes compute_us | predecessors | route_spec
+task_id barrier_id | src_rank dst_rank | transfer_bytes compute_us | predecessor_barriers | route_spec
 ```
 
 普通 task 不需要第五组，旧格式保持兼容：
@@ -180,7 +180,7 @@ Phase 3 dst_local: dst_relay -> dst_rank
 - 服务器内部 subflow 使用仿真器动态分配的内部 flow ID，避免与用户 ID 冲突。
 - 逻辑 flow 只有在最后一个实际 subflow 完成后才完成。
 - DAG network task 的完成回调只在整个三阶段状态机结束后触发。
-- DAG 的后继 stage 因此会等待目的服务器内部转发结束。
+- DAG 的后继 barrier 因此会等待目的服务器内部转发结束。
 - CM 的 `send_done_trigger` 和 `recv_done_trigger` 绑定到最后一个实际 subflow。
 - CM 的启动 `trigger` 只启动第一个实际 subflow。
 
@@ -222,5 +222,5 @@ route 语法错误或拓扑坐标不合法时，程序必须在事件循环开�
 - 显式正向与自动反向路径使用成对的 plane、spine 和 bundle。
 - `server_forward` 三阶段严格串行，跳过规则正确。
 - CM 与 DAG 都支持两种 route 模式。
-- DAG task 只在最终本地 phase 完成后通知 stage barrier。
+- DAG task 只在最终本地 phase 完成后通知 barrier。
 - 非法输入在仿真开始前确定性失败。
