@@ -18,7 +18,6 @@ struct MpRailTopologyConfig {
     uint32_t nodes = 0;
     uint32_t planes = 8;
     uint32_t gpus_per_server = 8;
-    uint32_t servers_per_rail = 1;
     uint32_t l1_eps_per_plane = 1;
     uint32_t l0_l1_links_per_spine = 1;
     bool packet_spray = false;

@@ -63,7 +63,7 @@ def build_inputs(input_dir: Path) -> None:
         },
         {
             "link_id": 1,
-            "link_name": "MPRAIL_HOST_SRC_8->MPRAIL_L0_r1_p3(b0)",
+            "link_name": "MPRAIL_HOST_SRC_8->MPRAIL_L0_r0_p0(b0)",
             "layer": "unknown",
             "direction": "unknown",
             "src_type": "unknown",
@@ -75,7 +75,7 @@ def build_inputs(input_dir: Path) -> None:
         },
         {
             "link_id": 2,
-            "link_name": "MPRAIL_L0_r1_p3->MPRAIL_L1_p3_s2(b1)",
+            "link_name": "MPRAIL_L0_r0_p0->MPRAIL_L1_p0_s2(b0)",
             "layer": "unknown",
             "direction": "unknown",
             "src_type": "unknown",
@@ -87,7 +87,7 @@ def build_inputs(input_dir: Path) -> None:
         },
         {
             "link_id": 3,
-            "link_name": "MPRAIL_L1_p3_s2->MPRAIL_L0_r2_p3(b0)",
+            "link_name": "MPRAIL_L1_p0_s2->MPRAIL_L0_r1_p0(b0)",
             "layer": "unknown",
             "direction": "unknown",
             "src_type": "unknown",
@@ -99,7 +99,7 @@ def build_inputs(input_dir: Path) -> None:
         },
         {
             "link_id": 4,
-            "link_name": "MPRAIL_L0_r2_p3->MPRAIL_HOST_DST_16(b0)",
+            "link_name": "MPRAIL_L0_r1_p0->MPRAIL_HOST_DST_9(b0)",
             "layer": "unknown",
             "direction": "unknown",
             "src_type": "unknown",
@@ -164,19 +164,19 @@ def build_inputs(input_dir: Path) -> None:
 def parsing_case() -> str:
     cases = [
         (0, "MPRAIL_LOCAL_MPRAIL_HOST_SRC_0->MPRAIL_HOST_DST_1(b0)", "server_local"),
-        (1, "MPRAIL_HOST_SRC_8->MPRAIL_L0_r1_p3(b0)", "host_l0_up"),
-        (2, "MPRAIL_L0_r1_p3->MPRAIL_L1_p3_s2(b1)", "l0_l1_up"),
-        (3, "MPRAIL_L1_p3_s2->MPRAIL_L0_r2_p3(b0)", "l1_l0_down"),
-        (4, "MPRAIL_L0_r2_p3->MPRAIL_HOST_DST_16(b0)", "l0_host_down"),
+        (1, "MPRAIL_HOST_SRC_8->MPRAIL_L0_r0_p0(b0)", "host_l0_up"),
+        (2, "MPRAIL_L0_r0_p0->MPRAIL_L1_p0_s2(b0)", "l0_l1_up"),
+        (3, "MPRAIL_L1_p0_s2->MPRAIL_L0_r1_p0(b0)", "l1_l0_down"),
+        (4, "MPRAIL_L0_r1_p0->MPRAIL_HOST_DST_9(b0)", "l0_host_down"),
     ]
     parsed = [classify_mprail_link(item, name, 400) for item, name, _ in cases]
     require(
         [item.panel for item in parsed] == [panel for _, _, panel in cases],
         "五类链路分类错误",
     )
-    require(parsed[1].src_rank == 8 and parsed[1].rail == 1 and parsed[1].plane == 3,
+    require(parsed[1].src_rank == 8 and parsed[1].rail == 0 and parsed[1].plane == 0,
             "Host->L0 坐标解析错误")
-    require(parsed[2].spine == 2 and parsed[2].bundle == 1,
+    require(parsed[2].spine == 2 and parsed[2].bundle == 0,
             "L0->L1 spine/bundle 解析错误")
     return "五类 MpRail 链路均恢复出正确 panel 和拓扑坐标"
 
@@ -205,7 +205,7 @@ def run_plotter(run_dir: Path, input_dir: Path, output_dir: Path) -> str:
         "--title",
         "MpRail visualization functional test",
         "--planes",
-        "8",
+        "1",
         "--dpi",
         "100",
     ]
@@ -226,7 +226,7 @@ def run_plotter(run_dir: Path, input_dir: Path, output_dir: Path) -> str:
     require(completed.returncode == 0, f"绘图进程返回码 {completed.returncode}")
     require("parsed 5 MpRail links across 4 time buckets" in completed.stdout,
             "绘图日志的链路或时间桶数量错误")
-    return "CLI 成功读取 5 links/4 buckets，按 8 planes 生成四类产物"
+    return "CLI 成功读取 5 links/4 buckets，按单 plane 生成四类产物"
 
 
 def png_case(output_dir: Path) -> str:
@@ -260,16 +260,16 @@ def summary_case(output_dir: Path) -> str:
         newline="", encoding="utf-8"
     ) as handle:
         endpoints = {row["direction"]: row for row in csv.DictReader(handle)}
-    require(endpoints["output"]["configured_planes"] == "8",
+    require(endpoints["output"]["configured_planes"] == "1",
             "endpoint summary plane 数错误")
-    require(endpoints["output"]["aggregate_line_rate_gbps"] == "3200.0",
-            "8x400 Gbps 聚合容量错误")
-    require(math.isclose(float(endpoints["output"]["peak_utilization"]), 0.125),
-            "output peak utilization 应为 12.5%")
-    require(math.isclose(float(endpoints["output"]["peak_headroom"]), 0.875),
-            "output peak headroom 应为 87.5%")
-    require(math.isclose(float(endpoints["input"]["peak_utilization"]), 0.0625),
-            "input peak utilization 应为 6.25%")
+    require(endpoints["output"]["aggregate_line_rate_gbps"] == "400.0",
+            "单卡 400 Gbps 容量错误")
+    require(math.isclose(float(endpoints["output"]["peak_utilization"]), 1.0),
+            "output peak utilization 应为 100%")
+    require(math.isclose(float(endpoints["output"]["peak_headroom"]), 0.0),
+            "output peak headroom 应为 0%")
+    require(math.isclose(float(endpoints["input"]["peak_utilization"]), 0.5),
+            "input peak utilization 应为 50%")
 
     with (output_dir / "mprail_link_inventory.csv").open(
         newline="", encoding="utf-8"
@@ -278,15 +278,15 @@ def summary_case(output_dir: Path) -> str:
     require(len(inventory) == 5, "inventory 链路数错误")
     fabric = next(row for row in inventory if row["panel"] == "l0_l1_up")
     require(
-        fabric["rail"] == "1"
-        and fabric["plane"] == "3"
+        fabric["rail"] == "0"
+        and fabric["plane"] == "0"
         and fabric["spine"] == "2"
-        and fabric["bundle"] == "1",
+        and fabric["bundle"] == "0",
         "inventory fabric 坐标错误",
     )
     return (
-        "8x400=3200 Gbps；output peak utilization/headroom=12.5%/87.5%；"
-        "inventory 恢复 rail1/plane3/spine2/bundle1"
+        "1x400=400 Gbps；output peak utilization/headroom=100%/0%；"
+        "inventory 恢复 rail0/plane0/spine2/bundle0"
     )
 
 

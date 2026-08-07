@@ -8,7 +8,7 @@
 
 ```text
 给定这些 source tokens、top-k experts、expert placement 和硬件 rank，
-DeepEP 或 MoonEP 实际需要哪些计算、复制、转发、归并和同步？
+NCCL、DeepEP 或 MoonEP 实际需要哪些计算、复制、转发、归并和同步？
 ```
 
 ## 2. 共享输入模型
@@ -87,6 +87,7 @@ entry -> planning/layout -> dispatch -> expert_compute -> combine -> exit
 - rank/server/expert 坐标校验；
 - router assignment 的加载和确定性排序；
 - tensor 字节数、dtype、alignment 和 padding；
+- token payload 去冗余策略及 multiplicity 核算；
 - point-to-point flow 聚合；
 - local bypass 判定；
 - 理论 FLOP 数和固定 `compute_us` 占位；
@@ -102,7 +103,10 @@ build_backward(plan, cost_provider) -> PhaseGraph
 summarize(plan) -> AlgorithmReport
 ```
 
-DeepEP 的 `AlgorithmPlan` 保存 domain 去重、relay 和 reduction 位置；MoonEP 的 plan 保存动态 replica、`experts_to_copy`、padding 和 duplicate groups。两者不应塞进一个充满可选字段的通用 plan。
+NCCL 的 `AlgorithmPlan` 关闭去冗余并保留每条 top-k route；DeepEP 的 plan 保存
+destination-rank 去重和 relay；MoonEP 的 plan 按 home server 保存动态 replica、
+execution rank、weight prefetch 和 padding，并复用 DeepEP scale-out transport。
+三者不应塞进一个充满可选字段的通用 plan。
 
 ## 5. Token 路由与字节核算
 
@@ -115,16 +119,41 @@ num_routes * aligned_token_bytes
 num_routes = sum_r(S_r * K)
 ```
 
-但真实算法可能按 rank 或 node 去重。如果一个 token 的多个 expert 位于同一 destination rank，hidden state 可能只发送一次，expert ID 和 weight 作为 metadata 携带。因此需要从 route assignment 计算：
+但真实算法可能按 destination rank 去重。如果一个 token 的多个 expert 位于同一
+destination rank，hidden state 只发送一次，expert ID 和 weight 作为 metadata
+携带。因此需要从 route assignment 计算：
 
 ```text
 U_rank(t) = unique destination ranks selected by token t
-U_node(t) = unique destination servers selected by token t
 ```
 
-不同算法分别选择 `K`、`U_rank` 或 `U_node` 作为某一 hop 的复制数。
+NCCL 选择 `K` 并保留 route multiplicity；DeepEP/MoonEP 等算法默认选择
+`U_rank`。去重只改变 payload 数，不能改变逻辑 expert route 数。
 
-### 5.2 Payload 分类
+### 5.2 共享 TokenPayloadPolicy
+
+第一层 base 提供统一策略对象：
+
+```text
+TokenPayloadPolicy
+  deduplicate: bool = true
+  scope: none | destination_rank = destination_rank
+```
+
+契约如下：
+
+- base 默认 `deduplicate=true`；除 NCCL 外的算法默认开启。
+- NCCL 必须显式设置 `deduplicate=false, scope=none`。
+- planner 根据策略把原始 `(src, token, topk_slot, expert, dst)` route 转成
+  payload item。
+- 去冗余不能删除 expert route metadata，也不能减少 expert compute route 数。
+- emitter 不允许重新去重；它只聚合 planner 已经确定的 payload items。
+
+同一 token 的两个 top-k slot 落到相同 dst rank 时，NCCL 产生两个 payload
+item；rank-level 去冗余算法产生一个 hidden payload item，并保留两个 expert
+metadata。
+
+### 5.3 Payload 分类
 
 每个 TransferTask 必须标记 payload：
 
@@ -139,7 +168,7 @@ U_node(t) = unique destination servers selected by token t
 
 不能使用一个 `redundancy_factor` 同时放大所有通信。token 冗余、expert 权重冗余、padding 和 metadata 是不同来源，生命周期和路径也不同。
 
-### 5.3 Token 字节
+### 5.4 Token 字节
 
 基础公式：
 
@@ -157,44 +186,35 @@ output_bytes = H * bytes(combine_dtype)
 
 例如 FP8 dispatch 与 BF16 combine 不能共用同一个 `token_bytes`。
 
-### 5.4 Flow 聚合
+### 5.5 Flow 聚合
 
-IR 不为每个 token 创建一个 HTSim flow。经过算法去重之后，按以下 key 聚合：
+IR 不为每个 token 创建一个 HTSim flow。经过 `TokenPayloadPolicy` 处理之后，按以下
+key 聚合：
 
 ```text
 (phase, src_rank, dst_rank, payload_kind, route_spec, chunk_id)
 ```
 
-聚合后 `bytes` 是该 key 下所有逻辑 payload 的总和。报告中同时保存 logical message 数和 aggregated flow 数。
+聚合后 `bytes` 是该 key 下所有逻辑 payload 的总和。NCCL 即使把多条 route
+聚合到同一个 `(src_rank, dst_rank)` flow，也必须把全部 route payload 字节累加，
+不能按 unique token 缩减。报告中同时保存 route 数、unique token 数、logical
+message 数和 aggregated flow 数。
 
 同 rank bypass 不生成 `src_rank == dst_rank` 的 network task，因为当前 DAG 禁止这种输入。本地读写、copy 或 reduce 计入对应 ComputeTask。
 
-## 6. 多级转发与 one-to-many
+## 6. DeepEP 目标端转发
 
-DeepEP hierarchical dispatch 可能先把一个 token 按 destination node 去重，只通过 fabric 发送一份，然后在目标服务器内向多个 expert rank 扇出。
-
-这不能展开为多条完整 `server_forward`：
-
-```text
-错误：每个 destination expert rank 各发一份 fabric payload
-正确：src -> destination relay 只发一份，再 relay -> target ranks 本地扇出
-```
-
-第一层 IR 应表达：
+DeepEP 对去重后的每个 `(src_rank, dst_rank)` chunk 生成一个逻辑 transfer task。
+跨服务器时，task 端点仍写真实 source/destination rank，并附加：
 
 ```text
-fabric_transfer(token, src, relay, once_per_destination_node)
-local_fanout(token, relay, each_unique_destination_rank)
+server_forward src_relay:<src_rank> dst_relay:<目标服务器中与 src 同 local-index 的 rank>
 ```
 
-barrier DAG 既能表达 full-message 转发，也能通过显式 chunk task 表达流水转发。当前实现使用 `chunk_tokens` 把逻辑 token 集合拆成多个 task：
-
-```text
-fabric_chunk[i] -> local_fanout_chunk[i]
-```
-
-每个 chunk 是一条完整 flow，后继监听该 flow 的完成 barrier。它能表达 chunk 间流水，
-但不监听单条 flow 内第 N 个 packet 到达，因此不能描述成 packet-progress 模型。
+因为 `src_relay == src_rank`，HTSim 跳过 source-local phase，只执行 fabric flow 和
+可选的 destination-local flow。两个 subflow 严格串行，整个逻辑 task 在最后一个
+subflow 完成后释放 barrier。不同 chunk 是不同逻辑 task，可以相互流水；单条 flow
+内部的 packet progress 不暴露给 DAG。
 
 ## 7. 冗余专家建模
 
@@ -205,14 +225,16 @@ fabric_chunk[i] -> local_fanout_chunk[i]
 3. `token reassignment`：dispatch 目的地改为 home 或 replica；
 4. `gradient reduction`：训练时 replica grad 回到 home rank。
 
-动态 replica 还会改变：
+动态 replica 只允许位于 logical expert 的 home server 内，并会改变：
 
 - 每 rank 的 token 数和 padding；
 - expert GEMM 的 shape；
 - dispatch/combine 的 src-dst matrix；
 - 权重和梯度通信与 token 通信之间的依赖。
 
-因此冗余专家属于算法 planner，而不是 emitter 的额外 flag。
+因此冗余专家属于 per-server 算法 planner，而不是 emitter 的额外 flag。跨服务器
+token dispatch/combine 使用 DeepEP destination-side forwarding；expert weight
+prefetch 始终是同服务器 local flow。
 
 ## 8. Compute 固定时长占位
 
@@ -275,10 +297,11 @@ lowering 需要验证：
 
 ## 10. 首版验收
 
-- 同一个 routing trace 在 DeepEP/MoonEP 下共享逻辑 expert 选择。
+- 同一个 routing trace 在 NCCL/DeepEP/MoonEP 下共享逻辑 expert 选择。
 - 算法输出的 token、weight、grad 字节分项可手算复核。
-- DeepEP 按 destination node 去重，fabric 不重复发送。
-- MoonEP 每个 rank 的 planned real token 数为 `S * K`，padding 单独统计。
+- NCCL 保留 top-k route multiplicity，不执行 hidden payload 去冗余。
+- DeepEP 按 destination rank 去重，并为跨服务器 task 使用目标端转发。
+- MoonEP 在每个 home server 内实现 floor/ceil route balance，padding 单独统计。
 - 输出 `.dag` 能被当前 HTSim 加载并完成。
 - manifest 能恢复每个 task 对应的算法 phase。
 - 固定随机种子时输出逐字节稳定。

@@ -63,7 +63,15 @@ parallel:
 
 moe_algorithm:
   name: deepep
-  mode: v2_hybrid
+  forwarding: destination
+```
+
+目标算法名包括：
+
+```text
+nccl           # 无去冗余、无 relay forwarding 的 rank-direct All-to-All
+deepep         # destination-rank 去重 + 同 index relay/目标端 forwarding
+moonep         # 动态 expert replica workload
 ```
 
 首版限制为 `TP=1`、`PP=1`。先把 EP、router 和完整 block 依赖做对，再扩展 TP collectives 和 PP microbatch pipeline。
@@ -176,7 +184,8 @@ overlap_compute_peak = 989 * 112 / 132 ~= 839.15 TFLOP/s
 
 NVIDIA 当前 H100 产品规格给出的 BF16/FP16 `1,979 TFLOP/s` 带结构化稀疏；首版不假设模型满足 2:4 sparsity，因此使用约一半的 dense 值 `989 TFLOP/s`。每个 compute task 绑定一张 GPU/rank，所以只使用单卡值。8 卡总值仅写入报告。
 
-`communication_sms_per_rank=20` 是实验配置，不是 DeepEP 的固定事实。当前 DeepEP V2 可以按配置计算或覆盖 `num_sms`；这里固定为 20 是为了用一个参数近似通信 kernel 和计算 kernel 的主要资源竞争。
+`communication_sms_per_rank=20` 是本项目实验配置，不是 DeepEP 的固定事实；这里
+用一个固定参数近似通信 kernel 和计算 kernel 的主要资源竞争。
 
 ### 6.2 固定时间换算
 
@@ -240,7 +249,7 @@ shared_expert_schedule = serial | overlap_dispatch | overlap_moe
 
 ### 7.2 Microbatch overlap
 
-DeepEP low-latency 的 hook 或框架双 batch 调度可以形成：
+训练/prefill 的框架双 batch 调度可以形成：
 
 ```text
 microbatch n:   attention -> dispatch -> expert -> combine
@@ -316,10 +325,14 @@ TP=1, PP=1, EP=8
 H=7168, top-k=8
 固定 expert placement
 可重放的 synthetic router assignment
-DeepEP 单节点路径与 MoonEP 两种输出
+NCCL、DeepEP 单节点路径与 MoonEP 三种输出
 ```
 
-这个目标用于同条件比较节点内专家通信、负载不均衡和算法差异。第二个独立配置再使用 `EP=16、2 servers x 8 GPUs、DeepEP V2 hybrid` 验证跨服务器去重和 forwarding。这样不会把 MoonEP 扩展到其当前官方实现未覆盖的跨节点范围，也不会过早引入 TP/PP/backward。
+这个目标用于同条件比较节点内专家通信、负载不均衡和算法差异。跨服务器对比统一
+使用 EP32、4 servers x 8 GPUs、plane=1 的专用测试拓扑：NCCL 验证 rank-direct
+All-to-All 和 Spine 流量，DeepEP 验证 destination-rank 去重与目标端 forwarding，
+MoonEP 在每个 expert home server 内独立规划 replica，并复用 DeepEP 跨服务器
+transport。该 MoonEP 组合是本项目的核心算法抽象，不声称官方实现提供多节点 RDMA。
 
 ## 12. 硬件规格来源
 

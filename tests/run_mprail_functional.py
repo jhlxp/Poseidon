@@ -88,12 +88,11 @@ class Suite:
         command = [
             str(BINARY),
             "-topology", "mprail",
-            "-mprail_planes", "8",
-            "-mprail_gpus_per_server", "4",
-            "-mprail_servers_per_rail", "2",
-            "-mprail_l1_eps_per_plane", "2",
-            "-mprail_l0_l1_links_per_spine", "2",
-            "-linkspeed", "100000",
+            "-mprail_planes", "1",
+            "-mprail_gpus_per_server", "8",
+            "-mprail_l1_eps_per_plane", "8",
+            "-mprail_l0_l1_links_per_spine", "1",
+            "-linkspeed", "400000",
             "-local_linkspeed", "3200000",
             "-local_latency_ns", "50",
             "-hop_latency", "0.1",
@@ -189,11 +188,11 @@ def validate_cross_rail(log: str, returncode: int) -> str:
                     and src_plane.group(1) == dst_plane.group(1),
                     f"跨 plane 链路: {src} -> {dst}")
     topology = re.search(
-        r"MPRAIL_TOPOLOGY nodes=16 servers=(\d+) rails=(\d+) "
+        r"MPRAIL_TOPOLOGY nodes=32 servers=(\d+) rails=(\d+) "
         r"planes=(\d+) l0=(\d+) l1=(\d+)", log
     )
     require(topology is not None, "缺少拓扑计数日志")
-    require(tuple(map(int, topology.groups())) == (4, 2, 8, 16, 16),
+    require(tuple(map(int, topology.groups())) == (4, 8, 1, 8, 8),
             f"拓扑计数错误: {topology.groups()}")
     fabric_links = sum(
         ("MPRAIL_L0" in src and "MPRAIL_L1" in dst)
@@ -201,7 +200,7 @@ def validate_cross_rail(log: str, returncode: int) -> str:
         for src, dst in links
     )
     return (
-        "servers=4，rails=2，planes=8，L0=16，L1=16，"
+        "servers=4，rails=8，planes=1，L0=8，L1=8，"
         f"本次物化 L0/L1 有向链路 {fabric_links} 条"
     )
 
@@ -211,9 +210,9 @@ def validate_flow_routing_mode(log: str, returncode: int) -> str:
     require("routing_mode flow_ecmp" in log, "全局路由模式不是 flow_ecmp")
     require(re.search(r"routing=flow_ecmp plane=\d+", log) is not None,
             "flow ECMP 没有固定 preferred plane")
-    require("ecmp_spines=2 ecmp_bundles=2" in log,
+    require("ecmp_spines=8 ecmp_bundles=1" in log,
             "flow ECMP 下一跳维度错误")
-    return "UEC ECMP：固定一个 plane，L0/L1 使用 2 spines x 2 bundles ECMP"
+    return "UEC ECMP：固定 plane 0，L0/L1 使用 8 spines x 1 bundle ECMP"
 
 
 def validate_spray_routing_mode(log: str, returncode: int) -> str:
@@ -222,9 +221,9 @@ def validate_spray_routing_mode(log: str, returncode: int) -> str:
             "全局路由模式不是 packet_spray_ecmp")
     require("routing=packet_spray_ecmp plane=-1" in log,
             "packet spray 仍固定 preferred plane")
-    require("ecmp_spines=2 ecmp_bundles=2" in log,
+    require("ecmp_spines=8 ecmp_bundles=1" in log,
             "packet spray ECMP 下一跳维度错误")
-    return "UEC spray：不固定 plane，L0/L1 使用 2 spines x 2 bundles ECMP"
+    return "UEC spray：单 plane 内逐包改变 pathid，使用 8 spines x 1 bundle ECMP"
 
 
 def parse_event_times(log: str, prefix: str) -> dict[int, float]:
@@ -302,7 +301,7 @@ def expect_failure(marker: str, expected_code: int | None = None) -> Callable[[s
 
 
 def connection_matrix(connections: list[str]) -> str:
-    return "Nodes 16\nConnections " + str(len(connections)) + "\n" \
+    return "Nodes 32\nConnections " + str(len(connections)) + "\n" \
         + "\n".join(connections) + ("\n" if connections else "")
 
 
@@ -327,9 +326,8 @@ def write_report(run_dir: Path, results: list[CaseResult], config: dict) -> None
         "",
         "## 拓扑规模",
         "",
-        "16 ranks，4 ranks/server，2 servers/rail，8 planes，"
-        "每 plane 2 台 L1-EPS，每个 L0/L1 对 2 条并行链路。",
-        "服务器内部 3200Gbps，每个 plane 的 endpoint 链路 100Gbps。",
+        "32 ranks，8 ranks/server，4 servers，1 plane，8 个 L0 Leaf，8 个 L1 Spine。",
+        "每个 Leaf 挂四张同 local-index GPU；RDMA 与 L0/L1 链路均为 400Gbps。",
         "",
         "## 测试结果",
         "",
@@ -364,13 +362,13 @@ def main() -> int:
     config = {
         "binary": str(BINARY),
         "build_dir": str(BUILD_DIR),
-        "nodes": 16,
-        "planes": 8,
-        "gpus_per_server": 4,
-        "servers_per_rail": 2,
-        "l1_eps_per_plane": 2,
-        "l0_l1_links_per_spine": 2,
-        "external_linkspeed_mbps": 100000,
+        "nodes": 32,
+        "planes": 1,
+        "gpus_per_server": 8,
+        "rail_mapping": "gpu_local_index",
+        "l1_eps_per_plane": 8,
+        "l0_l1_links_per_spine": 1,
+        "external_linkspeed_mbps": 400000,
         "local_linkspeed_mbps": 3200000,
     }
     suite = Suite(run_dir)
@@ -384,23 +382,23 @@ def main() -> int:
         )
         suite.run_case(
             "same_rail",
-            connection_matrix(["0->4 id 2 start 0 size 16384"]),
+            connection_matrix(["0->8 id 2 start 0 size 16384"]),
             validate_same_rail,
         )
         suite.run_case(
             "cross_rail",
-            connection_matrix(["0->8 id 3 start 0 size 16384"]),
+            connection_matrix(["0->9 id 3 start 0 size 16384"]),
             validate_cross_rail,
         )
         suite.run_case(
             "flow_routing_mode",
-            connection_matrix(["0->8 id 100 start 0 size 16384"]),
+            connection_matrix(["0->9 id 100 start 0 size 16384"]),
             validate_flow_routing_mode,
             extra_args=["-load_balancing_algo", "ecmp"],
         )
         suite.run_case(
             "spray_routing_mode",
-            connection_matrix(["0->8 id 101 start 0 size 16384"]),
+            connection_matrix(["0->9 id 101 start 0 size 16384"]),
             validate_spray_routing_mode,
             extra_args=["-load_balancing_algo", "oblivious"],
         )
@@ -468,8 +466,8 @@ def main() -> int:
         suite.run_case(
             "reject_rank_out_of_range",
             empty_matrix,
-            expect_failure("invalid rank: 16"),
-            dag="1 0 | 0 16 | 1024 0 | -\n",
+            expect_failure("invalid rank: 32"),
+            dag="1 0 | 0 32 | 1024 0 | -\n",
         )
         suite.run_case(
             "detect_dag_timeout",

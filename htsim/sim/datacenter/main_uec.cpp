@@ -76,7 +76,6 @@ void exit_error(char* progr) {
          << "\t[-local_latency_ns ns] direct intra-server one-way latency, default 200ns\n"
          << "\t[-mprail_planes N] independent EPS planes, default 8\n"
          << "\t[-mprail_gpus_per_server N] ranks in a FullMesh server, default 8\n"
-         << "\t[-mprail_servers_per_rail N] servers attached to each rail, default 1\n"
          << "\t[-mprail_l1_eps_per_plane N] L1 EPS switches per plane, default 1\n"
          << "\t[-mprail_l0_l1_links_per_spine N] parallel links per L0/L1 pair, default 1"
          << endl;
@@ -329,8 +328,8 @@ simtime_picosec calculate_mprail_pair_rtt(
                 1, cfg.local_latency, cfg.local_linkspeed);
     }
 
-    const uint32_t src_rail = src_server / cfg.servers_per_rail;
-    const uint32_t dst_rail = dst_server / cfg.servers_per_rail;
+    const uint32_t src_rail = src % cfg.gpus_per_server;
+    const uint32_t dst_rail = dst % cfg.gpus_per_server;
     if (src_rail == dst_rail) {
         return calculate_mprail_rtt(
                 2, 1, cfg.link_latency, cfg.switch_latency,
@@ -514,10 +513,6 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i],"-mprail_gpus_per_server")) {
             mprail_cfg.gpus_per_server = parse_positive_u32_arg(argv[i], argv[i+1]);
             cout << "mprail_gpus_per_server " << mprail_cfg.gpus_per_server << endl;
-            i++;
-        } else if (!strcmp(argv[i],"-mprail_servers_per_rail")) {
-            mprail_cfg.servers_per_rail = parse_positive_u32_arg(argv[i], argv[i+1]);
-            cout << "mprail_servers_per_rail " << mprail_cfg.servers_per_rail << endl;
             i++;
         } else if (!strcmp(argv[i],"-mprail_l1_eps_per_plane")) {
             mprail_cfg.l1_eps_per_plane = parse_positive_u32_arg(argv[i], argv[i+1]);
@@ -1171,7 +1166,6 @@ int main(int argc, char **argv) {
     if (mprail_mode) {
         if (mprail_cfg.planes == 0 || mprail_cfg.planes > 8
                 || mprail_cfg.gpus_per_server == 0
-                || mprail_cfg.servers_per_rail == 0
                 || mprail_cfg.l1_eps_per_plane == 0
                 || mprail_cfg.l0_l1_links_per_spine == 0) {
             cerr << "Invalid MpRail dimensions; counts must be positive and planes must be <= 8"
@@ -1265,9 +1259,7 @@ int main(int argc, char **argv) {
         const uint32_t server_count =
                 (no_of_nodes + mprail_cfg.gpus_per_server - 1)
                 / mprail_cfg.gpus_per_server;
-        const uint32_t rail_count =
-                (server_count + mprail_cfg.servers_per_rail - 1)
-                / mprail_cfg.servers_per_rail;
+        const uint32_t rail_count = mprail_cfg.gpus_per_server;
         const uint32_t l0_count = rail_count * mprail_cfg.planes;
         const uint32_t l1_count =
                 mprail_cfg.planes * mprail_cfg.l1_eps_per_plane;
@@ -1279,7 +1271,7 @@ int main(int argc, char **argv) {
         cout << "rails " << rail_count << endl;
         cout << "planes " << mprail_cfg.planes << endl;
         cout << "gpus_per_server " << mprail_cfg.gpus_per_server << endl;
-        cout << "servers_per_rail " << mprail_cfg.servers_per_rail << endl;
+        cout << "rail_mapping gpu_local_index" << endl;
         cout << "l0_switches " << l0_count << endl;
         cout << "l1_switches " << l1_count << endl;
         cout << "l1_eps_per_plane " << mprail_cfg.l1_eps_per_plane << endl;

@@ -7,7 +7,7 @@ MoE workload 生成器与 HTSim/MpRail 仿真器应当解耦。
 生成器负责：
 
 - 描述模型、并行布局、expert placement 和 router 输出；
-- 把 DeepEP、MoonEP 等算法展开成计算与通信任务图；
+- 把 NCCL、DeepEP、MoonEP 等算法展开成计算与通信任务图；
 - 用 H100 SXM dense BF16 理论峰值把算子 FLOP 数换算成固定 `compute_us` 占位；
 - 根据 tensor 形状、数据类型、去重、padding 和转发方案计算 `transfer_bytes`；
 - 最终输出 HTSim 可读取的 `.dag` 和空 `.cm`。
@@ -35,7 +35,7 @@ HTSim 负责：
   MoE invocation + expert placement + token routes + algorithm config
                             |
                             v
-  DeepEP / MoonEP 等算法专属 phase graph
+  NCCL / DeepEP / MoonEP 等算法专属 phase graph
                             |
                             v
 共享 lowering
@@ -64,6 +64,7 @@ pysrc/
 │   ├── emitter.py
 │   ├── algorithms/
 │   │   ├── common.py
+│   │   ├── nccl.py
 │   │   ├── deepep.py
 │   │   └── moonep.py
 │   └── models/
@@ -81,7 +82,7 @@ HTSim C++ 类。
 ```bash
 python3 pysrc/generate_moe_dag.py \
   --output generated_workloads/deepep_demo \
-  --algorithm deepep-hybrid \
+  --algorithm deepep \
   --num-ranks 16 --gpus-per-server 8 \
   --num-experts 16 --topk 8 \
   --tokens-per-rank 128 --micro-batches 2 \
@@ -101,14 +102,15 @@ python3 pysrc/generate_moe_dag.py \
 | token routing | 每个 source rank 的 token 选择了哪些 expert；来自 trace 或合成分布 |
 | 硬件 cost | 首版固定为 H100 SXM、dense BF16、`989 TFLOP/s/GPU` |
 
-算法配置是第一层的额外输入。当前代码已接受：
+算法配置是第一层的额外输入。本阶段代码接受：
 
-- `deepep-hybrid` 与 `deepep-direct` forward；
+- `nccl` rank-direct/no-dedup forward；
+- `deepep` 训练/prefill forward 核心路径；
 - dispatch、combine、weight dtype 与 `chunk_tokens`；
-- MoonEP forward 的 `replicas_per_rank` 和 `token_padding`。
+- `moonep` 的 per-server replica planning、`replicas_per_rank` 和 `token_padding`。
 
-DeepEP low-latency/backward、MoonEP backward、expanded metadata、zero-copy 和
-remote-direct 尚未实现，CLI 不提供对应开关。
+DeepEP/MoonEP backward、expanded metadata、zero-copy 和 kernel profiling 尚未
+实现，CLI 不提供对应开关。DeepEP low-latency/decode 不属于当前项目范围。
 
 ### 4.2 输出
 
@@ -139,13 +141,17 @@ generated_workloads/<name>/
 
 不能让每个算法从头实现 token、expert、rank 和 byte 计算，否则同一模型在不同算法间不可比较。
 
-也不能定义一个固定的 `dispatch -> expert -> combine` 模板后只替换路由。MoonEP 还包含在线规划、动态冗余 expert、权重预取和训练梯度归并；DeepEP hybrid 包含按 scale-out domain 去重和 scale-up 转发。这些不是普通 all-to-all 的参数变化。
+也不能定义一个固定的 `dispatch -> expert -> combine` 模板后只替换路由。NCCL
+保留全部 top-k payload 并直达 expert rank；MoonEP 还包含在线规划、动态冗余
+expert、权重预取和训练梯度归并，并复用 DeepEP scale-out transport；DeepEP 按
+destination rank 去重，并通过目标服务器同 local-index relay 完成目标端转发。
+这些不是普通 all-to-all 的参数变化。
 
 因此采用：
 
 ```text
-共享：MoE 数学语义、placement、routing trace、IR、cost 接口、DAG emitter
-独立：每个算法的 planner、phase graph、去重/复制规则、通信聚合规则
+共享：MoE 数学语义、placement、routing trace、IR、cost 接口、去冗余策略接口、DAG emitter
+独立：每个算法的 planner、phase graph、去冗余开关/scope、复制规则、通信聚合规则
 ```
 
 ### 5.2 Task graph 直接映射到 barrier DAG
@@ -201,9 +207,12 @@ compute_us_overlap = operation_flops / 839.15e12 * 1e6
 | GPU compute | 固定时长事件 | 普通任务按 989 TFLOP/s，overlap 任务按 839.15 TFLOP/s |
 | 通信/计算 SM 竞争 | 静态近似 | 每 rank 的逻辑通信 phase 固定预留 20/132 SM |
 | HBM/NVLink memory contention | 未支持 | 不进入首版 compute 占位，报告中标注 |
-| multicast/one-to-many 原语 | 未支持 | 展开为经过正确去重后的点到点 flow |
+| multicast/one-to-many 原语 | 未支持且当前不需要 | DeepEP 按 destination rank 生成点到点逻辑 task |
 
-单个 `server_forward` 是完整消息的三阶段 store-and-forward。DeepEP 的 forwarding kernel 若按 chunk 流水化，需要拆成 fabric/local chunk task；使用单个 `server_forward` 时只能标为 coarse baseline。
+单个 `server_forward` 最多执行三阶段 store-and-forward。DeepEP 固定
+`src_relay=src_rank`，跳过源端阶段，因此每个跨服务器逻辑 task 实际执行 fabric
+flow 和可选的 destination-local flow。`chunk_tokens` 通过多个逻辑 task 表达
+chunk overlap，单条 flow 内 packet-progress 不建模。
 
 MpRail 的 server-local FullMesh 也只是对 NVLink rank-to-rank 数据移动的网络级近似。UEC flow 的可靠传输、ACK 和拥塞控制不等价于 NVLink load/store、TMA 或 symmetric-memory 语义。首版可以研究字节、依赖和本地带宽竞争，但不能把理论 compute 占位或节点内 FCT 宣称为真实 DeepEP/MoonEP kernel latency。
 
@@ -211,11 +220,11 @@ MpRail 的 server-local FullMesh 也只是对 NVLink rank-to-rank 数据移动�
 
 1. 实现 schema、placement、routing assignment、task-level graph 和确定性 ID。
 2. 实现 HTSim emitter、manifest 和静态校验。
-3. 实现 DeepEP hierarchical forward 的 byte-accurate coarse 模型。
+3. 实现 NCCL direct/no-dedup 与 DeepEP destination-forward coarse 模型。
 4. 实现单个 MoE sublayer：router、dispatch、expert、combine。
 5. 实现完整 transformer block forward：attention、residual、norm、MoE。
 6. 实现 H100 dense BF16 峰值和通信预留 20 SM 的固定时长占位。
-7. 实现 MoonEP planning、token dispatch、weight prefetch 和 combine。
+7. 实现 per-server MoonEP planning、weight prefetch 和 DeepEP scale-out 组合。
 8. 再增加训练 backward 和 gradient reduce。
 
 ## 8. 首版非目标
@@ -229,4 +238,7 @@ MpRail 的 server-local FullMesh 也只是对 NVLink rank-to-rank 数据移动�
 - 不把所有 CUDA microkernel 都拆成 DAG task；拆分粒度以依赖、资源类型和可测 cost 是否不同为准。
 - 不在第一版同时支持任意 DP/TP/PP/EP 组合。
 
-首个可验收目标是：单服务器 EP=8、固定 placement、TP=1、PP=1 的一个 transformer block forward，在相同 token routing 下生成 DeepEP 和 MoonEP 两份可比较 workload。DeepEP 的 2 服务器 EP=16 hierarchical forwarding 作为紧随其后的独立多节点验收，不与当前只支持单 NVLink domain 的 MoonEP 混成同一组对比。
+统一算法验收使用 EP32、4 servers x 8 GPUs、plane=1、400 Gbps：NCCL 直达真实
+rank，DeepEP 使用 destination-side forwarding，MoonEP 在每个 expert home server
+内独立创建 replica 并复用 DeepEP scale-out transport。三者共享相同 routing
+assignments、expert placement 和 dtype，保证字节、路径和计算分布可比较。

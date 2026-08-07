@@ -64,7 +64,7 @@ def build_simulator(run_dir: Path) -> None:
 
 def connection_matrix(flows: list[str]) -> str:
     return "\n".join([
-        "Nodes 16",
+        "Nodes 32",
         f"Connections {len(flows)}",
         *flows,
         "",
@@ -115,14 +115,14 @@ def parse_active_links(case_dir: Path, pattern: re.Pattern[str]) -> dict[str, in
 def parse_active_plane_ingress(case_dir: Path) -> dict[str, int]:
     return parse_active_links(
         case_dir,
-        re.compile(r"^MPRAIL_HOST_SRC_\d+->MPRAIL_L0_r0_p\d+\(b\d+\)$"),
+        re.compile(r"^MPRAIL_HOST_SRC_\d+->MPRAIL_L0_r0_p0\(b\d+\)$"),
     )
 
 
 def parse_active_forward_paths(case_dir: Path) -> dict[str, int]:
     return parse_active_links(
         case_dir,
-        re.compile(r"^MPRAIL_L0_r0_p\d+->MPRAIL_L1_p\d+_s\d+\(b\d+\)$"),
+        re.compile(r"^MPRAIL_L0_r0_p0->MPRAIL_L1_p0_s\d+\(b0\)$"),
     )
 
 
@@ -130,12 +130,11 @@ def base_command(matrix_path: Path, case_dir: Path, algorithm: str) -> list[str]
     return [
         str(BINARY),
         "-topology", "mprail",
-        "-mprail_planes", "8",
-        "-mprail_gpus_per_server", "4",
-        "-mprail_servers_per_rail", "2",
-        "-mprail_l1_eps_per_plane", "2",
-        "-mprail_l0_l1_links_per_spine", "2",
-        "-linkspeed", "100000",
+        "-mprail_planes", "1",
+        "-mprail_gpus_per_server", "8",
+        "-mprail_l1_eps_per_plane", "8",
+        "-mprail_l0_l1_links_per_spine", "1",
+        "-linkspeed", "400000",
         "-local_linkspeed", "3200000",
         "-local_latency_ns", "50",
         "-hop_latency", "0.1",
@@ -190,7 +189,7 @@ def run_mode(
         one_physical_path = len(active_ingress) == 1 and len(active_paths) == 1
         supported = completed_ok and stable and pinned and one_physical_path
         detail = (
-            f"单流熵数量 {len(entropies.get('0->8', []))}；"
+            f"单流熵数量 {len(entropies.get('0->9', []))}；"
             f"plane 入口 {len(active_ingress)} 条；"
             f"L0->L1 链路 {len(active_paths)} 条"
         )
@@ -198,26 +197,22 @@ def run_mode(
         stable = len(entropies) == 8 and all(
             len(items) == 1 for items in entropies.values()
         )
-        distributed = (
-            len(preferred_planes) > 1
-            and len(active_ingress) > 1
-            and len(active_paths) > 1
-        )
+        distributed = preferred_planes == [0] and len(active_paths) > 1
         supported = completed_ok and stable and distributed
         detail = (
             f"8 条流的包内熵均固定={stable}；"
-            f"覆盖 {len(preferred_planes)} 个 planes；"
-            f"实际使用 L0->L1 链路 {len(active_paths)} 条"
+            "固定使用 plane 0；"
+            f"实际使用 {len(active_paths)}/8 条 L0->L1 spine 链路"
         )
     else:
-        entropy_changes = len(entropies.get("0->8", [])) > 1
-        all_planes = len(active_ingress) == 8
-        physical_spray = len(active_paths) > 8
-        supported = completed_ok and entropy_changes and all_planes and physical_spray
+        entropy_changes = len(entropies.get("0->9", [])) > 1
+        one_plane = len(active_ingress) == 1
+        physical_spray = len(active_paths) > 1
+        supported = completed_ok and entropy_changes and one_plane and physical_spray
         detail = (
-            f"单流报文熵数量 {len(entropies.get('0->8', []))}；"
-            f"使用 plane 入口 {len(active_ingress)}/8；"
-            f"实际使用 L0->L1 链路 {len(active_paths)} 条；"
+            f"单流报文熵数量 {len(entropies.get('0->9', []))}；"
+            "固定使用 plane 0；"
+            f"实际使用 {len(active_paths)}/8 条 L0->L1 spine 链路；"
             f"报文级物理分流={physical_spray}"
         )
 
@@ -258,15 +253,15 @@ def write_report(run_dir: Path, results: list[ModeResult]) -> None:
         "",
         "## 判定",
         "",
-        "- `flow_level_ecmp`：单流内部的熵、plane 和实际 ECMP 路径必须固定。",
-        "- `flow_level_distribution`：不同 flow 必须能分散到不同 plane 和 ECMP 路径。",
+        "- `flow_level_ecmp`：单流内部的熵、plane 0 和实际 ECMP 路径必须固定。",
+        "- `flow_level_distribution`：不同 flow 必须能分散到不同 Spine ECMP 路径。",
         "- `spray_packet_ecmp`：单流不同报文的熵必须变化，并且必须分散到多条实际链路。",
         "",
         "## 代码路径核验",
         "",
         "MpRail 的 L0/L1 使用普通多下一跳 FIB，统一按 `(flow_id, pathid, switch_salt)` 做 ECMP。",
-        "`ecmp` 的 `pathid` 在流内固定，并将数据源固定到一个 plane；`oblivious` 逐包改变",
-        "`pathid`，同时由 UEC NIC 在 8 个 plane port 之间调度。",
+        "`ecmp` 的 `pathid` 在流内固定；`oblivious` 逐包改变 `pathid`。本测试只有",
+        "plane 0，因此两者都在单 plane 内对 8 个 Spine 做 ECMP。",
         "",
         "仿真日志、命令、输入矩阵和链路采样 CSV 位于 `cases/`。",
         "机器可读结果位于 `汇总.json`。",
@@ -287,14 +282,14 @@ def main() -> int:
     build_simulator(run_dir)
 
     single_flow_matrix = connection_matrix([
-        "0->8 id 100 start 0 size 65536",
+        "0->9 id 100 start 0 size 65536",
     ])
     flow_distribution_matrix = connection_matrix([
-        f"{src}->{src + 8} id {100 + src} start 0 size 16384"
-        for src in range(8)
+        f"0->{dst} id {100 + index} start 0 size 16384"
+        for index, dst in enumerate((9, 10, 11, 12, 13, 14, 15, 17))
     ])
     spray_matrix = connection_matrix([
-        "0->8 id 200 start 0 size 65536",
+        "0->9 id 200 start 0 size 65536",
     ])
     results = [
         run_mode(run_dir, "flow_level_ecmp", "ecmp", single_flow_matrix),

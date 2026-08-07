@@ -34,7 +34,7 @@ MpRailTopology::MpRailTopology(const MpRailTopologyConfig& cfg, EventList& event
     : _cfg(cfg), _eventlist(eventlist) {
     validate_config();
     _server_count = (_cfg.nodes + _cfg.gpus_per_server - 1) / _cfg.gpus_per_server;
-    _rail_count = (_server_count + _cfg.servers_per_rail - 1) / _cfg.servers_per_rail;
+    _rail_count = _cfg.gpus_per_server;
     _l0_count = _rail_count * _cfg.planes;
     _l1_count = _cfg.planes * _cfg.l1_eps_per_plane;
     init_switches();
@@ -46,7 +46,7 @@ MpRailTopology::MpRailTopology(const MpRailTopologyConfig& cfg, EventList& event
          << " l0=" << _l0_count
          << " l1=" << _l1_count
          << " gpus_per_server=" << _cfg.gpus_per_server
-         << " servers_per_rail=" << _cfg.servers_per_rail
+         << " rail_mapping=gpu_local_index"
          << " l1_eps_per_plane=" << _cfg.l1_eps_per_plane
          << " bundles=" << _cfg.l0_l1_links_per_spine
          << endl;
@@ -67,8 +67,7 @@ MpRailTopology::~MpRailTopology() {
 
 void MpRailTopology::validate_config() const {
     if (_cfg.nodes == 0 || _cfg.planes == 0 || _cfg.gpus_per_server == 0
-            || _cfg.servers_per_rail == 0 || _cfg.l1_eps_per_plane == 0
-            || _cfg.l0_l1_links_per_spine == 0) {
+            || _cfg.l1_eps_per_plane == 0 || _cfg.l0_l1_links_per_spine == 0) {
         throw invalid_argument("MpRail topology dimensions must be positive");
     }
     if (_cfg.queue_size == 0) {
@@ -122,7 +121,8 @@ uint32_t MpRailTopology::rank_server(uint32_t rank) const {
 }
 
 uint32_t MpRailTopology::rank_rail(uint32_t rank) const {
-    return rank_server(rank) / _cfg.servers_per_rail;
+    rank_server(rank);
+    return rank % _cfg.gpus_per_server;
 }
 
 uint32_t MpRailTopology::l0_id(uint32_t rail, uint32_t plane) const {

@@ -7,11 +7,17 @@ from math import ceil
 from ..cost import H100CostModel
 from ..graph import TaskGraph
 from ..schema import MoEInvocation, RoutingAssignment, ValidationError
-from .common import AlgorithmBuildResult, chunked
+from .common import (
+    AlgorithmBuildResult,
+    TokenPayload,
+    TokenPayloadPolicy,
+    chunked,
+    destination_forward_route,
+    plan_token_payloads,
+)
 
 
 RouteKey = tuple[int, int, int]
-Token = tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -34,7 +40,9 @@ class MoonEPConfig:
 class MoonEPPlan:
     execution_rank: dict[RouteKey, int]
     replicas_by_rank: dict[int, tuple[int, ...]]
+    target_routes_by_rank: dict[int, int]
     real_routes_by_rank: dict[int, int]
+    routes_by_server: dict[int, int]
 
 
 class MoonEPBuilder:
@@ -44,82 +52,108 @@ class MoonEPBuilder:
 
     def plan(self, invocation: MoEInvocation) -> MoonEPPlan:
         placement = invocation.placement
-        if placement.num_servers != 1:
-            raise ValidationError("MoonEP v1 model requires a single server")
-        total_routes = len(invocation.assignments)
-        if total_routes % placement.num_ranks != 0:
-            raise ValidationError(
-                "MoonEP balanced plan requires total routes divisible by num_ranks"
-            )
-        target = total_routes // placement.num_ranks
-        remaining = {rank: target for rank in range(placement.num_ranks)}
+        assignments_by_server: dict[int, list[RoutingAssignment]] = {
+            server: [] for server in range(placement.num_servers)
+        }
+        for assignment in invocation.sorted_assignments():
+            home_rank = placement.expert_rank(assignment.expert_id)
+            assignments_by_server[placement.rank_server(home_rank)].append(assignment)
+
+        execution: dict[RouteKey, int] = {}
         replicas: dict[int, set[int]] = {
             rank: set() for rank in range(placement.num_ranks)
         }
-        execution: dict[RouteKey, int] = {}
+        target_routes: dict[int, int] = {
+            rank: 0 for rank in range(placement.num_ranks)
+        }
+        real_routes: dict[int, int] = {
+            rank: 0 for rank in range(placement.num_ranks)
+        }
+        routes_by_server: dict[int, int] = {}
 
-        routes_by_expert: dict[int, list[RoutingAssignment]] = defaultdict(list)
-        for assignment in invocation.sorted_assignments():
-            routes_by_expert[assignment.expert_id].append(assignment)
-        ordered_experts = sorted(
-            routes_by_expert,
-            key=lambda expert: (-len(routes_by_expert[expert]), expert),
-        )
-
-        for expert in ordered_experts:
-            routes = routes_by_expert[expert]
-            home = placement.expert_rank(expert)
-            candidates = {
-                home,
-                *(
-                    rank
-                    for rank, rank_replicas in replicas.items()
-                    if expert in rank_replicas
-                ),
-            }
-            while sum(remaining[rank] for rank in candidates) < len(routes):
-                available = [
-                    rank
-                    for rank in range(placement.num_ranks)
-                    if rank not in candidates
-                    and rank != home
-                    and remaining[rank] > 0
-                    and len(replicas[rank]) < self.config.replicas_per_rank
-                ]
-                if not available:
-                    raise ValidationError(
-                        "MoonEP deterministic planner cannot balance routes with "
-                        f"replicas_per_rank={self.config.replicas_per_rank}"
-                    )
-                replica_rank = min(available, key=lambda rank: (-remaining[rank], rank))
-                replicas[replica_rank].add(expert)
-                candidates.add(replica_rank)
-
-            for assignment in routes:
-                rank = min(
-                    (item for item in candidates if remaining[item] > 0),
-                    key=lambda item: (-remaining[item], item),
-                )
-                execution[
-                    (
-                        assignment.src_rank,
-                        assignment.token_id,
-                        assignment.topk_slot,
-                    )
-                ] = rank
-                remaining[rank] -= 1
-
-        if any(remaining.values()):
-            raise ValidationError(
-                "MoonEP deterministic planner left unused rank capacity: "
-                f"{remaining}"
+        for server, server_assignments in assignments_by_server.items():
+            ranks = tuple(
+                placement.server_rank(server, local_rank)
+                for local_rank in range(placement.gpus_per_server)
             )
+            total_routes = len(server_assignments)
+            routes_by_server[server] = total_routes
+            base, extra = divmod(total_routes, placement.gpus_per_server)
+            remaining = {}
+            for local_rank, rank in enumerate(ranks):
+                target = base + (1 if local_rank < extra else 0)
+                target_routes[rank] = target
+                remaining[rank] = target
+
+            routes_by_expert: dict[int, list[RoutingAssignment]] = defaultdict(list)
+            for assignment in server_assignments:
+                routes_by_expert[assignment.expert_id].append(assignment)
+            ordered_experts = sorted(
+                routes_by_expert,
+                key=lambda expert: (-len(routes_by_expert[expert]), expert),
+            )
+
+            for expert in ordered_experts:
+                routes = routes_by_expert[expert]
+                home = placement.expert_rank(expert)
+                candidates = {
+                    home,
+                    *(
+                        rank
+                        for rank in ranks
+                        if expert in replicas[rank]
+                    ),
+                }
+                while sum(remaining[rank] for rank in candidates) < len(routes):
+                    available = [
+                        rank
+                        for rank in ranks
+                        if rank not in candidates
+                        and rank != home
+                        and remaining[rank] > 0
+                        and len(replicas[rank]) < self.config.replicas_per_rank
+                    ]
+                    if not available:
+                        raise ValidationError(
+                            "MoonEP per-server planner cannot balance expert "
+                            f"{expert} on server {server} with "
+                            f"replicas_per_rank={self.config.replicas_per_rank}"
+                        )
+                    replica_rank = min(
+                        available, key=lambda rank: (-remaining[rank], rank)
+                    )
+                    replicas[replica_rank].add(expert)
+                    candidates.add(replica_rank)
+
+                for assignment in routes:
+                    rank = min(
+                        (item for item in candidates if remaining[item] > 0),
+                        key=lambda item: (-remaining[item], item),
+                    )
+                    execution[
+                        (
+                            assignment.src_rank,
+                            assignment.token_id,
+                            assignment.topk_slot,
+                        )
+                    ] = rank
+                    remaining[rank] -= 1
+                    real_routes[rank] += 1
+
+            if any(remaining.values()):
+                raise ValidationError(
+                    "MoonEP per-server planner left unused rank capacity on "
+                    f"server {server}: {remaining}"
+                )
+
         return MoonEPPlan(
             execution_rank=execution,
             replicas_by_rank={
                 rank: tuple(sorted(experts)) for rank, experts in replicas.items()
             },
-            real_routes_by_rank={rank: target for rank in range(placement.num_ranks)},
+            target_routes_by_rank=target_routes,
+            real_routes_by_rank=real_routes,
+            routes_by_server=routes_by_server,
         )
 
     def build(
@@ -136,36 +170,46 @@ class MoonEPBuilder:
         plan = self.plan(invocation)
         placement = invocation.placement
 
-        planning_keys: set[str] = set()
-        planning_flops = max(
-            1,
-            len(invocation.assignments)
-            * max(1, placement.num_experts.bit_length())
-            * 2,
-        )
-        for rank in range(placement.num_ranks):
-            key = f"{invocation.invocation_id}.plan.rank{rank}"
-            graph.add_compute(
-                key,
-                rank,
-                self.cost_model.estimate(planning_flops),
-                predecessors=roots,
-                barrier_group=f"{invocation.invocation_id}.planning_join",
-                metadata={
-                    "algorithm": "moonep",
-                    "operation": "planning_proxy",
-                    "cost_status": "theoretical_placeholder",
-                },
+        planning_keys_by_server: dict[int, set[str]] = defaultdict(set)
+        for server in range(placement.num_servers):
+            if plan.routes_by_server[server] == 0:
+                continue
+            planning_flops = (
+                plan.routes_by_server[server]
+                * max(1, placement.num_experts.bit_length())
+                * 2
             )
-            planning_keys.add(key)
+            for local_rank in range(placement.gpus_per_server):
+                rank = placement.server_rank(server, local_rank)
+                key = f"{invocation.invocation_id}.plan.server{server}.rank{rank}"
+                graph.add_compute(
+                    key,
+                    rank,
+                    self.cost_model.estimate(planning_flops),
+                    predecessors=roots,
+                    barrier_group=f"{invocation.invocation_id}.planning_join.server{server}",
+                    metadata={
+                        "algorithm": "moonep",
+                        "operation": "per_server_planning_proxy",
+                        "server": server,
+                        "server_route_count": plan.routes_by_server[server],
+                        "cost_status": "theoretical_placeholder",
+                    },
+                )
+                planning_keys_by_server[server].add(key)
 
         prefetch_by_rank: dict[int, set[str]] = defaultdict(set)
         replica_records: list[dict[str, int]] = []
         for dst_rank, experts in sorted(plan.replicas_by_rank.items()):
+            dst_server = placement.rank_server(dst_rank)
             for slot, expert in enumerate(experts):
                 home = placement.expert_rank(expert)
                 if home == dst_rank:
                     continue
+                if placement.rank_server(home) != dst_server:
+                    raise ValidationError(
+                        "MoonEP replica crossed its expert home server"
+                    )
                 key = (
                     f"{invocation.invocation_id}.prefetch.expert{expert}."
                     f"src{home}.dst{dst_rank}.slot{slot}"
@@ -176,12 +220,14 @@ class MoonEPBuilder:
                     dst_rank,
                     invocation.expert_weight_bytes,
                     "expert_weight_prefetch",
-                    f"{invocation.invocation_id}:prefetch:rank:{dst_rank}",
-                    predecessors=planning_keys,
+                    f"{invocation.invocation_id}:prefetch:server:{dst_server}",
+                    predecessors=planning_keys_by_server[dst_server],
                     metadata={
                         "expert_id": expert,
                         "prefetch_slot": slot,
+                        "home_server": dst_server,
                         "projections": ["gate", "up", "down"],
+                        "transport": "server_local_fullmesh",
                     },
                 )
                 prefetch_by_rank[dst_rank].add(key)
@@ -190,52 +236,55 @@ class MoonEPBuilder:
                         "expert_id": expert,
                         "home_rank": home,
                         "execution_rank": dst_rank,
+                        "home_server": dst_server,
                         "prefetch_slot": slot,
                     }
                 )
 
-        tokens_by_src_execution: dict[tuple[int, int], set[Token]] = defaultdict(set)
         routes_by_rank_expert: dict[tuple[int, int], list[RoutingAssignment]] = (
             defaultdict(list)
         )
         for assignment in invocation.sorted_assignments():
-            route_key = (
-                assignment.src_rank,
-                assignment.token_id,
-                assignment.topk_slot,
-            )
-            execution_rank = plan.execution_rank[route_key]
-            tokens_by_src_execution[(assignment.src_rank, execution_rank)].add(
-                (assignment.src_rank, assignment.token_id)
-            )
+            execution_rank = plan.execution_rank[self._route_key(assignment)]
+            home_rank = placement.expert_rank(assignment.expert_id)
+            if placement.rank_server(execution_rank) != placement.rank_server(home_rank):
+                raise ValidationError("MoonEP execution rank left expert home server")
             routes_by_rank_expert[(execution_rank, assignment.expert_id)].append(
                 assignment
             )
 
+        payloads_by_src_execution = plan_token_payloads(
+            invocation.sorted_assignments(),
+            lambda assignment: plan.execution_rank[self._route_key(assignment)],
+            TokenPayloadPolicy(),
+        )
+
         dispatch_arrivals: dict[int, set[str]] = defaultdict(set)
-        for (src, dst), tokens in sorted(tokens_by_src_execution.items()):
+        for (src, dst), payloads in payloads_by_src_execution.items():
             if src == dst:
                 continue
-            for chunk_id, token_chunk in enumerate(
-                chunked(sorted(tokens), self.config.chunk_tokens)
+            dst_server = placement.rank_server(dst)
+            for chunk_id, payload_chunk in enumerate(
+                chunked(payloads, self.config.chunk_tokens)
             ):
                 key = (
                     f"{invocation.invocation_id}.dispatch."
                     f"src{src}.dst{dst}.chunk{chunk_id}"
                 )
+                route_spec, relay = destination_forward_route(placement, src, dst)
                 graph.add_transfer(
                     key,
                     src,
                     dst,
-                    len(token_chunk) * invocation.dispatch_token_bytes,
-                    "dispatch_primary_row",
+                    len(payload_chunk) * invocation.dispatch_token_bytes,
+                    "dispatch_hidden",
                     f"{invocation.invocation_id}:dispatch:rank:{src}",
-                    predecessors=planning_keys,
+                    predecessors=planning_keys_by_server[dst_server],
+                    route_spec=route_spec,
                     chunk_id=chunk_id,
-                    metadata={
-                        "tokens": list(token_chunk),
-                        "deduplicated_by_destination_rank": True,
-                    },
+                    metadata=self._token_transfer_metadata(
+                        payload_chunk, relay, route_spec
+                    ),
                 )
                 dispatch_arrivals[dst].add(key)
 
@@ -254,6 +303,7 @@ class MoonEPBuilder:
             if padded_routes == 0:
                 continue
             padded_routes_by_rank[rank] = padded_routes
+            server = placement.rank_server(rank)
             key = f"{invocation.invocation_id}.expert.rank{rank}"
             graph.add_compute(
                 key,
@@ -263,11 +313,14 @@ class MoonEPBuilder:
                     overlaps_communication=self.config.overlap_expert_compute,
                 ),
                 predecessors=(
-                    planning_keys | prefetch_by_rank[rank] | dispatch_arrivals[rank]
+                    planning_keys_by_server[server]
+                    | prefetch_by_rank[rank]
+                    | dispatch_arrivals[rank]
                 ),
                 metadata={
                     "algorithm": "moonep",
                     "operation": "expert_ffn",
+                    "server": server,
                     "real_token_routes": plan.real_routes_by_rank[rank],
                     "padded_token_routes": padded_routes,
                     "expert_route_counts": expert_counts,
@@ -276,28 +329,32 @@ class MoonEPBuilder:
             expert_keys[rank] = key
 
         combine_arrivals: dict[int, set[str]] = defaultdict(set)
-        for (origin, execution_rank), tokens in sorted(
-            tokens_by_src_execution.items()
-        ):
+        for (origin, execution_rank), payloads in payloads_by_src_execution.items():
             if origin == execution_rank:
                 continue
-            for chunk_id, token_chunk in enumerate(
-                chunked(sorted(tokens), self.config.chunk_tokens)
+            for chunk_id, payload_chunk in enumerate(
+                chunked(payloads, self.config.chunk_tokens)
             ):
                 key = (
                     f"{invocation.invocation_id}.combine."
                     f"src{execution_rank}.dst{origin}.chunk{chunk_id}"
                 )
+                route_spec, relay = destination_forward_route(
+                    placement, execution_rank, origin
+                )
                 graph.add_transfer(
                     key,
                     execution_rank,
                     origin,
-                    len(token_chunk) * invocation.combine_token_bytes,
-                    "combine_primary_row",
+                    len(payload_chunk) * invocation.combine_token_bytes,
+                    "combine_partial",
                     f"{invocation.invocation_id}:combine:rank:{origin}",
                     predecessors={expert_keys[execution_rank]},
+                    route_spec=route_spec,
                     chunk_id=chunk_id,
-                    metadata={"tokens": list(token_chunk)},
+                    metadata=self._token_transfer_metadata(
+                        payload_chunk, relay, route_spec
+                    ),
                 )
                 combine_arrivals[origin].add(key)
 
@@ -306,16 +363,9 @@ class MoonEPBuilder:
         for rank, token_count in enumerate(invocation.tokens_per_source_rank):
             if token_count == 0:
                 continue
-            local_execution = {
-                execution_rank
-                for (src, execution_rank), tokens in tokens_by_src_execution.items()
-                if src == rank and execution_rank == rank and tokens
-            }
-            predecessors = combine_arrivals[rank] | {
-                expert_keys[item]
-                for item in local_execution
-                if item in expert_keys
-            }
+            predecessors = set(combine_arrivals[rank])
+            if (rank, rank) in payloads_by_src_execution and rank in expert_keys:
+                predecessors.add(expert_keys[rank])
             key = f"{invocation.invocation_id}.combine_reduce.rank{rank}"
             graph.add_compute(
                 key,
@@ -326,7 +376,7 @@ class MoonEPBuilder:
                 predecessors=predecessors,
                 metadata={
                     "algorithm": "moonep",
-                    "operation": "combine_local_reduce",
+                    "operation": "combine_reduce",
                     "token_count": token_count,
                 },
             )
@@ -335,22 +385,68 @@ class MoonEPBuilder:
 
         created = graph.tasks[before:]
         transfer_bytes: dict[str, int] = defaultdict(int)
+        server_forward_tasks = 0
         for task in created:
-            if task.kind == "transfer":
-                transfer_bytes[task.payload_kind or "unspecified"] += task.transfer_bytes
+            if task.kind != "transfer":
+                continue
+            transfer_bytes[task.payload_kind or "unspecified"] += task.transfer_bytes
+            if task.route_spec and task.route_spec.startswith("server_forward "):
+                server_forward_tasks += 1
         return AlgorithmBuildResult(
-            algorithm="moonep_forward",
+            algorithm="moonep_deepep_scaleout_forward",
             terminal_keys=frozenset(terminal_keys),
             rank_terminal_keys=rank_terminals,
             metadata={
-                "planner": "deterministic_capacity_balancer_v1",
+                "planner": "deterministic_per_server_capacity_balancer_v2",
+                "scale_out_transport": "deepep_destination_forward",
+                "replica_scope": "home_server",
                 "replicas_per_rank": self.config.replicas_per_rank,
                 "token_padding": self.config.token_padding,
                 "chunk_tokens": self.config.chunk_tokens,
+                "token_payload_policy": {
+                    "deduplicate": True,
+                    "scope": "destination_rank",
+                },
+                "routes_by_server": plan.routes_by_server,
+                "target_routes_by_rank": plan.target_routes_by_rank,
                 "real_routes_by_rank": plan.real_routes_by_rank,
                 "padded_routes_by_rank": padded_routes_by_rank,
                 "replicas": replica_records,
+                "server_forward_task_count": server_forward_tasks,
+                "expert_weight_prefetch_bytes": transfer_bytes.get(
+                    "expert_weight_prefetch", 0
+                ),
                 "transfer_bytes_by_payload": dict(sorted(transfer_bytes.items())),
                 "created_tasks": len(created),
             },
         )
+
+    @staticmethod
+    def _route_key(assignment: RoutingAssignment) -> RouteKey:
+        return (
+            assignment.src_rank,
+            assignment.token_id,
+            assignment.topk_slot,
+        )
+
+    @staticmethod
+    def _token_transfer_metadata(
+        payloads: tuple[TokenPayload, ...],
+        relay: int | None,
+        route_spec: str | None,
+    ) -> dict[str, object]:
+        return {
+            "payloads": [
+                {
+                    "src_rank": payload.src_rank,
+                    "token_id": payload.token_id,
+                    "route_count": len(payload.routes),
+                    "topk_slots": [route.topk_slot for route in payload.routes],
+                    "expert_ids": [route.expert_id for route in payload.routes],
+                }
+                for payload in payloads
+            ],
+            "deduplicated_by_destination_rank": True,
+            "forwarding": "destination" if route_spec else "local",
+            "dst_relay": relay,
+        }

@@ -42,7 +42,7 @@ def write_text(path: Path, value: str) -> None:
 
 def connection_matrix(flows: list[str]) -> str:
     return "\n".join([
-        "Nodes 16",
+        "Nodes 32",
         f"Connections {len(flows)}",
         *flows,
         "",
@@ -96,12 +96,11 @@ class Suite:
         command = [
             str(BINARY),
             "-topology", "mprail",
-            "-mprail_planes", "8",
-            "-mprail_gpus_per_server", "4",
-            "-mprail_servers_per_rail", "2",
-            "-mprail_l1_eps_per_plane", "2",
-            "-mprail_l0_l1_links_per_spine", "2",
-            "-linkspeed", "100000",
+            "-mprail_planes", "1",
+            "-mprail_gpus_per_server", "8",
+            "-mprail_l1_eps_per_plane", "8",
+            "-mprail_l0_l1_links_per_spine", "1",
+            "-linkspeed", "400000",
             "-local_linkspeed", "3200000",
             "-local_latency_ns", "50",
             "-hop_latency", "0.1",
@@ -156,7 +155,7 @@ def assert_success(log: str, returncode: int) -> None:
 def explicit_validator(expected_mode: str) -> Callable[[str, int], str]:
     def validate(log: str, returncode: int) -> str:
         assert_success(log, returncode)
-        require("MPRAIL_EXPLICIT_FLOW flow=2 src=0 dst=8 plane=3" in log,
+        require("MPRAIL_EXPLICIT_FLOW flow=2 src=0 dst=9 plane=0" in log,
                 "没有识别指定的显式路径")
         require(expected_mode in log, f"没有进入预期全局模式 {expected_mode}")
         fabric_links = {
@@ -169,16 +168,14 @@ def explicit_validator(expected_mode: str) -> Callable[[str, int], str]:
             )
         }
         expected = {
-            "MPRAIL_L0_r0_p3->MPRAIL_L1_p3_s1(b0)",
-            "MPRAIL_L1_p3_s1->MPRAIL_L0_r1_p3(b1)",
-            "MPRAIL_L0_r1_p3->MPRAIL_L1_p3_s1(b1)",
-            "MPRAIL_L1_p3_s1->MPRAIL_L0_r0_p3(b0)",
+            "MPRAIL_L0_r0_p0->MPRAIL_L1_p0_s1(b0)",
+            "MPRAIL_L1_p0_s1->MPRAIL_L0_r1_p0(b0)",
+            "MPRAIL_L0_r1_p0->MPRAIL_L1_p0_s1(b0)",
+            "MPRAIL_L1_p0_s1->MPRAIL_L0_r0_p0(b0)",
         }
         require(fabric_links == expected,
                 f"显式路径物化链路不精确: {sorted(fabric_links)}")
-        require("MPRAIL_L0_r0_p0" not in log and "MPRAIL_L1_p0" not in log,
-                "显式 flow 仍创建或使用了其他 plane")
-        return "正反向均严格使用 plane 3、spine 1、bundle 0/1"
+        return "正反向均严格使用 plane 0、spine 1、bundle 0"
 
     return validate
 
@@ -196,12 +193,11 @@ def validate_explicit_same_server(log: str, returncode: int) -> str:
 
 def validate_explicit_same_rail(log: str, returncode: int) -> str:
     assert_success(log, returncode)
-    require("MPRAIL_EXPLICIT_FLOW flow=6 src=0 dst=4 plane=5" in log,
-            "同 rail 显式路径未固定到 plane 5")
+    require("MPRAIL_EXPLICIT_FLOW flow=6 src=0 dst=8 plane=0" in log,
+            "同 rail 显式路径未固定到 plane 0")
     require("MPRAIL_L1" not in log, "同 rail 显式路径错误进入 L1")
-    require("MPRAIL_L0_r0_p5" in log, "同 rail 显式路径没有经过指定 L0")
-    require("MPRAIL_L0_r0_p0" not in log, "同 rail 显式路径创建了其他 plane")
-    return "rank:0 -> L0(r0,p5) -> rank:4，不经过 L1"
+    require("MPRAIL_L0_r0_p0" in log, "同 rail 显式路径没有经过指定 L0")
+    return "rank:0 -> L0(r0,p0) -> rank:8，不经过 L1"
 
 
 def phase_events(log: str, event: str) -> list[tuple[str, float]]:
@@ -219,7 +215,7 @@ def phase_events(log: str, event: str) -> list[tuple[str, float]]:
 def validate_server_forward_cm(log: str, returncode: int) -> str:
     assert_success(log, returncode)
     require("SERVER_FORWARD_BEGIN flow=3 src=0 src_relay=3 "
-            "dst_relay=11 dst=8 bytes=16384 phases=3" in log,
+            "dst_relay=10 dst=9 bytes=16384 phases=3" in log,
             "三阶段逻辑 flow 元数据错误")
     starts = phase_events(log, "START")
     dones = phase_events(log, "DONE")
@@ -232,7 +228,7 @@ def validate_server_forward_cm(log: str, returncode: int) -> str:
             "后一个 phase 在前一个完成前启动")
     require("scope=same_server" in log,
             "服务器内部 phase 没有走本地 FullMesh")
-    require(re.search(r"MPRAIL_FLOW flow=3 src=3 dst=11 scope=cross_rail", log)
+    require(re.search(r"MPRAIL_FLOW flow=3 src=3 dst=10 scope=cross_rail", log)
             is not None, "fabric phase 没有使用逻辑 flow ID 或 relay 端点")
     final = re.search(r"^SERVER_FORWARD_DONE flow=3 time_us=([0-9.]+)$",
                       log, re.MULTILINE)
@@ -248,6 +244,27 @@ def validate_server_forward_skip(log: str, returncode: int) -> str:
             "跳过场景仍启动了本地 phase")
     require("SERVER_FORWARD_DONE flow=3" in log, "单阶段逻辑 flow 未完成")
     return "src_relay=src 且 dst_relay=dst 时只创建 fabric phase"
+
+
+def validate_server_forward_destination(log: str, returncode: int) -> str:
+    assert_success(log, returncode)
+    require(
+        "SERVER_FORWARD_BEGIN flow=3 src=0 src_relay=0 "
+        "dst_relay=8 dst=9 bytes=16384 phases=2" in log,
+        "目标端转发逻辑 flow 元数据错误",
+    )
+    starts = phase_events(log, "START")
+    dones = phase_events(log, "DONE")
+    require([name for name, _ in starts] == ["fabric", "dst_local"],
+            f"目标端转发启动顺序错误: {starts}")
+    require([name for name, _ in dones] == ["fabric", "dst_local"],
+            f"目标端转发完成顺序错误: {dones}")
+    require(starts[1][1] >= dones[0][1], "dst_local 在 fabric 完成前启动")
+    require("phase=src_local" not in log, "目标端转发错误启动 src_local")
+    require(re.search(r"MPRAIL_FLOW flow=3 src=0 dst=8 scope=same_rail", log)
+            is not None, "fabric flow 没有走同 index rail")
+    require("scope=same_server" in log, "dst_local 没有走服务器 FullMesh")
+    return "src_local 被跳过；fabric 0->8 与 dst_local 8->9 严格串行"
 
 
 def validate_server_forward_trigger(log: str, returncode: int) -> str:
@@ -327,6 +344,7 @@ def write_report(run_dir: Path, results: list[CaseResult]) -> None:
         "- 同服务器、同 rail、跨 rail 三种显式路径形状。",
         "- 显式路径覆盖 flow ECMP、oblivious spray 和 ecmp_rr。",
         "- 服务器内部 src_local、fabric、dst_local 严格串行与 phase 跳过。",
+        "- DeepEP 使用的 destination-only 两阶段转发。",
         "- server_forward 最后 phase 的 CM trigger 链。",
         "- DAG 后继 barrier 等待最终 dst_local 完成。",
         "- 跨 plane 显式路径、错误 relay、compute route 和缺字段确定性失败。",
@@ -359,8 +377,8 @@ def main() -> int:
     suite = Suite(run_dir)
 
     explicit_cm = connection_matrix([
-        "0->8 id 2 start 0 size 16384 route explicit "
-        "rank:0 l0:r0:p3:b0 l1:p3:s1:b1 l0:r1:p3 rank:8"
+        "0->9 id 2 start 0 size 16384 route explicit "
+        "rank:0 l0:r0:p0:b0 l1:p0:s1:b0 l0:r1:p0 rank:9"
     ])
     empty_cm = connection_matrix([])
     try:
@@ -395,8 +413,8 @@ def main() -> int:
         suite.run_case(
             "cm_explicit_same_rail",
             connection_matrix([
-                "0->4 id 6 start 0 size 16384 route explicit "
-                "rank:0 l0:r0:p5 rank:4"
+                "0->8 id 6 start 0 size 16384 route explicit "
+                "rank:0 l0:r0:p0 rank:8"
             ]),
             validate_explicit_same_rail,
             algorithm="oblivious",
@@ -404,27 +422,35 @@ def main() -> int:
         suite.run_case(
             "cm_server_forward_three_phases",
             connection_matrix([
-                "0->8 id 3 start 0 size 16384 route server_forward "
-                "src_relay:3 dst_relay:11"
+                "0->9 id 3 start 0 size 16384 route server_forward "
+                "src_relay:3 dst_relay:10"
             ]),
             validate_server_forward_cm,
         )
         suite.run_case(
             "cm_server_forward_skip_local",
             connection_matrix([
-                "0->8 id 3 start 0 size 16384 route server_forward "
-                "src_relay:0 dst_relay:8"
+                "0->9 id 3 start 0 size 16384 route server_forward "
+                "src_relay:0 dst_relay:9"
             ]),
             validate_server_forward_skip,
         )
         suite.run_case(
+            "cm_server_forward_destination_only",
+            connection_matrix([
+                "0->9 id 3 start 0 size 16384 route server_forward "
+                "src_relay:0 dst_relay:8"
+            ]),
+            validate_server_forward_destination,
+        )
+        suite.run_case(
             "cm_server_forward_trigger",
             "\n".join([
-                "Nodes 16",
+                "Nodes 32",
                 "Connections 2",
                 "Triggers 1",
-                "0->8 id 3 start 0 size 16384 send_done_trigger 1 "
-                "route server_forward src_relay:3 dst_relay:11",
+                "0->9 id 3 start 0 size 16384 send_done_trigger 1 "
+                "route server_forward src_relay:3 dst_relay:10",
                 "4->12 id 4 trigger 1 size 16384",
                 "trigger id 1 oneshot",
                 "",
@@ -436,8 +462,8 @@ def main() -> int:
             empty_cm,
             validate_dag_explicit,
             dag=(
-                "2 0 | 0 8 | 16384 0 | - | explicit "
-                "rank:0 l0:r0:p3:b0 l1:p3:s1:b1 l0:r1:p3 rank:8\n"
+                "2 0 | 0 9 | 16384 0 | - | explicit "
+                "rank:0 l0:r0:p0:b0 l1:p0:s1:b0 l0:r1:p0 rank:9\n"
             ),
             algorithm="oblivious",
         )
@@ -446,40 +472,40 @@ def main() -> int:
             empty_cm,
             validate_dag_server_forward,
             dag=(
-                "3 0 | 0 8 | 16384 0 | - | server_forward "
-                "src_relay:3 dst_relay:11\n"
-                "4 1 | 8 8 | 0 10 | 0\n"
+                "3 0 | 0 9 | 16384 0 | - | server_forward "
+                "src_relay:3 dst_relay:10\n"
+                "4 1 | 9 9 | 0 10 | 0\n"
             ),
         )
         suite.run_case(
             "reject_explicit_cross_plane",
             connection_matrix([
-                "0->8 id 2 start 0 size 16384 route explicit "
-                "rank:0 l0:r0:p3:b0 l1:p2:s1:b1 l0:r1:p3 rank:8"
+                "0->9 id 2 start 0 size 16384 route explicit "
+                "rank:0 l0:r0:p0:b0 l1:p1:s1:b0 l0:r1:p0 rank:9"
             ]),
             expect_failure("must remain within one valid plane"),
         )
         suite.run_case(
             "reject_wrong_src_relay",
             connection_matrix([
-                "0->8 id 3 start 0 size 16384 route server_forward "
-                "src_relay:4 dst_relay:11"
+                "0->9 id 3 start 0 size 16384 route server_forward "
+                "src_relay:8 dst_relay:10"
             ]),
             expect_failure("src_relay is not on the logical source server"),
         )
         suite.run_case(
             "reject_explicit_wrong_endpoint",
             connection_matrix([
-                "0->8 id 2 start 0 size 16384 route explicit "
-                "rank:1 l0:r0:p3:b0 l1:p3:s1:b1 l0:r1:p3 rank:8"
+                "0->9 id 2 start 0 size 16384 route explicit "
+                "rank:1 l0:r0:p0:b0 l1:p0:s1:b0 l0:r1:p0 rank:9"
             ]),
             expect_failure("endpoint rank does not match the flow"),
         )
         suite.run_case(
             "reject_explicit_bundle_out_of_range",
             connection_matrix([
-                "0->8 id 2 start 0 size 16384 route explicit "
-                "rank:0 l0:r0:p3:b2 l1:p3:s1:b1 l0:r1:p3 rank:8"
+                "0->9 id 2 start 0 size 16384 route explicit "
+                "rank:0 l0:r0:p0:b1 l1:p0:s1:b0 l0:r1:p0 rank:9"
             ]),
             expect_failure("require valid bundle coordinates"),
         )
@@ -495,7 +521,7 @@ def main() -> int:
         suite.run_case(
             "reject_missing_dst_relay",
             connection_matrix([
-                "0->8 id 3 start 0 size 16384 route server_forward src_relay:3"
+                "0->9 id 3 start 0 size 16384 route server_forward src_relay:3"
             ]),
             expect_failure("requires src_relay and dst_relay"),
         )

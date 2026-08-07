@@ -21,19 +21,19 @@ route 子句必须位于一条 connection 的末尾。
 普通 flow：
 
 ```text
-0->8 id 1 start 0 size 16384
+0->9 id 1 start 0 size 16384
 ```
 
 完整显式路径：
 
 ```text
-0->8 id 2 start 0 size 16384 route explicit rank:0 l0:r0:p3:b0 l1:p3:s1:b1 l0:r1:p3 rank:8
+0->9 id 2 start 0 size 16384 route explicit rank:0 l0:r0:p0:b0 l1:p0:s1:b0 l0:r1:p0 rank:9
 ```
 
 服务器内部转发：
 
 ```text
-0->8 id 3 start 0 size 16384 route server_forward src_relay:3 dst_relay:11
+0->9 id 3 start 0 size 16384 route server_forward src_relay:3 dst_relay:10
 ```
 
 ### 2.2 DAG
@@ -47,19 +47,19 @@ task_id barrier_id | src_rank dst_rank | transfer_bytes compute_us | predecessor
 普通 task 不需要第五组，旧格式保持兼容：
 
 ```text
-1 0 | 0 8 | 16384 0 | -
+1 0 | 0 9 | 16384 0 | -
 ```
 
 完整显式路径：
 
 ```text
-2 0 | 0 8 | 16384 0 | - | explicit rank:0 l0:r0:p3:b0 l1:p3:s1:b1 l0:r1:p3 rank:8
+2 0 | 0 9 | 16384 0 | - | explicit rank:0 l0:r0:p0:b0 l1:p0:s1:b0 l0:r1:p0 rank:9
 ```
 
 服务器内部转发：
 
 ```text
-3 0 | 0 8 | 16384 0 | - | server_forward src_relay:3 dst_relay:11
+3 0 | 0 9 | 16384 0 | - | server_forward src_relay:3 dst_relay:10
 ```
 
 route 组只能用于 network task。compute task 不允许携带 route 组。
@@ -83,19 +83,19 @@ route 组只能用于 network task。compute task 不允许携带 route 组。
 
 ```text
 rank:0
-  -> l0:r0:p3:b0
-  -> l1:p3:s1:b1
-  -> l0:r1:p3
-  -> rank:8
+  -> l0:r0:p0:b0
+  -> l1:p0:s1:b0
+  -> l0:r1:p0
+  -> rank:9
 ```
 
 表示正向数据使用：
 
 ```text
-rank 0 -> L0(r0,p3)
-L0(r0,p3) -- bundle 0 --> L1(p3,s1)
-L1(p3,s1) -- bundle 1 --> L0(r1,p3)
-L0(r1,p3) -> rank 8
+rank 0 -> L0(r0,p0)
+L0(r0,p0) -- bundle 0 --> L1(p0,s1)
+L1(p0,s1) -- bundle 0 --> L0(r1,p0)
+L0(r1,p0) -> rank 9
 ```
 
 ### 3.2 路径形状
@@ -138,7 +138,7 @@ rank:src l0:rSRC:pP:bUP l1:pP:sS:bDOWN l0:rDST:pP rank:dst
 上面的例子自动得到：
 
 ```text
-rank:8 l0:r1:p3:b1 l1:p3:s1:b0 l0:r0:p3 rank:0
+rank:9 l0:r1:p0:b0 l1:p0:s1:b0 l0:r0:p0 rank:0
 ```
 
 ## 4. 服务器内部转发
@@ -201,6 +201,28 @@ SERVER_FORWARD_PHASE_DONE flow=3 phase=dst_local time_us=...
 SERVER_FORWARD_DONE flow=3 time_us=...
 ```
 
+### 4.5 DeepEP 的目标端转发特例
+
+DeepEP 只使用 destination-side forwarding：
+
+```text
+src_relay = logical src_rank
+dst_relay = 目标服务器中与 src_rank 相同 local index 的 rank
+```
+
+因此 source-local phase 永远跳过。对于逻辑 task `0 -> 9`、每服务器 8 张 GPU：
+
+```text
+route server_forward src_relay:0 dst_relay:8
+
+实际 flow 1: fabric   0 -> 8
+实际 flow 2: dst_local 8 -> 9
+```
+
+两个 flow 严格串行，但仍属于一个 DAG network task。task 只有在 `dst_local`
+完成后才通知 barrier；若逻辑目标就是 relay，例如 `0 -> 8`，则只执行 fabric
+flow。DeepEP 不使用三阶段模型中的 source-local flow。
+
 ## 5. 错误处理
 
 route 语法错误或拓扑坐标不合法时，程序必须在事件循环开始前返回非零状态，并给出包含 flow/task 上下文的错误信息。不能静默退回普通 ECMP，也不能只执行路径的一部分。
@@ -221,6 +243,7 @@ route 语法错误或拓扑坐标不合法时，程序必须在事件循环开�
 - `explicit` 的实际链路严格等于输入坐标，且不受三种全局路由策略影响。
 - 显式正向与自动反向路径使用成对的 plane、spine 和 bundle。
 - `server_forward` 三阶段严格串行，跳过规则正确。
+- DeepEP 目标端转发固定跳过 source-local，并正确执行一或两个实际 flow。
 - CM 与 DAG 都支持两种 route 模式。
 - DAG task 只在最终本地 phase 完成后通知 barrier。
 - 非法输入在仿真开始前确定性失败。

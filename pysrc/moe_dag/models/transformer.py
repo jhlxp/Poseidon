@@ -9,13 +9,15 @@ from ..algorithms import (
     DeepEPConfig,
     MoonEPBuilder,
     MoonEPConfig,
+    NCCLBuilder,
+    NCCLConfig,
 )
 from ..cost import H100CostModel
 from ..graph import TaskGraph
 from ..schema import ModelSpec, MoEInvocation, Placement, ValidationError, make_uniform_assignments
 
 
-AlgorithmName = Literal["deepep-hybrid", "deepep-direct", "moonep"]
+AlgorithmName = Literal["nccl", "deepep", "moonep"]
 
 
 @dataclass(frozen=True)
@@ -36,7 +38,7 @@ class TransformerWorkloadConfig:
             raise ValidationError("tokens_per_rank must be positive")
         if self.model.num_experts != self.placement.num_experts:
             raise ValidationError("model and placement expert counts differ")
-        if self.algorithm not in {"deepep-hybrid", "deepep-direct", "moonep"}:
+        if self.algorithm not in {"nccl", "deepep", "moonep"}:
             raise ValidationError(f"unsupported algorithm: {self.algorithm}")
 
 
@@ -66,7 +68,12 @@ def build_transformer_workload(
     graph = TaskGraph(config.model.name, config.placement.num_ranks)
     tokens = (config.tokens_per_rank,) * config.placement.num_ranks
 
-    if config.algorithm == "moonep":
+    if config.algorithm == "nccl":
+        algorithm_builder = NCCLBuilder(
+            cost,
+            NCCLConfig(chunk_routes=config.chunk_tokens),
+        )
+    elif config.algorithm == "moonep":
         algorithm_builder = MoonEPBuilder(
             cost,
             MoonEPConfig(
@@ -78,10 +85,7 @@ def build_transformer_workload(
     else:
         algorithm_builder = DeepEPBuilder(
             cost,
-            DeepEPConfig(
-                mode=("hybrid" if config.algorithm == "deepep-hybrid" else "direct"),
-                chunk_tokens=config.chunk_tokens,
-            ),
+            DeepEPConfig(chunk_tokens=config.chunk_tokens),
         )
 
     previous_attention: dict[int, str] = {}

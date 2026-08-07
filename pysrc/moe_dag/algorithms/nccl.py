@@ -11,28 +11,29 @@ from .common import (
     TokenPayload,
     TokenPayloadPolicy,
     chunked,
-    destination_forward_route,
     plan_token_payloads,
 )
 
 
 @dataclass(frozen=True)
-class DeepEPConfig:
-    chunk_tokens: int = 128
+class NCCLConfig:
+    chunk_routes: int = 128
     overlap_expert_compute: bool = True
     token_payload_policy: TokenPayloadPolicy = field(
-        default_factory=TokenPayloadPolicy
+        default_factory=lambda: TokenPayloadPolicy(
+            deduplicate=False, scope="none"
+        )
     )
 
     def __post_init__(self) -> None:
-        if self.chunk_tokens <= 0:
-            raise ValidationError("chunk_tokens must be positive")
-        if not self.token_payload_policy.deduplicate:
-            raise ValidationError("DeepEP requires token payload deduplication")
+        if self.chunk_routes <= 0:
+            raise ValidationError("chunk_routes must be positive")
+        if self.token_payload_policy.deduplicate:
+            raise ValidationError("NCCL requires non-deduplicated token payloads")
 
 
-class DeepEPBuilder:
-    def __init__(self, cost_model: H100CostModel, config: DeepEPConfig) -> None:
+class NCCLBuilder:
+    def __init__(self, cost_model: H100CostModel, config: NCCLConfig) -> None:
         self.cost_model = cost_model
         self.config = config
 
@@ -72,17 +73,16 @@ class DeepEPBuilder:
         expert_keys: dict[int, str] = {}
         for rank, route_count in sorted(route_count_by_rank.items()):
             key = f"{invocation.invocation_id}.expert.rank{rank}"
-            flops = route_count * 6 * invocation.hidden * invocation.ffn_hidden
             graph.add_compute(
                 key,
                 rank,
                 self.cost_model.estimate(
-                    flops,
+                    route_count * 6 * invocation.hidden * invocation.ffn_hidden,
                     overlaps_communication=self.config.overlap_expert_compute,
                 ),
                 predecessors=roots | dispatch_arrivals[rank],
                 metadata={
-                    "algorithm": "deepep",
+                    "algorithm": "nccl",
                     "operation": "expert_ffn",
                     "real_token_routes": route_count,
                 },
@@ -98,8 +98,8 @@ class DeepEPBuilder:
             combine_arrivals,
         )
 
-        rank_terminals: dict[int, frozenset[str]] = {}
         terminal_keys: set[str] = set()
+        rank_terminals: dict[int, frozenset[str]] = {}
         for origin, token_count in enumerate(invocation.tokens_per_source_rank):
             if token_count == 0:
                 continue
@@ -115,49 +115,39 @@ class DeepEPBuilder:
                 ),
                 predecessors=predecessors,
                 metadata={
-                    "algorithm": "deepep",
-                    "operation": "combine_final_reduce",
+                    "algorithm": "nccl",
+                    "operation": "combine_reduce",
                     "token_count": token_count,
                     "route_partials": route_count_by_origin[origin],
                 },
             )
-            rank_terminals[origin] = frozenset({key})
             terminal_keys.add(key)
+            rank_terminals[origin] = frozenset({key})
 
         created = graph.tasks[before:]
         transfer_bytes: dict[str, int] = defaultdict(int)
-        server_forward_tasks = 0
         for task in created:
-            if task.kind != "transfer":
-                continue
-            transfer_bytes[task.payload_kind or "unspecified"] += task.transfer_bytes
-            if task.route_spec and task.route_spec.startswith("server_forward "):
-                server_forward_tasks += 1
-        payload_count = sum(len(items) for items in payloads_by_pair.values())
+            if task.kind == "transfer":
+                transfer_bytes[task.payload_kind or "unspecified"] += task.transfer_bytes
         route_count = len(invocation.assignments)
+        payload_count = sum(len(items) for items in payloads_by_pair.values())
         return AlgorithmBuildResult(
-            algorithm="deepep_forward",
+            algorithm="nccl_alltoall_forward",
             terminal_keys=frozenset(terminal_keys),
             rank_terminal_keys=rank_terminals,
             metadata={
-                "workload_scope": "training_prefill_forward",
-                "chunk_tokens": self.config.chunk_tokens,
+                "collective_semantics": "alltoallv",
+                "chunk_routes": self.config.chunk_routes,
                 "token_payload_policy": {
-                    "deduplicate": True,
-                    "scope": "destination_rank",
+                    "deduplicate": False,
+                    "scope": "none",
                 },
-                "forwarding": {
-                    "mode": "destination",
-                    "relay_coordinate": "source_local_index",
-                    "completion": "full_message",
-                },
+                "hierarchical_forwarding": False,
                 "route_count": route_count,
-                "unique_token_payload_count": payload_count,
-                "deduplicated_route_count": route_count - payload_count,
+                "token_payload_count": payload_count,
                 "logical_transfer_task_count": sum(
                     task.kind == "transfer" for task in created
                 ),
-                "server_forward_task_count": server_forward_tasks,
                 "transfer_bytes_by_payload": dict(sorted(transfer_bytes.items())),
                 "created_tasks": len(created),
             },
@@ -175,14 +165,11 @@ class DeepEPBuilder:
             if src == dst:
                 continue
             for chunk_id, payload_chunk in enumerate(
-                chunked(payloads, self.config.chunk_tokens)
+                chunked(payloads, self.config.chunk_routes)
             ):
                 key = (
                     f"{invocation.invocation_id}.dispatch."
                     f"src{src}.dst{dst}.chunk{chunk_id}"
-                )
-                route_spec, relay = destination_forward_route(
-                    invocation.placement, src, dst
                 )
                 graph.add_transfer(
                     key,
@@ -192,11 +179,8 @@ class DeepEPBuilder:
                     "dispatch_hidden",
                     f"{invocation.invocation_id}:dispatch:rank:{src}",
                     predecessors=roots,
-                    route_spec=route_spec,
                     chunk_id=chunk_id,
-                    metadata=self._transfer_metadata(
-                        payload_chunk, relay, route_spec
-                    ),
+                    metadata=self._payload_metadata(payload_chunk),
                 )
                 arrivals[dst].add(key)
 
@@ -212,14 +196,11 @@ class DeepEPBuilder:
             if origin == execution_rank:
                 continue
             for chunk_id, payload_chunk in enumerate(
-                chunked(payloads, self.config.chunk_tokens)
+                chunked(payloads, self.config.chunk_routes)
             ):
                 key = (
                     f"{invocation.invocation_id}.combine."
                     f"src{execution_rank}.dst{origin}.chunk{chunk_id}"
-                )
-                route_spec, relay = destination_forward_route(
-                    invocation.placement, execution_rank, origin
                 )
                 graph.add_transfer(
                     key,
@@ -229,32 +210,25 @@ class DeepEPBuilder:
                     "combine_partial",
                     f"{invocation.invocation_id}:combine:rank:{origin}",
                     predecessors={expert_keys[execution_rank]},
-                    route_spec=route_spec,
                     chunk_id=chunk_id,
-                    metadata=self._transfer_metadata(
-                        payload_chunk, relay, route_spec
-                    ),
+                    metadata=self._payload_metadata(payload_chunk),
                 )
                 arrivals[origin].add(key)
 
     @staticmethod
-    def _transfer_metadata(
+    def _payload_metadata(
         payloads: tuple[TokenPayload, ...],
-        relay: int | None,
-        route_spec: str | None,
     ) -> dict[str, object]:
         return {
             "payloads": [
                 {
                     "src_rank": payload.src_rank,
                     "token_id": payload.token_id,
-                    "route_count": len(payload.routes),
-                    "topk_slots": [route.topk_slot for route in payload.routes],
-                    "expert_ids": [route.expert_id for route in payload.routes],
+                    "topk_slot": payload.routes[0].topk_slot,
+                    "expert_id": payload.routes[0].expert_id,
                 }
                 for payload in payloads
             ],
-            "deduplicated_by_destination_rank": True,
-            "forwarding": "destination" if route_spec else "local",
-            "dst_relay": relay,
+            "deduplicated": False,
+            "forwarding": "rank_direct",
         }

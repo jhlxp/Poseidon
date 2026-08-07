@@ -15,8 +15,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--algorithm",
-        choices=("deepep-hybrid", "deepep-direct", "moonep"),
-        default="deepep-hybrid",
+        choices=("nccl", "deepep", "moonep"),
+        default="deepep",
     )
     parser.add_argument("--name", default="moe_block")
     parser.add_argument("--num-ranks", type=int, default=16)

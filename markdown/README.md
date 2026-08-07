@@ -7,15 +7,17 @@
 | 文档 | 内容 |
 |---|---|
 | [01_DAG工作负载生成总体设计.md](01_DAG工作负载生成总体设计.md) | Python 生成器的两层架构、目录、输入输出和能力边界 |
-| [02_第一层-MoE算法工作负载建模.md](02_第一层-MoE算法工作负载建模.md) | 共享 MoE IR、算法插件、字节核算、冗余通信和 barrier 映射 |
+| [02_第一层-MoE算法工作负载建模.md](02_第一层-MoE算法工作负载建模.md) | 共享 MoE IR、算法插件、payload 去冗余策略、字节核算和 barrier 映射 |
 | [03_第二层-模型到DAG生成.md](03_第二层-模型到DAG生成.md) | Transformer block、router、H100 理论计算占位、20 SM 通信预留和多层 workload |
-| [04_算法建模-DeepEP.md](04_算法建模-DeepEP.md) | DeepEP V1/V2、hybrid/direct、domain 去重和多级转发 |
-| [05_算法建模-MoonEP.md](05_算法建模-MoonEP.md) | 动态冗余 expert、perfect balance、权重预取、combine 和 grad reduce |
-| [06_MpRail拓扑开发文档.md](06_MpRail拓扑开发文档.md) | 拓扑定义、端口模型、路由、配置和开发边界 |
-| [07_DAG任务与执行模型.md](07_DAG任务与执行模型.md) | `.cm` 纯 flow 与 `.dag` 一体化 workload、barrier 依赖和完成语义 |
-| [08_MpRail源路由与服务器转发.md](08_MpRail源路由与服务器转发.md) | CM/DAG 显式路径、服务器内部 relay 转发、校验与完成语义 |
-| [09_测试与日志规范.md](09_测试与日志规范.md) | Python 功能测试分类及 `test_logs/` 产物结构 |
-| [10_MpRail链路负载可视化.md](10_MpRail链路负载可视化.md) | link-load 采样、五面板吞吐图、坐标解析和统计口径 |
+| [04_算法建模-NCCL.md](04_算法建模-NCCL.md) | NCCL MoE All-to-Allv、无 payload 去冗余、真实目标 rank 直达和验收边界 |
+| [05_算法建模-DeepEP.md](05_算法建模-DeepEP.md) | 训练/prefill 的 destination-rank 去重和目标端两段转发 |
+| [06_算法建模-MoonEP.md](06_算法建模-MoonEP.md) | per-server 动态 expert replica、权重预取和 DeepEP scale-out 组合 |
+| [07_MpRail拓扑开发文档.md](07_MpRail拓扑开发文档.md) | 拓扑定义、端口模型、路由、配置和开发边界 |
+| [08_DAG任务与执行模型.md](08_DAG任务与执行模型.md) | `.cm` 纯 flow 与 `.dag` 一体化 workload、barrier 依赖和完成语义 |
+| [09_MpRail源路由与服务器转发.md](09_MpRail源路由与服务器转发.md) | CM/DAG 显式路径、服务器内部 relay 转发、校验与完成语义 |
+| [10_测试与日志规范.md](10_测试与日志规范.md) | Python 功能测试分类及 `test_logs/` 产物结构 |
+| [11_MpRail链路负载可视化.md](11_MpRail链路负载可视化.md) | link-load 采样、七面板吞吐图、坐标解析和统计口径 |
+| [12_专用测试拓扑-EP32-1Plane.md](12_专用测试拓扑-EP32-1Plane.md) | 32 GPU、单 plane、8 Leaf/8 Spine、400 Gbps RDMA 的统一测试基准 |
 
 ## 仿真器的两种输入模式
 
@@ -37,12 +39,16 @@ GPU -> server-local FullMesh -> plane-specific L0-EPS
     -> same-plane L1-EPS -> destination L0-EPS -> GPU
 ```
 
-- 默认目标为 8 个 plane，每个 plane 独立。
-- 一个 rail 包含每个 plane 各一台 L0-EPS；8-plane 时一个 rail 有 8 台 L0-EPS。
-- 一个 rail 下挂可配置数量的服务器。
+- 统一测试目标为 1 个 plane、8 条 rail、8 台 L0 Leaf 和 8 台 L1 Spine。
+- rail 由 GPU 在服务器内的 local index 定义；4 台 8-GPU server 时每条 rail 挂 4 张 GPU。
+- 每张 GPU 只有一条 400 Gbps RDMA fabric 链路。
+- `plane=1` 仅是测试基准；仿真器支持最多 8 个完全独立的并行 scale-out plane。
 - 每个 plane 内，所有 rail 的 L0-EPS 与该 plane 的全部 L1-EPS 全连接。
 - 不存在跨 plane 交换机链路，不存在光交换语义。
 - 同服务器 GPU 之间使用独立的高速 FullMesh 本地路径。
+
+固定 rank/Leaf 映射和测试参数见
+[12_专用测试拓扑-EP32-1Plane.md](12_专用测试拓扑-EP32-1Plane.md)。
 
 实现顺序固定为：文档契约、拓扑与路由、DAG 接入、Python 功能测试。
 
@@ -51,7 +57,7 @@ GPU -> server-local FullMesh -> plane-specific L0-EPS
 ```bash
 python3 pysrc/generate_moe_dag.py \
   --output generated_workloads/deepep_demo \
-  --algorithm deepep-hybrid \
+  --algorithm deepep \
   --num-ranks 16 --gpus-per-server 8 \
   --num-experts 16 --tokens-per-rank 128 \
   --topk 8 --micro-batches 2 --chunk-tokens 32
@@ -73,4 +79,4 @@ python3 visualization/mprail_link_load.py \
 ```
 
 采样开关、五类面板和统计语义见
-[10_MpRail链路负载可视化.md](10_MpRail链路负载可视化.md)。
+[11_MpRail链路负载可视化.md](11_MpRail链路负载可视化.md)。

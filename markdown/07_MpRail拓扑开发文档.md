@@ -18,20 +18,39 @@ MpRail 模拟面向 AI 集群的多平面两层 Leaf-Spine 网络。它不包含
 | rank | 一个 GPU-facing 网络端点 |
 | server | 一组通过高速 FullMesh 相连的 rank |
 | plane | 一套独立的 Leaf-Spine 数据面 |
-| rail | 一组共享服务器集合、按 plane 各有一台 L0-EPS 的接入域 |
-| L0-EPS | plane 内的 Leaf，连接 rail 下的 GPU 和同 plane 的 L1-EPS |
+| rail | 服务器内相同 GPU local index 的集合；8-GPU server 对应 rail 0..7 |
+| L0-EPS | plane 内的 Leaf，连接该 rail 上各服务器的 GPU 和同 plane 的 L1-EPS |
 | L1-EPS | plane 内的 Spine，连接所有 rail 在该 plane 的 L0-EPS |
 
 关键关系：
 
 ```text
 server_count = ceil(rank_count / gpus_per_server)
-rail_count = ceil(server_count / servers_per_rail)
+rail_count = gpus_per_server
 L0_count = rail_count * plane_count
 L1_count = plane_count * l1_eps_per_plane
 ```
 
-因此，`plane_count=8` 时，每个 rail 包含 8 台 L0-EPS：每个 plane 一台。
+rank 到 server/rail 的映射为：
+
+```text
+server_id = rank / gpus_per_server
+rail_id = rank % gpus_per_server
+```
+
+因此，每台服务器在每条 rail 上各贡献一张 GPU。`plane_count=1`、8-GPU server
+时共有 8 条 rail 和 8 台 L0-EPS。
+
+rail 与 plane 是正交维度。plane 表示一套完整、独立的 scale-out fabric：
+
+```text
+每个 plane: 8 L0 Leaf <-> 8 L1 Spine
+plane 之间: 无交换机链路、无共享 Queue/Pipe
+每个 rank: 每个 plane 一个独立 400 Gbps fabric port
+```
+
+因此 `plane_count=8` 表示 8 个并行 scale-out 网络，共 64 台 L0 和 64 台
+L1；单 rank 聚合带宽为 `8 * 400 = 3200 Gbps`。
 
 ## 3. 物理结构
 
@@ -140,18 +159,30 @@ ecmp-rr:
 
 ## 5. 带宽和端口
 
-目标默认口径：
+统一测试口径：
 
 ```text
-plane_count = 8
-endpoint_link_speed = 100 Gb/s per plane
-aggregate_rank_bandwidth = 8 * 100 = 800 Gb/s
+rank_count = 32
+server_count = 4
+gpus_per_server = 8
+rail_count = 8
+plane_count = 1
+L0_count = 8
+L1_count = 8
+endpoint_link_speed = 400 Gb/s
+aggregate_rank_bandwidth = 400 Gb/s
+```
+
+一般情况下：
+
+```text
+aggregate_rank_bandwidth = plane_count * endpoint_link_speed
 ```
 
 每台 L0-EPS 的端口需求：
 
 ```text
-down_ports = servers_per_rail * gpus_per_server
+down_ports = server_count
 up_ports = l1_eps_per_plane * l0_l1_links_per_spine
 required_ports = down_ports + up_ports
 ```
@@ -168,7 +199,7 @@ down_ports = rail_count * l0_l1_links_per_spine
 L0 aggregate uplink bandwidth >= L0 aggregate GPU downlink bandwidth
 ```
 
-拓扑允许通过 `servers_per_rail`、`l1_eps_per_plane` 和链路 bundle 数表达不同 radix 与超卖比例，不把端口数写死在代码里。
+拓扑允许通过 `l1_eps_per_plane` 和链路 bundle 数表达不同 radix 与超卖比例，不把端口数写死在代码里。
 
 ## 6. 配置契约
 
@@ -178,7 +209,6 @@ L0 aggregate uplink bandwidth >= L0 aggregate GPU downlink bandwidth
 -topology mprail
 -mprail_planes <N>
 -mprail_gpus_per_server <N>
--mprail_servers_per_rail <N>
 -mprail_l1_eps_per_plane <N>
 -mprail_l0_l1_links_per_spine <N>
 -linkspeed <Mbps>
@@ -191,7 +221,7 @@ L0 aggregate uplink bandwidth >= L0 aggregate GPU downlink bandwidth
 首版约束：
 
 - 所有正整数拓扑参数必须大于 0。
-- rank 数可以不填满最后一台服务器或最后一个 rail。
+- rank 数可以不填满最后一台服务器。
 - `local_linkspeed` 独立于 plane 链路速率。
 - flow-level ECMP 使用稳定 flow hash 选择 preferred plane。
 - packet spray 复用 UEC 多端口 NIC 调度，不增加 MpRail 私有 spray 算法。

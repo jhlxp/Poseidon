@@ -33,6 +33,10 @@ from moe_dag.algorithms import (  # noqa: E402
     DeepEPConfig,
     MoonEPBuilder,
     MoonEPConfig,
+    NCCLBuilder,
+    NCCLConfig,
+    TokenPayloadPolicy,
+    plan_token_payloads,
 )
 from moe_dag.models import (  # noqa: E402
     TransformerWorkloadConfig,
@@ -117,8 +121,33 @@ def emitter_case(run_dir: Path) -> str:
     return "task dependency 被稳定降低为 3 task/3 barrier，join 前驱为 {0,1}"
 
 
-def deepep_hybrid_case(run_dir: Path) -> str:
-    placement = Placement(8, 4, (4, 5))
+def token_payload_policy_case() -> str:
+    assignments = (
+        RoutingAssignment(0, 7, 0, 0),
+        RoutingAssignment(0, 7, 1, 1),
+    )
+    destinations = {0: 9, 1: 9}
+    deduplicated = plan_token_payloads(
+        assignments,
+        lambda assignment: destinations[assignment.expert_id],
+        TokenPayloadPolicy(),
+    )
+    expanded = plan_token_payloads(
+        assignments,
+        lambda assignment: destinations[assignment.expert_id],
+        TokenPayloadPolicy(deduplicate=False, scope="none"),
+    )
+    require(len(deduplicated[(0, 9)]) == 1, "默认策略没有按 destination rank 去重")
+    require(
+        len(deduplicated[(0, 9)][0].routes) == 2,
+        "去重 payload 没有保留两条 expert route metadata",
+    )
+    require(len(expanded[(0, 9)]) == 2, "关闭去重后没有保留 top-k multiplicity")
+    return "共享 policy 默认生成 1 个 payload；关闭去重时保留 2 个 route payload"
+
+
+def deepep_destination_forward_case(run_dir: Path) -> str:
+    placement = Placement(32, 8, (9, 9))
     assignments = tuple(
         RoutingAssignment(0, token, slot, slot)
         for token in range(3)
@@ -127,7 +156,7 @@ def deepep_hybrid_case(run_dir: Path) -> str:
     invocation = MoEInvocation(
         "deepep_exact",
         placement,
-        (3, 0, 0, 0, 0, 0, 0, 0),
+        (3,) + (0,) * 31,
         128,
         256,
         2,
@@ -136,54 +165,75 @@ def deepep_hybrid_case(run_dir: Path) -> str:
         "bf16",
         assignments,
     )
-    graph = TaskGraph("deepep_hybrid_exact", 8)
-    result = DeepEPBuilder(
-        H100CostModel(), DeepEPConfig(mode="hybrid", chunk_tokens=1)
-    ).build(graph, invocation)
+    graph = TaskGraph("deepep_destination_forward", 32)
+    result = DeepEPBuilder(H100CostModel(), DeepEPConfig(chunk_tokens=1)).build(
+        graph, invocation
+    )
     graph.validate()
 
     tasks = graph.tasks
-    fabric_dispatch = [
-        task for task in tasks if task.payload_kind == "dispatch_fabric"
+    dispatch = [
+        task for task in tasks if task.payload_kind == "dispatch_hidden"
     ]
-    local_fanout = [
-        task for task in tasks if task.payload_kind == "dispatch_local_fanout"
+    combine = [
+        task for task in tasks if task.payload_kind == "combine_partial"
     ]
-    fabric_combine = [
-        task for task in tasks if task.payload_kind == "combine_fabric_partial"
-    ]
-    require(len(fabric_dispatch) == 3, "3 tokens 应生成 3 个 fabric dispatch chunks")
-    require(len(local_fanout) == 3, "relay->rank5 应生成 3 个 local chunks")
-    require(len(fabric_combine) == 3, "combine 每个 token/server 应只返回一个 partial")
+    require(len(dispatch) == 3, "3 tokens 应生成 3 个 dispatch chunks")
+    require(len(combine) == 3, "3 tokens 应生成 3 个 combine chunks")
     require(
-        sum(task.transfer_bytes for task in fabric_dispatch) == 3 * 128,
-        "同一 token 在目标 server 选择两个 expert 时 fabric dispatch 被重复",
+        sum(task.transfer_bytes for task in dispatch) == 3 * 128,
+        "同一 token 在目标 rank 选择两个 expert 时 dispatch payload 被重复",
     )
     require(
-        sum(task.transfer_bytes for task in fabric_combine) == 3 * 128 * 2,
-        "combine fabric partial 字节错误",
+        sum(task.transfer_bytes for task in combine) == 3 * 128 * 2,
+        "combine partial 字节错误",
     )
-    for fanout in local_fanout:
-        require(len(fanout.predecessors) == 1, "每个 local chunk 必须只等对应 fabric chunk")
-        predecessor = graph.task(next(iter(fanout.predecessors)))
-        require(predecessor.chunk_id == fanout.chunk_id, "chunk pipeline 对应关系错误")
+    require(
+        all(
+            task.src_rank == 0
+            and task.dst_rank == 9
+            and task.route_spec == "server_forward src_relay:0 dst_relay:8"
+            for task in dispatch
+        ),
+        "dispatch 没有使用真实端点和目标侧同 index relay",
+    )
+    require(
+        all(
+            task.src_rank == 9
+            and task.dst_rank == 0
+            and task.route_spec == "server_forward src_relay:9 dst_relay:1"
+            for task in combine
+        ),
+        "combine 没有使用反向目标侧转发",
+    )
+    expert = graph.task("deepep_exact.expert.rank9")
+    require(expert.metadata["real_token_routes"] == 6, "去重错误减少了 expert routes")
+    require(result.metadata["route_count"] == 6, "route_count 汇总错误")
+    require(result.metadata["unique_token_payload_count"] == 3, "payload 去重汇总错误")
+    require(result.metadata["deduplicated_route_count"] == 3, "去重 route 汇总错误")
+    require(result.metadata["server_forward_task_count"] == 6, "转发 task 汇总错误")
 
     emitted = emit_workload(
         graph,
-        run_dir / "generated" / "deepep_hybrid_exact",
+        run_dir / "generated" / "deepep_destination_forward",
         metadata=result.metadata,
     )
     require(emitted.dag_path.exists(), "DeepEP DAG 未生成")
-    return "跨节点 dispatch/combine 按 destination server 去重；3 个 chunk 独立推进"
+    dag = emitted.dag_path.read_text(encoding="utf-8")
+    require(dag.count("server_forward src_relay:0 dst_relay:8") == 3,
+            "DAG dispatch route 数量错误")
+    require(dag.count("server_forward src_relay:9 dst_relay:1") == 3,
+            "DAG combine route 数量错误")
+    return "destination-rank 去重保留 6 expert routes；6 个跨服 task 均使用目标端转发"
 
 
-def deepep_direct_cli_case(run_dir: Path) -> str:
-    output_dir = run_dir / "generated" / "deepep_direct_cli"
+def deepep_cli_case(run_dir: Path) -> str:
+    output_dir = run_dir / "generated" / "deepep_cli"
     command = [
         sys.executable,
         str(PYSRC / "generate_moe_dag.py"),
         "--output", str(output_dir),
-        "--algorithm", "deepep-direct",
+        "--algorithm", "deepep",
         "--num-ranks", "8",
         "--gpus-per-server", "4",
         "--num-experts", "8",
@@ -211,15 +261,122 @@ def deepep_direct_cli_case(run_dir: Path) -> str:
     require(completed.returncode == 0, f"CLI 返回码 {completed.returncode}")
     manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
     task_map = json.loads((output_dir / "task_map.json").read_text(encoding="utf-8"))
-    require(manifest["metadata"]["algorithm"] == "deepep-direct", "CLI 算法记录错误")
+    require(manifest["metadata"]["algorithm"] == "deepep", "CLI 算法记录错误")
     payloads = {
         task["payload_kind"]
         for task in task_map["tasks"]
         if task["kind"] == "transfer"
     }
     require(payloads == {"dispatch_hidden", "combine_partial"},
-            f"direct 模式出现非 direct payload: {sorted(payloads)}")
-    return "CLI 生成 direct workload；传输仅含 dispatch_hidden/combine_partial"
+            f"DeepEP 出现非核心 payload: {sorted(payloads)}")
+    require(
+        any(
+            task["route_spec"] and task["route_spec"].startswith("server_forward ")
+            for task in task_map["tasks"]
+            if task["kind"] == "transfer"
+        ),
+        "CLI 生成物没有目标端转发 route",
+    )
+    return "CLI 生成 DeepEP 核心 workload，并输出 destination-side server_forward"
+
+
+def algorithm_cli_case(run_dir: Path) -> str:
+    for algorithm in ("nccl", "moonep"):
+        output_dir = run_dir / "generated" / f"{algorithm}_cli"
+        command = [
+            sys.executable,
+            str(PYSRC / "generate_moe_dag.py"),
+            "--output", str(output_dir),
+            "--algorithm", algorithm,
+            "--num-ranks", "8",
+            "--gpus-per-server", "4",
+            "--num-experts", "8",
+            "--tokens-per-rank", "2",
+            "--topk", "2",
+            "--hidden", "128",
+            "--ffn-hidden", "256",
+            "--sequence-length", "16",
+            "--micro-batches", "1",
+            "--chunk-tokens", "2",
+            "--replicas-per-rank", "1",
+            "--token-padding", "1",
+        ]
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        (run_dir / f"{algorithm}_cli.log").write_text(
+            "$ " + " ".join(command) + "\n" + completed.stdout,
+            encoding="utf-8",
+        )
+        require(completed.returncode == 0,
+                f"{algorithm} CLI 返回码 {completed.returncode}")
+        manifest = json.loads(
+            (output_dir / "manifest.json").read_text(encoding="utf-8")
+        )
+        require(manifest["metadata"]["algorithm"] == algorithm,
+                f"{algorithm} CLI manifest 算法记录错误")
+    return "CLI 成功生成 nccl 与 moonep workload，manifest 算法名正确"
+
+
+def nccl_case(run_dir: Path) -> str:
+    placement = Placement(32, 8, (9, 9))
+    assignments = tuple(
+        RoutingAssignment(0, token, slot, slot)
+        for token in range(3)
+        for slot in range(2)
+    )
+    invocation = MoEInvocation(
+        "nccl_exact",
+        placement,
+        (3,) + (0,) * 31,
+        128,
+        256,
+        2,
+        "fp8",
+        "bf16",
+        "bf16",
+        assignments,
+    )
+    graph = TaskGraph("nccl_rank_direct", 32)
+    result = NCCLBuilder(H100CostModel(), NCCLConfig(chunk_routes=1)).build(
+        graph, invocation
+    )
+    graph.validate()
+
+    dispatch = [
+        task for task in graph.tasks if task.payload_kind == "dispatch_hidden"
+    ]
+    combine = [
+        task for task in graph.tasks if task.payload_kind == "combine_partial"
+    ]
+    require(len(dispatch) == 6 and len(combine) == 6,
+            "NCCL 没有保留 6 条 top-k route multiplicity")
+    require(sum(task.transfer_bytes for task in dispatch) == 6 * 128,
+            "NCCL dispatch 字节没有按 route count 计算")
+    require(sum(task.transfer_bytes for task in combine) == 6 * 128 * 2,
+            "NCCL combine 字节没有按 route count 计算")
+    require(all(task.route_spec is None for task in dispatch + combine),
+            "NCCL 错误使用了 server_forward")
+    require(all(task.src_rank == 0 and task.dst_rank == 9 for task in dispatch),
+            "NCCL dispatch 没有直达真实 dst rank")
+    require(result.metadata["route_count"] == 6, "NCCL route_count 汇总错误")
+    require(result.metadata["token_payload_count"] == 6,
+            "NCCL 错误执行了 payload 去冗余")
+
+    emitted = emit_workload(
+        graph,
+        run_dir / "generated" / "nccl_rank_direct",
+        metadata=result.metadata,
+    )
+    require("server_forward" not in emitted.dag_path.read_text(encoding="utf-8"),
+            "NCCL DAG 出现 server_forward")
+    return "6 条 top-k routes 生成 6 份 direct dispatch/combine payload，无去重和 relay"
 
 
 def moonep_case(run_dir: Path) -> str:
@@ -266,6 +423,98 @@ def moonep_case(run_dir: Path) -> str:
     return "hot expert 复制到 3 个 rank；每 rank 2 real routes；权重预取字节完整"
 
 
+def moonep_scaleout_case(run_dir: Path) -> str:
+    placement = Placement(32, 8, (9, 17))
+    assignments = tuple(
+        [RoutingAssignment(0, token, 0, 0) for token in range(16)]
+        + [RoutingAssignment(1, token, 0, 1) for token in range(8)]
+    )
+    invocation = MoEInvocation(
+        "moonep_scaleout",
+        placement,
+        (16, 8) + (0,) * 30,
+        64,
+        128,
+        1,
+        "fp8",
+        "bf16",
+        "bf16",
+        assignments,
+    )
+    graph = TaskGraph("moonep_deepep_scaleout", 32)
+    result = MoonEPBuilder(
+        H100CostModel(),
+        MoonEPConfig(replicas_per_rank=1, token_padding=1, chunk_tokens=4),
+    ).build(graph, invocation)
+    graph.validate()
+
+    real_routes = result.metadata["real_routes_by_rank"]
+    require({real_routes[rank] for rank in range(8, 16)} == {2},
+            "server 1 没有独立均衡为每 rank 2 routes")
+    require({real_routes[rank] for rank in range(16, 24)} == {1},
+            "server 2 没有独立均衡为每 rank 1 route")
+    require(all(real_routes[rank] == 0 for rank in (*range(0, 8), *range(24, 32))),
+            "无目标 expert 的服务器错误获得了 execution routes")
+    require(result.metadata["routes_by_server"] == {0: 0, 1: 16, 2: 8, 3: 0},
+            "per-server route 汇总错误")
+
+    replicas = result.metadata["replicas"]
+    require(len(replicas) == 14, "两个 hot experts 应各创建 7 个本地 replica")
+    require(
+        all(
+            placement.rank_server(item["home_rank"])
+            == placement.rank_server(item["execution_rank"])
+            == item["home_server"]
+            for item in replicas
+        ),
+        "MoonEP replica 跨越了 expert home server",
+    )
+    prefetch = [
+        task for task in graph.tasks if task.payload_kind == "expert_weight_prefetch"
+    ]
+    require(len(prefetch) == 14, "expert weight prefetch flow 数量错误")
+    require(all(task.route_spec is None for task in prefetch),
+            "本地 expert prefetch 错误使用 server_forward")
+    require(
+        all(
+            placement.rank_server(task.src_rank) == placement.rank_server(task.dst_rank)
+            for task in prefetch
+        ),
+        "expert prefetch flow 跨服务器",
+    )
+    require(
+        sum(task.transfer_bytes for task in prefetch)
+        == 14 * invocation.expert_weight_bytes,
+        "expert prefetch 总字节错误",
+    )
+
+    token_flows = [
+        task
+        for task in graph.tasks
+        if task.payload_kind in {"dispatch_hidden", "combine_partial"}
+    ]
+    require(len(token_flows) == 32, "MoonEP token dispatch/combine flow 数量错误")
+    require(all(task.route_spec and task.route_spec.startswith("server_forward ")
+                for task in token_flows),
+            "MoonEP 跨服务器 token flow 没有复用 DeepEP transport")
+    require(result.metadata["server_forward_task_count"] == 32,
+            "MoonEP server_forward task 汇总错误")
+    require(
+        graph.task("moonep_scaleout.expert.rank8").duration_us
+        > graph.task("moonep_scaleout.expert.rank16").duration_us,
+        "不同服务器 route 负载没有产生不同 compute_us",
+    )
+
+    emitted = emit_workload(
+        graph,
+        run_dir / "generated" / "moonep_deepep_scaleout",
+        metadata=result.metadata,
+    )
+    require(emitted.dag_path.read_text(encoding="utf-8").count("server_forward") == 32,
+            "MoonEP DAG 的 DeepEP route 数量错误")
+    return "server1 每 rank 2 routes、server2 每 rank 1 route；14 个本地 replica flows、32 个 DeepEP token flows"
+
+
 def model_pipeline_case(run_dir: Path) -> str:
     model = ModelSpec(
         name="two_microbatch_block",
@@ -285,7 +534,7 @@ def model_pipeline_case(run_dir: Path) -> str:
             model=model,
             placement=placement,
             tokens_per_rank=4,
-            algorithm="deepep-hybrid",
+            algorithm="deepep",
             chunk_tokens=2,
         )
     )
@@ -349,12 +598,11 @@ def execute_htsim(
     command = [
         str(BINARY),
         "-topology", "mprail",
-        "-mprail_planes", "8",
-        "-mprail_gpus_per_server", "4",
-        "-mprail_servers_per_rail", "1",
-        "-mprail_l1_eps_per_plane", "2",
-        "-mprail_l0_l1_links_per_spine", "2",
-        "-linkspeed", "100000",
+        "-mprail_planes", "1",
+        "-mprail_gpus_per_server", "8",
+        "-mprail_l1_eps_per_plane", "8",
+        "-mprail_l0_l1_links_per_spine", "1",
+        "-linkspeed", "400000",
         "-local_linkspeed", "3200000",
         "-local_latency_ns", "50",
         "-hop_latency", "0.1",
@@ -422,13 +670,13 @@ def htsim_case(run_dir: Path) -> str:
 
 
 def htsim_deepep_case(run_dir: Path) -> str:
-    generated = run_dir / "generated" / "deepep_hybrid_exact"
+    generated = run_dir / "generated" / "deepep_destination_forward"
     manifest = json.loads((generated / "manifest.json").read_text(encoding="utf-8"))
     task_count = manifest["task_count"]
     barrier_count = manifest["barrier_count"]
     log = execute_htsim(
         run_dir,
-        "htsim_deepep_hybrid",
+        "htsim_deepep_destination_forward",
         generated / "nodes.cm",
         generated / "workload.dag",
     )
@@ -437,10 +685,75 @@ def htsim_deepep_case(run_dir: Path) -> str:
         "DeepEP 生成 DAG 未完整结束",
     )
     require(
-        len(re.findall(r"^DAG_NETWORK_DONE", log, re.MULTILINE)) == 12,
-        "DeepEP 12 个 network chunk 没有全部完成",
+        len(re.findall(r"^DAG_NETWORK_DONE", log, re.MULTILINE)) == 6,
+        "DeepEP 6 个逻辑 network task 没有全部完成",
     )
-    return f"HTSim 完成 DeepEP hybrid 全图：{task_count} tasks/{barrier_count} barriers"
+    begins = re.findall(r"^SERVER_FORWARD_BEGIN .* phases=(\d+)$", log, re.MULTILINE)
+    require(begins == ["2"] * 6, f"DeepEP task 不是两个 subflow: {begins}")
+    require("phase=src_local" not in log, "DeepEP 错误启动了 source-local phase")
+    require(
+        len(re.findall(r"^SERVER_FORWARD_PHASE_DONE .* phase=fabric ", log, re.MULTILINE))
+        == 6,
+        "DeepEP fabric subflow 完成数量错误",
+    )
+    require(
+        len(re.findall(r"^SERVER_FORWARD_PHASE_DONE .* phase=dst_local ", log, re.MULTILINE))
+        == 6,
+        "DeepEP destination-local subflow 完成数量错误",
+    )
+    return (
+        f"HTSim 完成 DeepEP 目标端转发全图：{task_count} tasks/"
+        f"{barrier_count} barriers，6 个逻辑 task 各执行 2 个 subflow"
+    )
+
+
+def htsim_nccl_case(run_dir: Path) -> str:
+    generated = run_dir / "generated" / "nccl_rank_direct"
+    manifest = json.loads((generated / "manifest.json").read_text(encoding="utf-8"))
+    log = execute_htsim(
+        run_dir,
+        "htsim_nccl_rank_direct",
+        generated / "nodes.cm",
+        generated / "workload.dag",
+    )
+    require(
+        f"DAG_SUMMARY tasks={manifest['task_count']} "
+        f"barriers={manifest['barrier_count']}" in log,
+        "NCCL 生成 DAG 未完整结束",
+    )
+    require("SERVER_FORWARD_BEGIN" not in log, "NCCL 运行时进入 server_forward")
+    require(
+        len(re.findall(r"MPRAIL_FLOW flow=\d+ src=0 dst=9 scope=cross_rail", log))
+        == 6,
+        "NCCL dispatch 没有按真实 0->9 跨 rail 直达",
+    )
+    require(len(re.findall(r"^DAG_NETWORK_DONE", log, re.MULTILINE)) == 12,
+            "NCCL 12 个 network tasks 没有全部完成")
+    return "HTSim 完成 NCCL direct DAG；0->9 经过 cross-rail，未使用 server_forward"
+
+
+def htsim_moonep_case(run_dir: Path) -> str:
+    generated = run_dir / "generated" / "moonep_deepep_scaleout"
+    manifest = json.loads((generated / "manifest.json").read_text(encoding="utf-8"))
+    log = execute_htsim(
+        run_dir,
+        "htsim_moonep_deepep_scaleout",
+        generated / "nodes.cm",
+        generated / "workload.dag",
+    )
+    require(
+        f"DAG_SUMMARY tasks={manifest['task_count']} "
+        f"barriers={manifest['barrier_count']}" in log,
+        "MoonEP 生成 DAG 未完整结束",
+    )
+    require(len(re.findall(r"^SERVER_FORWARD_BEGIN", log, re.MULTILINE)) == 32,
+            "MoonEP 32 个跨服务器 token tasks 未全部进入 DeepEP transport")
+    require("phase=src_local" not in log,
+            "MoonEP/DeepEP 目标端转发错误启动 src_local")
+    require(len(re.findall(r"^DAG_NETWORK_DONE", log, re.MULTILINE)) == 46,
+            "MoonEP 14 prefetch + 32 token tasks 没有全部完成")
+    require("scope=same_server" in log, "MoonEP 本地 expert prefetch 未走 FullMesh")
+    return "HTSim 完成 MoonEP EP32 DAG；14 个本地 prefetch 和 32 个 DeepEP token tasks 全部完成"
 
 
 def write_report(run_dir: Path, results: list[CaseResult]) -> None:
@@ -464,7 +777,8 @@ def write_report(run_dir: Path, results: list[CaseResult]) -> None:
             "## 范围",
             "",
             "已验证字节计算、显式 chunk task、flow 完成依赖、barrier lowering、",
-            "DeepEP hybrid/direct、MoonEP 首版 planner 以及 HTSim 加载执行。",
+            "NCCL direct/no-dedup、DeepEP 目标端转发、MoonEP per-server replica/",
+            "DeepEP scale-out 组合以及 HTSim 加载执行。",
             "不测试单 flow 包进度事件、CUDA stream、动态 SM、HBM 竞争或 kernel profiling。",
         ]
     )
@@ -487,14 +801,20 @@ def main() -> int:
     suite = Suite(run_dir)
     suite.run("h100_cost_model", cost_model_case)
     suite.run("barrier_emitter", lambda: emitter_case(run_dir))
-    suite.run("deepep_hybrid_exact_bytes", lambda: deepep_hybrid_case(run_dir))
-    suite.run("deepep_direct_cli", lambda: deepep_direct_cli_case(run_dir))
+    suite.run("token_payload_policy", token_payload_policy_case)
+    suite.run("deepep_destination_forward", lambda: deepep_destination_forward_case(run_dir))
+    suite.run("deepep_cli", lambda: deepep_cli_case(run_dir))
+    suite.run("nccl_moonep_cli", lambda: algorithm_cli_case(run_dir))
+    suite.run("nccl_rank_direct", lambda: nccl_case(run_dir))
     suite.run("moonep_balanced_replica", lambda: moonep_case(run_dir))
+    suite.run("moonep_deepep_scaleout", lambda: moonep_scaleout_case(run_dir))
     suite.run("two_microbatch_overlap", lambda: model_pipeline_case(run_dir))
     try:
         build_simulator(run_dir)
         suite.run("htsim_generated_dag", lambda: htsim_case(run_dir))
-        suite.run("htsim_deepep_hybrid", lambda: htsim_deepep_case(run_dir))
+        suite.run("htsim_deepep_destination_forward", lambda: htsim_deepep_case(run_dir))
+        suite.run("htsim_nccl_rank_direct", lambda: htsim_nccl_case(run_dir))
+        suite.run("htsim_moonep_deepep_scaleout", lambda: htsim_moonep_case(run_dir))
     except Exception as exc:
         suite.results.append(CaseResult("htsim_generated_dag", "failed", str(exc)))
     write_report(run_dir, suite.results)

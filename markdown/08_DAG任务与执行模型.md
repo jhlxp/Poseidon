@@ -120,11 +120,11 @@ compute = src_rank == dst_rank and transfer_bytes == 0 and compute_us > 0
 network task 可选的第五组支持：
 
 ```text
-explicit rank:0 l0:r0:p3:b0 l1:p3:s1:b1 l0:r1:p3 rank:8
+explicit rank:0 l0:r0:p0:b0 l1:p0:s1:b0 l0:r1:p0 rank:9
 server_forward src_relay:3 dst_relay:11
 ```
 
-完整语法、拓扑校验和完成语义见 [08_MpRail源路由与服务器转发.md](08_MpRail源路由与服务器转发.md)。compute task 不允许携带 route 组。
+完整语法、拓扑校验和完成语义见 [09_MpRail源路由与服务器转发.md](09_MpRail源路由与服务器转发.md)。compute task 不允许携带 route 组。
 
 ## 4. Barrier DAG 语义
 
@@ -207,8 +207,9 @@ Attention 1
 
 - DAG 本身不直接指定 plane 或 spine。
 - network task 提供 `src_rank`、`dst_rank`、`transfer_bytes` 和 task/flow ID。
-- `-load_balancing_algo ecmp` 下，MpRail 根据 flow ID 稳定选择 source plane；UEC 固定 `pathid`，因此一个 network task 使用一条 flow-level ECMP 路径。
-- `-load_balancing_algo oblivious` 下，UEC 逐包改变 `pathid`，NIC 在可用 plane port 间调度；一个 network task 即可使用全部 8 个 plane。
+- `-load_balancing_algo ecmp` 下，MpRail 根据 flow ID 固定 source plane，UEC 固定 `pathid`，因此一个 network task 使用一条 flow-level ECMP 路径。
+- `-load_balancing_algo oblivious` 下，UEC 逐包改变 `pathid`，NIC 可在多个 plane port 间调度，并在各 plane 内使用多个 Spine ECMP 路径。
+- 专用测试配置 `plane=1` 时，两种策略都只进入 plane 0，但仍可验证单 plane 内的 8-Spine ECMP。
 - L0/L1 在 packet 所属 plane 内，根据 `(flow_id, pathid, switch_salt)` 对 L1-EPS 和 bundle 执行 ECMP。
 - 同一 barrier 的多个 network task 在两种模式下都可以并发执行并产生网络竞争。
 - compute task 不进入网络拓扑。

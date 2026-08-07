@@ -23,11 +23,14 @@
 FullMesh/NVLink 位于 GPU/NIC 一侧，因此放在最下面，不能放在 L1 上方。
 
 第三行的 server endpoint 按一个 HTSim endpoint/rank 聚合，不会再把同一物理服务器
-内的多个 rank 相加。这样在 `planes=8`、每 plane 链路 400 Gbps 时，红色容量线正好是：
+内的多个 rank 相加。红色容量线按 plane 数聚合：
 
 ```text
-8 * 400 Gbps = 3200 Gbps = 3.2 Tbps
+aggregate_rank_bandwidth = plane_count * 400 Gbps
 ```
+
+专用测试为 `1 * 400 = 400 Gbps`；8-plane 实验为
+`8 * 400 = 3200 Gbps = 3.2 Tbps`。
 
 每条蓝色、橙色或绿色曲线表示一条有向物理链路的 bucket throughput。红色虚线
 来自 `link_info.csv` 中该面板的真实 `rate_gbps`，不是脚本写死的 400 Gbps。
@@ -177,18 +180,18 @@ MpRail 的 `ECNQueue` 当前只使用 `ecn_low` 作为 marking threshold；`ecn_
 occupancy_ratio = max_queue_bytes / queue_size_bytes
 ```
 
-其中 `queue_size_bytes` 取 HTSim 启动日志，不能拿 line rate 或 3.2 Tbps 聚合容量代替。
+其中 `queue_size_bytes` 取 HTSim 启动日志，不能拿 400 Gbps line rate 代替。
 
 ### 3.4 推荐的显式实验参数
 
-400 Gbps/link、8 planes、3.2 Tbps/rank 的实验建议把关键口径写全：
+专用测试使用 400 Gbps/link、1 plane、400 Gbps/rank，建议把关键口径写全：
 
 ```bash
 HTSIM_LINK_LOAD_SAMPLE=1 \
 HTSIM_LINK_LOAD_SAMPLE_US=1 \
 ./htsim/sim/build-mprail/datacenter/htsim_uec \
   -topology mprail \
-  -mprail_planes 8 \
+  -mprail_planes 1 \
   -linkspeed 400000 \
   -local_linkspeed 3200000 \
   -mtu 4150 \
@@ -211,7 +214,7 @@ Pandas。
 python3 visualization/mprail_link_load.py \
   --metrics-dir <run-dir>/output_metrics \
   --output-dir <run-dir>/visualization \
-  --planes 8 \
+  --planes 1 \
   --title "DeepEP EP32 MpRail link throughput"
 ```
 
@@ -308,8 +311,8 @@ python3 tests/run_mprail_visualization.py
 - 五类名称和坐标解析；
 - L0/L1 跨 plane 输入被拒绝；
 - 四行七面板 PNG 确实生成且尺寸有效；
-- 8 个 plane、400 Gbps/link 得到 3200 Gbps endpoint 容量线；
-- endpoint output 的 400 Gbps peak 得到 12.5% utilization 和 87.5% headroom；
+- endpoint 容量线按 `plane_count * 400 Gbps/link` 计算；
+- 专用测试中 endpoint output 的 400 Gbps peak 得到 100% utilization 和 0% headroom；
 - summary 的链路数、总字节、line rate 和最大队列正确；
 - inventory 能恢复 rank/rail/plane/spine/bundle。
 
