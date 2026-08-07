@@ -204,11 +204,11 @@ N=3: (MB0, MB1) -> (MB2)
 N=4: (MB0, MB1) -> (MB2, MB3)
 ```
 
-每组使用两条 stream 做组内 overlap；前一组的完整 workload 全部完成后，下一组
-才启动，组与组之间不 overlap。这里的“完整 workload”由生成范围决定：当前单
-Transformer block builder 表示两个 microbatch 都走完该 block；当第二层扩展为完整
-DeepSeek-V3 prefill 时，则表示两个 microbatch 都走完 DSV3 的全部层和最终任务后，
-下一组才开始。奇数个 microbatch 的最后一个单独成组。
+每组使用两条 stream 做组内 overlap；前一组在所有 rank 上的完整 workload 全部完成
+后，下一组才启动，组与组之间不 overlap。这里的“完整 workload”由 `num_layers`
+决定：`num_layers=1` 表示两个 microbatch 都走完一个 block；`num_layers=2` 表示都
+走完两个 block。未来完整 DSV3 builder 覆盖全部真实层和最终任务时，同一语义才
+表示两个 microbatch 走完整 DSV3 prefill。奇数个 microbatch 的最后一个单独成组。
 
 同一个 Dispatch/Combine phase 内的 destination flow 和 chunk 保持并行；不同通信
 phase 只在实际参与的 rank 上按 comm stream tail 串行。compute producer、
@@ -219,9 +219,15 @@ HTSim 不感知或调度 CUDA stream；它只执行 lowering 后的 barrier DAG�
 同一 GPU 上两个 compute task 错误重叠，也保留 `D0||Attention1`、`D1||Expert0`、
 `C0||Expert1` 和 `C1||Reduce0`。
 
-### 5.4 首版 compute 只使用固定时长理论占位
+### 5.4 Compute 使用固定时长
 
-首版不建立真实 kernel 性能模型。生成器先计算每个算子的理论 FLOP 数，再按单张 H100 SXM 的 dense BF16 Tensor Core 峰值换算。普通计算使用完整峰值；明确与通信 kernel 重叠的计算使用固定 SM 预留后的峰值：
+HTSim 中的 compute task 始终是固定 `compute_us`。生成器支持两种写入来源：默认
+H100 理论 FLOP 公式，或者模块级 JSON 固定时间。JSON 同时保存 `theoretical_us`
+和 `profiled_us`，通过 `selected_source` 二选一，格式见
+[15_计算时间JSON配置.md](15_计算时间JSON配置.md)。
+
+未传 JSON 时，生成器按单张 H100 SXM 的 dense BF16 Tensor Core 峰值换算。普通
+计算使用完整峰值；明确与通信 kernel 重叠的计算使用固定 SM 预留后的峰值：
 
 ```text
 peak_flops_per_gpu = 989e12 FLOP/s
@@ -236,7 +242,12 @@ compute_us_overlap = operation_flops / 839.15e12 * 1e6
 
 `communication_sms=20` 是本项目的首版仿真假设，不是 DeepEP 对所有模式和拓扑的固定值。它按“每个 rank 上的逻辑通信 kernel/phase”预留一次；同一个 dispatch/combine phase 拆出的多个 flow 或 chunk 共享这 20 SM，不能按 flow 数重复扣减。
 
-换算结果写入 `.dag` 后就是固定时长事件。HTSim 不做运行时 SM 调度：被标记为 overlap 的 compute task 在整个固定时长内都按 112 SM 计算，即使 network task 较早结束，也不动态恢复到 132 SM。network task 的 FCT 仍完全由 UEC/MpRail 决定，20 SM 只影响计算占位时间。
+传入 JSON 后，选中的模块时间直接写入 `.dag`，不再按 FLOP 或 overlap SM 比例缩放；
+`total_sms`/`communication_sms` 只记录资源假设。这样每个模块只需维护一个理论数字
+和一个 profiling 数字。
+
+换算或读取结果写入 `.dag` 后就是固定时长事件。HTSim 不做运行时 SM 调度，也不
+动态恢复 SM。network task 的 FCT 仍完全由 UEC/MpRail 决定。
 
 该占位仍不考虑 Tensor Core 实际利用率、HBM、kernel launch、融合、padding、warp、抢占或 cache，因此只是简化理论下界。profiling 和完整 GPU 资源模型留到后续开发。
 
@@ -252,7 +263,7 @@ compute_us_overlap = operation_flops / 839.15e12 * 1e6
 | 每 GPU compute/comm stream 顺序 | 已支持静态 lowering | 模型生成器增加 predecessor edges；HTSim 不做运行时 stream 调度 |
 | chunk 级流水转发 | 已支持表达 | 显式拆成多个 network task，每个 flow 完成后释放自己的 barrier |
 | 单 flow 内部流式事件 | 不支持且首版不需要 | 不监听第 N 个 packet；需要时拆 chunk flow |
-| GPU compute | 固定时长事件 | 普通任务按 989 TFLOP/s，overlap 任务按 839.15 TFLOP/s |
+| GPU compute | 固定时长事件 | 默认 H100 理论公式，或 JSON theoretical/profiled 二选一 |
 | 通信/计算 SM 竞争 | 静态近似 | 每 rank 的逻辑通信 phase 固定预留 20/132 SM |
 | HBM/NVLink memory contention | 未支持 | 不进入首版 compute 占位，报告中标注 |
 | multicast/one-to-many 原语 | 未支持且当前不需要 | DeepEP 按 destination rank 生成点到点逻辑 task |

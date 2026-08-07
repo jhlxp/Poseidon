@@ -14,7 +14,7 @@ from ..algorithms import (
     NCCLBuilder,
     NCCLConfig,
 )
-from ..cost import H100CostModel
+from ..cost import ComputeCostModel, H100CostModel
 from ..graph import TaskGraph
 from ..schema import ModelSpec, MoEInvocation, Placement, ValidationError, make_uniform_assignments
 from .streams import apply_double_buffered_two_stream_schedule
@@ -80,7 +80,7 @@ def _router_flops(tokens: int, model: ModelSpec) -> int:
 def build_transformer_workload(
     config: TransformerWorkloadConfig,
     *,
-    cost_model: H100CostModel | None = None,
+    cost_model: ComputeCostModel | None = None,
 ) -> WorkloadBuildResult:
     cost = cost_model or H100CostModel()
     graph = TaskGraph(config.model.name, config.placement.num_ranks)
@@ -127,65 +127,90 @@ def build_transformer_workload(
         )
 
     algorithm_results: list[AlgorithmBuildResult] = []
+    algorithm_metadata: list[dict[str, object]] = []
     microbatch_task_keys: list[tuple[str, ...]] = []
     for micro_batch in range(config.model.micro_batches):
         before_microbatch = len(graph.tasks)
-        attention_keys: dict[int, str] = {}
-        for rank in range(config.placement.num_ranks):
-            key = f"mb{micro_batch}.attention.rank{rank}"
-            graph.add_compute(
-                key,
-                rank,
-                cost.estimate(
-                    _attention_flops(config.tokens_per_rank, config.model),
-                    overlaps_communication=micro_batch > 0,
-                ),
-                metadata={
-                    "operation": "attention",
-                    "micro_batch": micro_batch,
-                    "cost_status": "theoretical_flops",
-                },
-            )
-            attention_keys[rank] = key
+        previous_rank_terminals: dict[int, frozenset[str]] = {}
+        for layer in range(config.model.num_layers):
+            before_layer = len(graph.tasks)
+            scope = f"mb{micro_batch}"
+            if config.model.num_layers > 1:
+                scope += f".layer{layer}"
 
-        router_keys: set[str] = set()
-        for rank in range(config.placement.num_ranks):
-            key = f"mb{micro_batch}.router.rank{rank}"
-            graph.add_compute(
-                key,
-                rank,
-                cost.estimate(
-                    _router_flops(config.tokens_per_rank, config.model),
-                    overlaps_communication=micro_batch > 0,
-                ),
-                predecessors={attention_keys[rank]},
-                metadata={
-                    "operation": "router_projection",
-                    "micro_batch": micro_batch,
-                    "cost_status": "theoretical_flops",
-                },
-            )
-            router_keys.add(key)
+            attention_keys: dict[int, str] = {}
+            for rank in range(config.placement.num_ranks):
+                key = f"{scope}.attention.rank{rank}"
+                graph.add_compute(
+                    key,
+                    rank,
+                    cost.estimate(
+                        _attention_flops(config.tokens_per_rank, config.model),
+                        operation="attention",
+                        overlaps_communication=micro_batch % 2 == 1,
+                    ),
+                    predecessors=set(previous_rank_terminals.get(rank, ())),
+                    metadata={
+                        "operation": "attention",
+                        "micro_batch": micro_batch,
+                        "layer": layer,
+                        "operation_flops_status": "theoretical_formula",
+                    },
+                )
+                attention_keys[rank] = key
 
-        invocation = MoEInvocation(
-            invocation_id=f"mb{micro_batch}.moe",
-            placement=config.placement,
-            tokens_per_source_rank=tokens,
-            hidden=config.model.hidden,
-            ffn_hidden=config.model.ffn_hidden,
-            topk=config.model.topk,
-            dispatch_dtype=config.dispatch_dtype,
-            combine_dtype=config.combine_dtype,
-            weight_dtype=config.weight_dtype,
-            assignments=make_uniform_assignments(
-                tokens,
-                config.model.topk,
-                config.model.num_experts,
-            ),
-        )
-        algorithm_results.append(
-            algorithm_builder.build(graph, invocation, entry_keys=router_keys)
-        )
+            router_keys: set[str] = set()
+            for rank in range(config.placement.num_ranks):
+                key = f"{scope}.router.rank{rank}"
+                graph.add_compute(
+                    key,
+                    rank,
+                    cost.estimate(
+                        _router_flops(config.tokens_per_rank, config.model),
+                        operation="router_projection",
+                        overlaps_communication=micro_batch % 2 == 1,
+                    ),
+                    predecessors={attention_keys[rank]},
+                    metadata={
+                        "operation": "router_projection",
+                        "micro_batch": micro_batch,
+                        "layer": layer,
+                        "operation_flops_status": "theoretical_formula",
+                    },
+                )
+                router_keys.add(key)
+
+            invocation = MoEInvocation(
+                invocation_id=f"{scope}.moe",
+                placement=config.placement,
+                tokens_per_source_rank=tokens,
+                hidden=config.model.hidden,
+                ffn_hidden=config.model.ffn_hidden,
+                topk=config.model.topk,
+                dispatch_dtype=config.dispatch_dtype,
+                combine_dtype=config.combine_dtype,
+                weight_dtype=config.weight_dtype,
+                assignments=make_uniform_assignments(
+                    tokens,
+                    config.model.topk,
+                    config.model.num_experts,
+                ),
+            )
+            algorithm_result = algorithm_builder.build(
+                graph, invocation, entry_keys=router_keys
+            )
+            for task in graph.tasks[before_layer:]:
+                task.metadata["micro_batch"] = micro_batch
+                task.metadata["layer"] = layer
+            algorithm_results.append(algorithm_result)
+            algorithm_metadata.append(
+                {
+                    "micro_batch": micro_batch,
+                    "layer": layer,
+                    **algorithm_result.metadata,
+                }
+            )
+            previous_rank_terminals = algorithm_result.rank_terminal_keys
         microbatch_task_keys.append(
             tuple(task.key for task in graph.tasks[before_microbatch:])
         )
@@ -206,6 +231,7 @@ def build_transformer_workload(
             "num_experts": config.model.num_experts,
             "topk": config.model.topk,
             "sequence_length": config.model.sequence_length,
+            "num_layers": config.model.num_layers,
             "micro_batches": config.model.micro_batches,
             "batch_size": config.model.batch_size,
             "dtype": config.model.dtype,
@@ -254,6 +280,6 @@ def build_transformer_workload(
             "single_flow_packet_progress_events": False,
             "dynamic_gpu_resource_scheduling": False,
         },
-        "micro_batch_algorithms": [result.metadata for result in algorithm_results],
+        "micro_batch_algorithms": algorithm_metadata,
     }
     return WorkloadBuildResult(graph, metadata, tuple(algorithm_results))

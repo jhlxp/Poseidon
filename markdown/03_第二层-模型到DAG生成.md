@@ -12,10 +12,10 @@
 以及这些操作之间如何依赖或重叠？
 ```
 
-当前实现位于 `pysrc/moe_dag/models/transformer.py`。它生成一个 forward MoE
-block 的 Attention、Router 和算法专属 Dispatch/Expert/Combine，并支持多个
-microbatch。当前不是下面完整算子清单的逐 kernel 实现：norm、RoPE、residual、
-shared expert、TP/PP 和 backward 仍是后续范围。
+当前实现位于 `pysrc/moe_dag/models/transformer.py`。它按 `num_layers` 生成一个或
+多个 forward MoE block 的 Attention、Router 和算法专属 Dispatch/Expert/Combine，
+并支持多个 microbatch 和跨层依赖。当前不是下面完整算子清单的逐 kernel 实现：
+norm、RoPE、residual、shared expert、TP/PP 和 backward 仍是后续范围。
 
 当前合成 routing 为确定性的 uniform assignment。真实 trace、Zipf/hot-expert
 provider 尚未接入 CLI；第一层 API 可以直接传入完整 `RoutingAssignment`。
@@ -136,6 +136,20 @@ tokens_per_rank = micro_batch * sequence_length / data_parallel_shard_factor
 
 模型层只决定 source token tensor；top-k assignment 交给 routing provider。
 
+### 4.1 DeepEP 训练/prefill token 口径
+
+DeepEP normal-kernel 测试的 `--num-tokens` 默认值为 4096，每个分布式进程在自己的
+rank 上创建 `[4096, hidden]` 输入。因此本项目的标准 DSV3 训练/prefill workload
+固定解释为：
+
+```text
+tokens_per_rank_per_microbatch = 4096
+```
+
+这个值不是所有 rank 的全局 token 总数。EP32 下每个 microbatch 的全局 token 数为
+`4096 * 32 = 131072`。功能 smoke test 可以使用更小值加快逐包仿真，但 manifest、
+测试报告和文档必须标记为 smoke，不能据此得出性能结论。
+
 ## 5. Router 输入来源
 
 支持三类 routing provider：
@@ -175,9 +189,10 @@ routing_fidelity = histogram_only
 
 ## 6. Compute 固定时长占位
 
-### 6.1 固定硬件口径
+### 6.1 默认理论硬件口径
 
-首版不做 kernel profiling、roofline、HBM 或动态 SM 调度。统一采用 H100 SXM 的 dense BF16 Tensor Core 理论峰值，并为重叠通信固定预留 20 SM：
+没有指定计算 JSON 时，生成器采用 H100 SXM 的 dense BF16 Tensor Core 理论峰值，
+并为重叠通信固定预留 20 SM：
 
 ```text
 per_gpu_peak = 989 TFLOP/s = 989e12 FLOP/s
@@ -193,9 +208,10 @@ NVIDIA 当前 H100 产品规格给出的 BF16/FP16 `1,979 TFLOP/s` 带结构化�
 `communication_sms_per_rank=20` 是本项目实验配置，不是 DeepEP 的固定事实；这里
 用一个固定参数近似通信 kernel 和计算 kernel 的主要资源竞争。
 
-### 6.2 固定时间换算
+### 6.2 固定时间来源
 
-生成器离线计算理论 FLOP 数，然后根据 task 是否位于通信 overlap 窗口写入固定 `compute_us`：
+默认模式离线计算理论 FLOP 数，然后根据 task 是否位于通信 overlap 窗口写入固定
+`compute_us`：
 
 ```text
 compute_us_normal  = operation_flops / 989e12 * 1e6
@@ -223,6 +239,12 @@ total ~= 6 * H * H_ff
 
 attention 仍需按 prefill/decode 和实际 shape 计算 FLOP 数，但同样统一除以 `989e12`，不单独建模 KV cache 或内存瓶颈。
 
+指定 `--compute-config` 后，生成器改为读取模块级 JSON。每个模块包含
+`theoretical_us` 和 `profiled_us`，`selected_source` 决定哪一个直接成为
+`compute_us`。JSON 模式仍记录理论 `operation_flops`，但不再用它换算时间，也不按
+overlap SM 比例二次缩放。完整格式、模块名和失败规则见
+[15_计算时间JSON配置.md](15_计算时间JSON配置.md)。
+
 ### 6.3 与网络的边界
 
 只有模型计算 FLOP 进入 `compute_us`。以下时间不加入 compute task：
@@ -231,7 +253,7 @@ attention 仍需按 prefill/decode 和实际 shape 计算 FLOP 数，但同样�
 - `server_forward` 的网络和本地 flow 时间；
 - 等待 predecessor barrier 的时间。
 
-后续引入 profiling 时，仍不能把包含 RDMA/NVLink 等待的端到端时间直接填入 compute task，否则会重复计算网络时间。
+profiling 时间不能包含 RDMA/NVLink 等待，否则会与 HTSim network FCT 重复计算。
 
 一个逻辑通信 phase 可以展开成多条 destination flow 或 chunk flow。这些 flow 在同一 rank 上共享一次 20 SM 预留，而不是每条 flow 各占 20 SM。phase 归属记录在 `task_map.json`/manifest 中，不修改 `.dag` 行格式。
 
@@ -291,8 +313,8 @@ group 2: MB4 + MB5
 
 “完整 workload”不能一律写成“完整模型”，必须以 builder 的建模范围为准：
 
-- 当前 `build_transformer_workload()` 只生成一个 forward MoE block，因此组间边界是
-  两个 microbatch 都完成这个 block；
+- 当前 `build_transformer_workload()` 生成 `num_layers` 个同构 forward MoE block，
+  因此组间边界是两个 microbatch 都完成这些 block；
 - 将来完整 DSV3 builder 生成全部 Transformer 层时，组间边界就是两个 microbatch
   都完成完整 DSV3 prefill，包括全部层及最终任务；
 - 不允许在前一组仍位于中间层时提前启动下一组，从而把当前双缓冲语义误解为

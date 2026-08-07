@@ -30,6 +30,7 @@ class TwoStreamScheduleResult:
     compute_task_count: int
     communication_task_count: int
     communication_phase_count: int
+    layer_count: int
     microbatch_group_size: int = 2
 
     def manifest(self) -> dict[str, object]:
@@ -37,7 +38,10 @@ class TwoStreamScheduleResult:
             "model": "per_rank_two_stream_double_buffered_v1",
             "compute_streams_per_rank": 1,
             "communication_streams_per_rank": 1,
+            "layer_count": self.layer_count,
             "microbatch_group_size": self.microbatch_group_size,
+            "microbatch_group_completion": "complete_workload_drain",
+            "schedule_order": "group_then_layer_then_stream_section",
             "phase_internal_flows_parallel": True,
             "stream_order_lowering": "predecessor_edges",
             "added_dependencies": self.added_dependencies,
@@ -83,31 +87,62 @@ def apply_double_buffered_two_stream_schedule(
     if set(flattened) != {task.key for task in graph.tasks}:
         raise ValidationError("two-stream fragments must cover the complete graph")
 
-    fragments = [tuple(graph.task(key) for key in keys) for keys in microbatch_task_keys]
-    compute_sections: list[dict[str, dict[int, list[Task]]]] = []
-    transfer_phases: list[dict[str, list[Task]]] = []
-    for micro_batch, tasks in enumerate(fragments):
-        sections = {
-            "front": {rank: [] for rank in range(graph.num_ranks)},
-            "expert": {rank: [] for rank in range(graph.num_ranks)},
-            "final": {rank: [] for rank in range(graph.num_ranks)},
-        }
-        phases = {"prefetch": [], "dispatch": [], "combine": []}
+    microbatch_fragments = [
+        tuple(graph.task(key) for key in keys) for keys in microbatch_task_keys
+    ]
+    layer_fragments: dict[tuple[int, int], list[Task]] = {}
+    layer_ids: tuple[int, ...] | None = None
+    for micro_batch, tasks in enumerate(microbatch_fragments):
+        current_layers: set[int] = set()
         for task in tasks:
-            task.metadata["micro_batch"] = micro_batch
-            if task.kind == "compute":
-                assert task.rank is not None
-                section = _compute_section(task)
-                sections[section][task.rank].append(task)
-                task.metadata["logical_stream"] = "compute"
-                task.metadata["stream_section"] = section
-            else:
-                phase = _transfer_phase(task)
-                phases[phase].append(task)
-                task.metadata["logical_stream"] = "communication"
-                task.metadata["stream_phase"] = phase
-        compute_sections.append(sections)
-        transfer_phases.append(phases)
+            layer = task.metadata.get("layer", 0)
+            if isinstance(layer, bool) or not isinstance(layer, int) or layer < 0:
+                raise ValidationError(
+                    f"task {task.key} has invalid layer metadata {layer!r}"
+                )
+            current_layers.add(layer)
+            layer_fragments.setdefault((micro_batch, layer), []).append(task)
+        ordered_layers = tuple(sorted(current_layers))
+        if ordered_layers != tuple(range(len(ordered_layers))):
+            raise ValidationError(
+                f"microbatch {micro_batch} layers must be contiguous from zero"
+            )
+        if layer_ids is None:
+            layer_ids = ordered_layers
+        elif layer_ids != ordered_layers:
+            raise ValidationError("all microbatches must contain the same layers")
+    assert layer_ids is not None
+
+    compute_sections: dict[
+        tuple[int, int], dict[str, dict[int, list[Task]]]
+    ] = {}
+    transfer_phases: dict[tuple[int, int], dict[str, list[Task]]] = {}
+    for micro_batch in range(len(microbatch_fragments)):
+        for layer in layer_ids:
+            tasks = layer_fragments[(micro_batch, layer)]
+            fragment_key = (micro_batch, layer)
+            sections = {
+                "front": {rank: [] for rank in range(graph.num_ranks)},
+                "expert": {rank: [] for rank in range(graph.num_ranks)},
+                "final": {rank: [] for rank in range(graph.num_ranks)},
+            }
+            phases = {"prefetch": [], "dispatch": [], "combine": []}
+            for task in tasks:
+                task.metadata["micro_batch"] = micro_batch
+                task.metadata["layer"] = layer
+                if task.kind == "compute":
+                    assert task.rank is not None
+                    section = _compute_section(task)
+                    sections[section][task.rank].append(task)
+                    task.metadata["logical_stream"] = "compute"
+                    task.metadata["stream_section"] = section
+                else:
+                    phase = _transfer_phase(task)
+                    phases[phase].append(task)
+                    task.metadata["logical_stream"] = "communication"
+                    task.metadata["stream_phase"] = phase
+            compute_sections[fragment_key] = sections
+            transfer_phases[fragment_key] = phases
 
     added_dependencies = 0
 
@@ -120,79 +155,119 @@ def apply_double_buffered_two_stream_schedule(
             added_dependencies += 1
 
     # CUDA events connecting compute producers and communication consumers.
-    for micro_batch, (sections, phases) in enumerate(
-        zip(compute_sections, transfer_phases)
-    ):
-        front_tail = {
-            rank: tasks[-1]
-            for rank, tasks in sections["front"].items()
-            if tasks
-        }
-        experts = {
-            rank: tasks[-1]
-            for rank, tasks in sections["expert"].items()
-            if tasks
-        }
-        finals = {
-            rank: tasks[-1]
-            for rank, tasks in sections["final"].items()
-            if tasks
-        }
+    for micro_batch in range(len(microbatch_fragments)):
+        for layer in layer_ids:
+            sections = compute_sections[(micro_batch, layer)]
+            phases = transfer_phases[(micro_batch, layer)]
+            front_tail = {
+                rank: tasks[-1]
+                for rank, tasks in sections["front"].items()
+                if tasks
+            }
+            experts = {
+                rank: tasks[-1]
+                for rank, tasks in sections["expert"].items()
+                if tasks
+            }
+            finals = {
+                rank: tasks[-1]
+                for rank, tasks in sections["final"].items()
+                if tasks
+            }
 
-        for phase_name in ("prefetch", "dispatch"):
-            for task in phases[phase_name]:
+            for phase_name in ("prefetch", "dispatch"):
+                for task in phases[phase_name]:
+                    for rank in _participant_ranks(task, graph.num_ranks):
+                        if rank in front_tail:
+                            add_dependency(task, front_tail[rank])
+
+            dispatch_by_rank = _tasks_touching_ranks(
+                phases["dispatch"], graph.num_ranks
+            )
+            for rank, expert in experts.items():
+                for task in dispatch_by_rank[rank]:
+                    add_dependency(expert, task)
+
+            for task in phases["combine"]:
                 for rank in _participant_ranks(task, graph.num_ranks):
-                    if rank in front_tail:
-                        add_dependency(task, front_tail[rank])
+                    if rank in experts:
+                        add_dependency(task, experts[rank])
 
-        dispatch_by_rank = _tasks_touching_ranks(
-            phases["dispatch"], graph.num_ranks
-        )
-        for rank, expert in experts.items():
-            for task in dispatch_by_rank[rank]:
-                add_dependency(expert, task)
+            combine_by_rank = _tasks_touching_ranks(
+                phases["combine"], graph.num_ranks
+            )
+            for rank, final in finals.items():
+                for task in combine_by_rank[rank]:
+                    add_dependency(final, task)
 
-        for task in phases["combine"]:
-            for rank in _participant_ranks(task, graph.num_ranks):
-                if rank in experts:
-                    add_dependency(task, experts[rank])
+            for phase_name, tasks in phases.items():
+                phase_id = f"mb{micro_batch}.{phase_name}"
+                if len(layer_ids) > 1:
+                    phase_id = f"mb{micro_batch}.layer{layer}.{phase_name}"
+                for task in tasks:
+                    task.metadata["stream_phase_id"] = phase_id
 
-        combine_by_rank = _tasks_touching_ranks(
-            phases["combine"], graph.num_ranks
-        )
-        for rank, final in finals.items():
-            for task in combine_by_rank[rank]:
-                add_dependency(final, task)
-
-        for phase_name, tasks in phases.items():
-            phase_id = f"mb{micro_batch}.{phase_name}"
-            for task in tasks:
-                task.metadata["stream_phase_id"] = phase_id
-
-    # One compute stream per rank. Double-buffer each adjacent microbatch pair.
+    # One compute stream per rank. Each adjacent microbatch pair drains every layer.
     for rank in range(graph.num_ranks):
         compute_order: list[Task] = []
-        for pair_start in range(0, len(fragments), 2):
-            pair = compute_sections[pair_start:pair_start + 2]
-            for section_name in ("front", "expert", "final"):
-                for sections in pair:
-                    compute_order.extend(sections[section_name][rank])
+        for pair_start in range(0, len(microbatch_fragments), 2):
+            pair = range(
+                pair_start, min(pair_start + 2, len(microbatch_fragments))
+            )
+            for layer in layer_ids:
+                for section_name in ("front", "expert", "final"):
+                    for micro_batch in pair:
+                        compute_order.extend(
+                            compute_sections[(micro_batch, layer)][section_name][rank]
+                        )
         for sequence, task in enumerate(compute_order):
             task.metadata["stream_sequence"] = sequence
         for predecessor, task in zip(compute_order, compute_order[1:]):
             add_dependency(task, predecessor)
 
+    # A new pair starts only after the preceding pair has drained on every rank.
+    for next_pair_start in range(2, len(microbatch_fragments), 2):
+        previous_pair_start = next_pair_start - 2
+        previous_pair = range(
+            previous_pair_start,
+            min(previous_pair_start + 2, len(microbatch_fragments)),
+        )
+        previous_terminals = [
+            task
+            for micro_batch in previous_pair
+            for tasks in compute_sections[(micro_batch, layer_ids[-1])][
+                "final"
+            ].values()
+            for task in tasks
+        ]
+        if not previous_terminals:
+            raise ValidationError(
+                f"microbatch group at {previous_pair_start} has no final tasks"
+            )
+        for tasks in compute_sections[(next_pair_start, layer_ids[0])][
+            "front"
+        ].values():
+            if not tasks:
+                continue
+            for predecessor in previous_terminals:
+                add_dependency(tasks[0], predecessor)
+
     # One communication stream per rank. Flow tasks inside one phase remain parallel.
     phase_order: list[tuple[str, list[Task]]] = []
-    for pair_start in range(0, len(fragments), 2):
-        pair = transfer_phases[pair_start:pair_start + 2]
-        for phases in pair:
-            for phase_name in ("prefetch", "dispatch"):
-                if phases[phase_name]:
-                    phase_order.append((phase_name, phases[phase_name]))
-        for phases in pair:
-            if phases["combine"]:
-                phase_order.append(("combine", phases["combine"]))
+    for pair_start in range(0, len(microbatch_fragments), 2):
+        pair = range(
+            pair_start, min(pair_start + 2, len(microbatch_fragments))
+        )
+        for layer in layer_ids:
+            for micro_batch in pair:
+                phases = transfer_phases[(micro_batch, layer)]
+                for phase_name in ("prefetch", "dispatch"):
+                    if phases[phase_name]:
+                        phase_order.append((phase_name, phases[phase_name]))
+            for micro_batch in pair:
+                phases = transfer_phases[(micro_batch, layer)]
+                if phases["combine"]:
+                    phase_order.append(("combine", phases["combine"]))
 
     communication_tail: dict[int, list[Task]] = {
         rank: [] for rank in range(graph.num_ranks)
@@ -214,6 +289,7 @@ def apply_double_buffered_two_stream_schedule(
         compute_task_count=sum(task.kind == "compute" for task in graph.tasks),
         communication_task_count=sum(task.kind == "transfer" for task in graph.tasks),
         communication_phase_count=len(phase_order),
+        layer_count=len(layer_ids),
     )
 
 

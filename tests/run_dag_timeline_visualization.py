@@ -9,6 +9,7 @@ from datetime import datetime
 import json
 import math
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from typing import Callable
@@ -27,6 +28,7 @@ from visualization.dag_timeline import (  # noqa: E402
 
 
 PLOTTER = ROOT / "visualization" / "dag_timeline.py"
+COMPARISON = ROOT / "visualization" / "dsv3_algorithm_comparison.py"
 
 
 @dataclass
@@ -266,6 +268,16 @@ def artifacts_case(output_dir: Path) -> str:
             "HTML tooltip 缺少 network task")
     require("Bytes: 1000000" in html and "Actual duration: 6 us" in html,
             "HTML tooltip 缺少字节或 FCT")
+    require(
+        'class="zoom-slider"' in html
+        and 'class="scale-readout"' in html
+        and "ResizeObserver" in html,
+        "HTML 缺少 Fit/水平缩放和动态时间比例",
+    )
+    require(
+        '<details class="details"><summary>Task details (4)</summary>' in html,
+        "Task details 没有使用三角折叠控件",
+    )
 
     with (output_dir / "dag_rank_overlap_summary.csv").open(
         newline="", encoding="utf-8"
@@ -294,6 +306,49 @@ def artifacts_case(output_dir: Path) -> str:
     require(not (output_dir / "dag_gpu_timeline.png").exists(),
             "DAG timeline 不应再生成 PNG")
     return "HTML hover、task CSV、rank overlap 和总览正确，未生成 PNG"
+
+
+def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
+    case_dirs: list[tuple[str, Path]] = []
+    for algorithm in ("nccl", "deepep"):
+        case_dir = run_dir / "comparison_inputs" / algorithm
+        case_timeline = case_dir / "timeline"
+        case_link = case_dir / "link_load"
+        case_timeline.mkdir(parents=True)
+        case_link.mkdir()
+        for name in ("dag_gpu_timeline.html", "dag_timeline_summary.json"):
+            shutil.copyfile(timeline_dir / name, case_timeline / name)
+        (case_link / "mprail_link_load_by_layer.png").write_bytes(b"PNG")
+        (case_link / "mprail_link_load_summary.csv").write_text(
+            "panel,total_bytes\nall,1\n", encoding="utf-8"
+        )
+        (case_link / "mprail_endpoint_load_summary.csv").write_text(
+            "rank,tx_bytes\n0,1\n", encoding="utf-8"
+        )
+        case_dirs.append((algorithm, case_dir))
+
+    output = run_dir / "comparison.html"
+    command = [sys.executable, str(COMPARISON), "--output", str(output)]
+    for algorithm, case_dir in case_dirs:
+        command.extend(("--case", f"{algorithm}={case_dir}"))
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    require(completed.returncode == 0, "四算法总览 HTML 生成失败")
+    html = output.read_text(encoding="utf-8")
+    require(html.count('<details class="algorithm"') == 2,
+            "算法没有分别使用可折叠分区")
+    require(html.count("mprail_link_load_by_layer.png") == 2,
+            "算法分区没有引用各自链路负载图")
+    require("Expand all" in html and "Collapse all" in html,
+            "总览缺少全局展开/收起按钮")
+    return "算法分区、iframe timeline、链路负载图和全局折叠按钮正确"
 
 
 class Suite:
@@ -363,6 +418,7 @@ def main() -> int:
         lambda: cli_case(run_dir, workload_dir, log_path, output_dir),
     )
     suite.run("validate_artifacts", lambda: artifacts_case(output_dir))
+    suite.run("comparison_dashboard", lambda: comparison_case(run_dir, output_dir))
     write_report(run_dir, suite.results)
 
     passed = sum(item.status == "passed" for item in suite.results)

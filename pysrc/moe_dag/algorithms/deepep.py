@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from ..cost import H100CostModel
+from ..cost import ComputeCostModel
 from ..graph import TaskGraph
 from ..schema import MoEInvocation, ValidationError
 from .common import (
@@ -20,6 +20,7 @@ from .common import (
 class DeepEPConfig:
     chunk_tokens: int = 128
     overlap_expert_compute: bool = True
+    payload_metadata_sample_limit: int = 8
     token_payload_policy: TokenPayloadPolicy = field(
         default_factory=TokenPayloadPolicy
     )
@@ -27,12 +28,16 @@ class DeepEPConfig:
     def __post_init__(self) -> None:
         if self.chunk_tokens <= 0:
             raise ValidationError("chunk_tokens must be positive")
+        if self.payload_metadata_sample_limit < 0:
+            raise ValidationError(
+                "payload_metadata_sample_limit must be non-negative"
+            )
         if not self.token_payload_policy.deduplicate:
             raise ValidationError("DeepEP requires token payload deduplication")
 
 
 class DeepEPBuilder:
-    def __init__(self, cost_model: H100CostModel, config: DeepEPConfig) -> None:
+    def __init__(self, cost_model: ComputeCostModel, config: DeepEPConfig) -> None:
         self.cost_model = cost_model
         self.config = config
 
@@ -78,6 +83,7 @@ class DeepEPBuilder:
                 rank,
                 self.cost_model.estimate(
                     flops,
+                    operation="expert_ffn",
                     overlaps_communication=self.config.overlap_expert_compute,
                 ),
                 predecessors=roots | dispatch_arrivals[rank],
@@ -111,7 +117,8 @@ class DeepEPBuilder:
                 key,
                 origin,
                 self.cost_model.estimate(
-                    max(1, route_count_by_origin[origin] * invocation.hidden * 2)
+                    max(1, route_count_by_origin[origin] * invocation.hidden * 2),
+                    operation="combine_final_reduce",
                 ),
                 predecessors=predecessors,
                 metadata={
@@ -237,12 +244,13 @@ class DeepEPBuilder:
                 )
                 arrivals[origin].add(key)
 
-    @staticmethod
     def _transfer_metadata(
+        self,
         payloads: tuple[TokenPayload, ...],
         relay: int | None,
         route_spec: str | None,
     ) -> dict[str, object]:
+        sample = payloads[: self.config.payload_metadata_sample_limit]
         return {
             "payloads": [
                 {
@@ -252,8 +260,11 @@ class DeepEPBuilder:
                     "topk_slots": [route.topk_slot for route in payload.routes],
                     "expert_ids": [route.expert_id for route in payload.routes],
                 }
-                for payload in payloads
+                for payload in sample
             ],
+            "payload_count": len(payloads),
+            "payload_sample_count": len(sample),
+            "payload_metadata_truncated": len(sample) < len(payloads),
             "deduplicated_by_destination_rank": True,
             "forwarding": "destination" if route_spec else "local",
             "dst_relay": relay,

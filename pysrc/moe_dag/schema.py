@@ -192,6 +192,7 @@ class ModelSpec:
     num_experts: int
     topk: int
     sequence_length: int
+    num_layers: int = 1
     micro_batches: int = 1
     batch_size: int = 1
     dtype: str = "bf16"
@@ -206,6 +207,7 @@ class ModelSpec:
             self.num_experts,
             self.topk,
             self.sequence_length,
+            self.num_layers,
             self.micro_batches,
             self.batch_size,
         )

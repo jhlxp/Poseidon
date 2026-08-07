@@ -21,11 +21,13 @@ sys.path.insert(0, str(PYSRC))
 from moe_dag import (  # noqa: E402
     ComputeEstimate,
     H100CostModel,
+    JsonComputeCostModel,
     ModelSpec,
     MoEInvocation,
     Placement,
     RoutingAssignment,
     TaskGraph,
+    ValidationError,
     emit_workload,
 )
 from moe_dag.algorithms import (  # noqa: E402
@@ -99,6 +101,56 @@ def cost_model_case() -> str:
     estimate = cost.estimate(989_000_000_000, overlaps_communication=False)
     require(math.isclose(estimate.duration_us, 1000.0), "FLOP 到时间换算错误")
     return "132 SM；通信预留 20 SM；dense BF16 overlap 峰值 839.15 TFLOP/s"
+
+
+def json_compute_cost_case(run_dir: Path) -> str:
+    config_path = (
+        PYSRC
+        / "compute_profiles"
+        / "H100_DSV3_EP32_compute_4096tpr.json"
+    )
+    theoretical = JsonComputeCostModel.from_path(config_path)
+    estimate = theoretical.estimate(
+        1_000_000,
+        operation="attention",
+        overlaps_communication=True,
+    )
+    require(
+        math.isclose(estimate.duration_us, 2188.73965337108),
+        "JSON theoretical_us 没有成为固定 compute_us",
+    )
+    require(estimate.available_sms == 112, "JSON cost model 的 overlap SM 错误")
+    require(
+        theoretical.manifest()["selected_source"] == "theoretical",
+        "JSON cost manifest 没有记录 theoretical 选择",
+    )
+    profile_payload = json.loads(config_path.read_text(encoding="utf-8"))
+    profile_payload["selected_source"] = "profiled"
+    profile_payload["modules"]["attention"]["profiled_us"] = 7.5
+    profiled_path = run_dir / "generated" / "profiled_compute_test.json"
+    profiled_path.parent.mkdir(parents=True, exist_ok=True)
+    profiled_path.write_text(
+        json.dumps(profile_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    profiled = JsonComputeCostModel.from_path(profiled_path)
+    profiled_estimate = profiled.estimate(
+        1_000_000,
+        operation="attention",
+    )
+    require(
+        profiled_estimate.duration_us == 7.5,
+        "JSON profiled_us 没有成为固定 compute_us",
+    )
+    try:
+        JsonComputeCostModel.from_path(
+            config_path, selected_source="profiled"
+        ).estimate(1_000_000, operation="expert_ffn")
+    except ValidationError as exc:
+        require("profiled_us is null" in str(exc), "空 profiling 报错信息错误")
+    else:
+        raise AssertionError("选中的 profiled_us 为空时应拒绝生成")
+    return "JSON theoretical/profiled 二选一正确；空 profiling 和缺失值不会静默回退"
 
 
 def emitter_case(run_dir: Path) -> str:
@@ -815,6 +867,79 @@ def relay_stream_participant_case() -> str:
     return f"dst relay GPU{relay} 被计入 compute/comm event 和 phase stream tail"
 
 
+def multi_layer_group_schedule_case() -> str:
+    model = ModelSpec(
+        name="two_layer_four_microbatch",
+        hidden=128,
+        ffn_hidden=256,
+        num_attention_heads=1,
+        num_kv_heads=1,
+        head_dim=128,
+        num_experts=8,
+        topk=2,
+        sequence_length=16,
+        num_layers=2,
+        micro_batches=4,
+    )
+    result = build_transformer_workload(
+        TransformerWorkloadConfig(
+            model=model,
+            placement=Placement(8, 8, tuple(range(8))),
+            tokens_per_rank=2,
+            algorithm="deepep",
+            chunk_tokens=2,
+        )
+    )
+    graph = result.graph
+    require(
+        result.metadata["model"]["num_layers"] == 2,
+        "manifest metadata 没有记录两层模型",
+    )
+    require(
+        result.metadata["stream_schedule"]["layer_count"] == 2,
+        "stream schedule 没有记录两层 lowering",
+    )
+    require(
+        len(result.metadata["micro_batch_algorithms"]) == 8,
+        "4 microbatch x 2 layer 应产生 8 次 MoE invocation",
+    )
+
+    layer1_attention = graph.task("mb0.layer1.attention.rank0")
+    require(
+        "mb0.layer0.moe.combine_reduce.rank0" in layer1_attention.predecessors,
+        "第二层 Attention 没有等待同 microbatch 第一层输出",
+    )
+    next_group = graph.task("mb2.layer0.attention.rank0")
+    previous_group_terminals = {
+        f"mb{micro_batch}.layer1.moe.combine_reduce.rank{rank}"
+        for micro_batch in (0, 1)
+        for rank in range(8)
+    }
+    require(
+        previous_group_terminals <= next_group.predecessors,
+        "第二个 double-buffer group 没有等待前一组全局 drain",
+    )
+    require(
+        not next_group.overlaps_communication and next_group.available_sms == 132,
+        "每组第一个 microbatch 的 Attention 应使用 132 SM",
+    )
+    require(
+        graph.task("mb3.layer0.attention.rank0").available_sms == 112,
+        "每组第二个 microbatch 的 Attention 应使用 112 SM",
+    )
+    layer_phase_ids = {
+        task.metadata.get("stream_phase_id")
+        for task in graph.tasks
+        if task.kind == "transfer"
+    }
+    require(
+        "mb0.layer0.dispatch" in layer_phase_ids
+        and "mb1.layer1.combine" in layer_phase_ids,
+        "多层 communication phase ID 缺少 layer 坐标",
+    )
+    return "2 层 x 4 microbatch 按 pair 分组；跨层依赖和组间全局 drain 正确"
+
+
 def build_simulator(run_dir: Path) -> None:
     commands = [
         ["cmake", "-S", str(SIM_DIR), "-B", str(BUILD_DIR), "-DCMAKE_BUILD_TYPE=Release"],
@@ -1187,6 +1312,7 @@ def main() -> int:
     run_dir.mkdir(parents=True)
     suite = Suite(run_dir)
     suite.run("h100_cost_model", cost_model_case)
+    suite.run("json_compute_cost_model", lambda: json_compute_cost_case(run_dir))
     suite.run("barrier_emitter", lambda: emitter_case(run_dir))
     suite.run("token_payload_policy", token_payload_policy_case)
     suite.run("eplb_official_example", eplb_official_example_case)
@@ -1199,6 +1325,7 @@ def main() -> int:
     suite.run("moonep_deepep_scaleout", lambda: moonep_scaleout_case(run_dir))
     suite.run("two_microbatch_overlap", lambda: model_pipeline_case(run_dir))
     suite.run("relay_stream_participant", relay_stream_participant_case)
+    suite.run("multi_layer_group_schedule", multi_layer_group_schedule_case)
     try:
         build_simulator(run_dir)
         suite.run("htsim_generated_dag", lambda: htsim_case(run_dir))

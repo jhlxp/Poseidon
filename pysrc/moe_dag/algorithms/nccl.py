@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from ..cost import H100CostModel
+from ..cost import ComputeCostModel
 from ..graph import TaskGraph
 from ..schema import MoEInvocation, ValidationError
 from .common import (
@@ -19,6 +19,7 @@ from .common import (
 class NCCLConfig:
     chunk_routes: int = 128
     overlap_expert_compute: bool = True
+    payload_metadata_sample_limit: int = 8
     token_payload_policy: TokenPayloadPolicy = field(
         default_factory=lambda: TokenPayloadPolicy(
             deduplicate=False, scope="none"
@@ -28,12 +29,16 @@ class NCCLConfig:
     def __post_init__(self) -> None:
         if self.chunk_routes <= 0:
             raise ValidationError("chunk_routes must be positive")
+        if self.payload_metadata_sample_limit < 0:
+            raise ValidationError(
+                "payload_metadata_sample_limit must be non-negative"
+            )
         if self.token_payload_policy.deduplicate:
             raise ValidationError("NCCL requires non-deduplicated token payloads")
 
 
 class NCCLBuilder:
-    def __init__(self, cost_model: H100CostModel, config: NCCLConfig) -> None:
+    def __init__(self, cost_model: ComputeCostModel, config: NCCLConfig) -> None:
         self.cost_model = cost_model
         self.config = config
 
@@ -78,6 +83,7 @@ class NCCLBuilder:
                 rank,
                 self.cost_model.estimate(
                     route_count * 6 * invocation.hidden * invocation.ffn_hidden,
+                    operation="expert_ffn",
                     overlaps_communication=self.config.overlap_expert_compute,
                 ),
                 predecessors=roots | dispatch_arrivals[rank],
@@ -111,7 +117,8 @@ class NCCLBuilder:
                 key,
                 origin,
                 self.cost_model.estimate(
-                    max(1, route_count_by_origin[origin] * invocation.hidden * 2)
+                    max(1, route_count_by_origin[origin] * invocation.hidden * 2),
+                    operation="combine_reduce",
                 ),
                 predecessors=predecessors,
                 metadata={
@@ -215,10 +222,11 @@ class NCCLBuilder:
                 )
                 arrivals[origin].add(key)
 
-    @staticmethod
     def _payload_metadata(
+        self,
         payloads: tuple[TokenPayload, ...],
     ) -> dict[str, object]:
+        sample = payloads[: self.config.payload_metadata_sample_limit]
         return {
             "payloads": [
                 {
@@ -227,8 +235,11 @@ class NCCLBuilder:
                     "topk_slot": payload.routes[0].topk_slot,
                     "expert_id": payload.routes[0].expert_id,
                 }
-                for payload in payloads
+                for payload in sample
             ],
+            "payload_count": len(payloads),
+            "payload_sample_count": len(sample),
+            "payload_metadata_truncated": len(sample) < len(payloads),
             "deduplicated": False,
             "forwarding": "rank_direct",
         }

@@ -117,13 +117,14 @@ overlap        = intersection(compute_active, network_active)
 
 | 输出 | 用途 |
 |---|---|
-| `dag_gpu_timeline.html` | 自包含交互时间线；横向滚动，hover 查看 task、字节、FCT、route 和依赖 |
+| `dag_gpu_timeline.html` | 自包含交互时间线；Fit/缩放、hover 查看 task、字节、FCT、route 和依赖 |
 | `dag_task_timeline.csv` | 每个 task 的 start/end/FCT/bytes/logical throughput |
 | `dag_rank_overlap_summary.csv` | 每 GPU compute/network active、overlap、TX/RX 字节 |
 | `dag_timeline_summary.json` | makespan、task 数、payload 字节和统计语义 |
 
-HTML 下方还包含逐 task 明细表。大量 task 在同一 network lane 并发时，bar 可能视觉
-重合；hover 和明细表仍能逐项恢复。可使用 `--ranks` 只观察部分 GPU。
+HTML 下方的 `Task details` 默认收起，点击左侧三角后展开逐 task
+明细表。大量 task 在同一 network lane 并发时，bar 可能视觉重合；hover 和
+明细表仍能逐项恢复。可使用 `--ranks` 只观察部分 GPU。
 
 ## 5. 使用方法
 
@@ -145,7 +146,33 @@ python3 visualization/dag_timeline.py \
   --ranks 0-7,16-23
 ```
 
-HTML 横向尺寸由 `--pixels-per-us` 控制，最小为 1400 px。
+### 5.1 横向缩放与时间尺度
+
+时间线打开时默认 `Fit`，完整 makespan 刚好适配当前可视宽度，不需要
+先横向拖动。工具栏支持：
+
+- `-` / `+` 按钮和 slider 连续缩放；
+- `Ctrl + wheel` 在时间线内缩放；
+- `Fit` 恢复全局；
+- 动态刻度和 `100 px = X us` 读数，同时显示当前可见时间及总时间。
+
+缩放时 bar、背景、分割线和刻度使用同一 `px/us` 比例重算。因此同一
+水平距离对应的实际时间是明确的，不会只是把 SVG 图片放大。
+
+### 5.2 四算法合并页
+
+```bash
+python3 tests/run_dsv3_2layer_algorithms.py
+python3 tests/run_dsv3_2layer_algorithms.py --full --workers 4
+```
+
+标准入口生成 `dsv3_algorithm_comparison.html`：NCCL、DeepEP、EPLB 和
+MoonEP 各有一个可折叠区域，页头支持全部展开/收起。每个区域包含该算法
+独立可缩放 timeline、makespan/task/bytes/overlap 摘要，以及同次 HTSim run
+的可折叠 MpRail 链路负载图。
+
+合并页通过相对路径引用各算法的 HTML、PNG 和 CSV，不把大文件重复内联到
+一个文件。查看或移动结果时应保留整个 run 目录。
 
 ## 6. 应当观察什么
 
@@ -189,4 +216,6 @@ python3 tests/run_dag_timeline_visualization.py
 - GPU0 计算通信 overlap 为 6us；
 - GPU1 计算通信 overlap 为 2us；
 - 不完整日志被拒绝；
-- HTML hover、逐 task CSV、逐 rank CSV 和总览 JSON 完整生成，且不产生 PNG。
+- HTML hover、Fit/缩放控件、动态尺度、可折叠 Task details、逐 task CSV、
+  逐 rank CSV 和总览 JSON 完整生成；
+- 两个伪算法 case 能合成可折叠总览页，并引用各自的 timeline 和链路负载图。

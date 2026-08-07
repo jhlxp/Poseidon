@@ -4,7 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from math import ceil
 
-from ..cost import H100CostModel
+from ..cost import ComputeCostModel
 from ..graph import TaskGraph
 from ..schema import MoEInvocation, RoutingAssignment, ValidationError
 from .common import (
@@ -26,6 +26,7 @@ class MoonEPConfig:
     token_padding: int = 128
     chunk_tokens: int = 128
     overlap_expert_compute: bool = True
+    payload_metadata_sample_limit: int = 8
 
     def __post_init__(self) -> None:
         if self.replicas_per_rank < 0:
@@ -34,6 +35,10 @@ class MoonEPConfig:
             raise ValidationError("token_padding must be positive")
         if self.chunk_tokens <= 0:
             raise ValidationError("chunk_tokens must be positive")
+        if self.payload_metadata_sample_limit < 0:
+            raise ValidationError(
+                "payload_metadata_sample_limit must be non-negative"
+            )
 
 
 @dataclass(frozen=True)
@@ -46,7 +51,7 @@ class MoonEPPlan:
 
 
 class MoonEPBuilder:
-    def __init__(self, cost_model: H100CostModel, config: MoonEPConfig) -> None:
+    def __init__(self, cost_model: ComputeCostModel, config: MoonEPConfig) -> None:
         self.cost_model = cost_model
         self.config = config
 
@@ -185,7 +190,10 @@ class MoonEPBuilder:
                 graph.add_compute(
                     key,
                     rank,
-                    self.cost_model.estimate(planning_flops),
+                    self.cost_model.estimate(
+                        planning_flops,
+                        operation="per_server_planning_proxy",
+                    ),
                     predecessors=roots,
                     barrier_group=f"{invocation.invocation_id}.planning_join.server{server}",
                     metadata={
@@ -193,7 +201,7 @@ class MoonEPBuilder:
                         "operation": "per_server_planning_proxy",
                         "server": server,
                         "server_route_count": plan.routes_by_server[server],
-                        "cost_status": "theoretical_placeholder",
+                        "operation_flops_status": "theoretical_placeholder",
                     },
                 )
                 planning_keys_by_server[server].add(key)
@@ -310,6 +318,7 @@ class MoonEPBuilder:
                 rank,
                 self.cost_model.estimate(
                     padded_routes * 6 * invocation.hidden * invocation.ffn_hidden,
+                    operation="expert_ffn",
                     overlaps_communication=self.config.overlap_expert_compute,
                 ),
                 predecessors=(
@@ -371,7 +380,8 @@ class MoonEPBuilder:
                 key,
                 rank,
                 self.cost_model.estimate(
-                    max(1, token_count * invocation.topk * invocation.hidden * 2)
+                    max(1, token_count * invocation.topk * invocation.hidden * 2),
+                    operation="combine_reduce",
                 ),
                 predecessors=predecessors,
                 metadata={
@@ -429,12 +439,13 @@ class MoonEPBuilder:
             assignment.topk_slot,
         )
 
-    @staticmethod
     def _token_transfer_metadata(
+        self,
         payloads: tuple[TokenPayload, ...],
         relay: int | None,
         route_spec: str | None,
     ) -> dict[str, object]:
+        sample = payloads[: self.config.payload_metadata_sample_limit]
         return {
             "payloads": [
                 {
@@ -444,8 +455,11 @@ class MoonEPBuilder:
                     "topk_slots": [route.topk_slot for route in payload.routes],
                     "expert_ids": [route.expert_id for route in payload.routes],
                 }
-                for payload in payloads
+                for payload in sample
             ],
+            "payload_count": len(payloads),
+            "payload_sample_count": len(sample),
+            "payload_metadata_truncated": len(sample) < len(payloads),
             "deduplicated_by_destination_rank": True,
             "forwarding": "destination" if route_spec else "local",
             "dst_relay": relay,

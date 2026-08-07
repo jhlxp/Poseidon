@@ -4,7 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from math import isfinite
 
-from ..cost import H100CostModel
+from ..cost import ComputeCostModel
 from ..graph import TaskGraph
 from ..schema import MoEInvocation, RoutingAssignment, ValidationError
 from .common import (
@@ -212,6 +212,7 @@ class EPLBConfig:
     estimated_loads: tuple[float, ...] | None = None
     load_source: str = "current_invocation_proxy"
     overlap_expert_compute: bool = True
+    payload_metadata_sample_limit: int = 8
 
     def __post_init__(self) -> None:
         if self.num_physical_experts <= 0:
@@ -220,6 +221,10 @@ class EPLBConfig:
             raise ValidationError("EPLB group count must be positive")
         if self.chunk_tokens <= 0:
             raise ValidationError("chunk_tokens must be positive")
+        if self.payload_metadata_sample_limit < 0:
+            raise ValidationError(
+                "payload_metadata_sample_limit must be non-negative"
+            )
         if not self.load_source:
             raise ValidationError("EPLB load source must not be empty")
         if self.estimated_loads is not None and any(
@@ -238,7 +243,7 @@ class EPLBExecution:
 
 
 class EPLBBuilder:
-    def __init__(self, cost_model: H100CostModel, config: EPLBConfig) -> None:
+    def __init__(self, cost_model: ComputeCostModel, config: EPLBConfig) -> None:
         self.cost_model = cost_model
         self.config = config
         self._placement_plan: EPLBPlacementPlan | None = None
@@ -331,6 +336,7 @@ class EPLBBuilder:
                 rank,
                 self.cost_model.estimate(
                     route_count * 6 * invocation.hidden * invocation.ffn_hidden,
+                    operation="expert_ffn",
                     overlaps_communication=self.config.overlap_expert_compute,
                 ),
                 predecessors=roots | dispatch_arrivals[rank],
@@ -371,7 +377,8 @@ class EPLBBuilder:
                 key,
                 origin,
                 self.cost_model.estimate(
-                    max(1, route_count_by_origin[origin] * invocation.hidden * 2)
+                    max(1, route_count_by_origin[origin] * invocation.hidden * 2),
+                    operation="combine_reduce",
                 ),
                 predecessors=predecessors,
                 metadata={
@@ -526,14 +533,14 @@ class EPLBBuilder:
             assignment.topk_slot,
         )
 
-    @classmethod
     def _transfer_metadata(
-        cls,
+        self,
         payloads: tuple[TokenPayload, ...],
         execution: dict[RouteKey, EPLBExecution],
         relay: int | None,
         route_spec: str | None,
     ) -> dict[str, object]:
+        sample = payloads[: self.config.payload_metadata_sample_limit]
         return {
             "payloads": [
                 {
@@ -544,12 +551,15 @@ class EPLBBuilder:
                         route.expert_id for route in payload.routes
                     ],
                     "physical_experts": [
-                        execution[cls._route_key(route)].physical_expert
+                        execution[self._route_key(route)].physical_expert
                         for route in payload.routes
                     ],
                 }
-                for payload in payloads
+                for payload in sample
             ],
+            "payload_count": len(payloads),
+            "payload_sample_count": len(sample),
+            "payload_metadata_truncated": len(sample) < len(payloads),
             "deduplicated_by_destination_rank": True,
             "forwarding": "destination" if route_spec else "local",
             "dst_relay": relay,

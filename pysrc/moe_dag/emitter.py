@@ -142,6 +142,9 @@ def emit_workload(
     _write_json(manifest_path, manifest)
     _write_json(task_map_path, {"tasks": task_records})
 
+    compute_cost = (metadata or {}).get("compute_cost", {})
+    if not isinstance(compute_cost, dict):
+        compute_cost = {}
     report_lines = [
         f"# {graph.name} 生成报告",
         "",
@@ -170,6 +173,14 @@ def emit_workload(
             "## 模型边界",
             "",
             f"- 算法：`{(metadata or {}).get('algorithm', '未指定')}`",
+            f"- 计算时间模型：`{compute_cost.get('model', '未指定')}`",
+            f"- 计算时间选择：`{compute_cost.get('selected_source', '默认理论公式')}`",
+        ]
+    )
+    if compute_cost.get("config_path"):
+        report_lines.append(f"- 计算 JSON：`{compute_cost['config_path']}`")
+    report_lines.extend(
+        [
             "- network task 的完成点是整条 flow/chunk 收到完整 ACK。",
             "- compute task 使用生成时确定的固定 `compute_us`。",
             "- 逻辑 stream 顺序由生成器降低为 predecessor edges；HTSim 不做运行时 stream 调度。",

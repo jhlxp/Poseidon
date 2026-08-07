@@ -572,30 +572,24 @@ def write_html(
     pixels_per_us: float,
 ) -> None:
     makespan = max(event.end_us for event in events)
-    timeline_width = max(1400.0, makespan * pixels_per_us)
+    timeline_width = 1400.0
     row_height = 23
     top_height = 35
     rows = [(rank, lane) for rank in selected_ranks for lane in LANES]
     svg_height = top_height + len(rows) * row_height + 18
     x_scale = timeline_width / max(makespan, 1e-12)
     svg_parts = [
-        f"<svg xmlns='http://www.w3.org/2000/svg' width='{timeline_width:.3f}' "
+        f"<svg class='timeline-svg' xmlns='http://www.w3.org/2000/svg' "
+        f"width='{timeline_width:.3f}' "
         f"height='{svg_height}' viewBox='0 0 {timeline_width:.3f} {svg_height}'>"
+        "<g class='ruler'></g>"
     ]
-    for tick in range(11):
-        time_us = makespan * tick / 10
-        x = time_us * x_scale
-        svg_parts.append(
-            f"<line x1='{x:.3f}' y1='{top_height}' x2='{x:.3f}' y2='{svg_height}' "
-            "stroke='#C6CDD6' stroke-width='0.7'/>"
-            f"<text x='{x + 3:.3f}' y='18' fill='#4B5563' font-size='11'>"
-            f"{time_us:.6g} us</text>"
-        )
     for row_index, (rank, lane) in enumerate(rows):
         y = top_height + row_index * row_height
         if (rank // gpus_per_server) % 2:
             svg_parts.append(
-                f"<rect x='0' y='{y}' width='{timeline_width:.3f}' "
+                f"<rect class='row-background' x='0' y='{y}' "
+                f"width='{timeline_width:.3f}' "
                 f"height='{row_height}' fill='#F1F4F7'/>"
             )
         for event in _lane_events(events, rank, lane):
@@ -603,14 +597,17 @@ def write_html(
             width = max(event.actual_duration_us * x_scale, 1.2)
             tooltip = escape(_event_tooltip(event, lane))
             svg_parts.append(
-                f"<rect class='task' x='{x:.3f}' y='{y + 3}' width='{width:.3f}' "
+                f"<rect class='task' data-start-us='{event.start_us:.12g}' "
+                f"data-duration-us='{event.actual_duration_us:.12g}' "
+                f"x='{x:.3f}' y='{y + 3}' width='{width:.3f}' "
                 f"height='{row_height - 6}' rx='1.5' fill='{_task_color(event.task)}' "
                 "fill-opacity='0.86' stroke='#FFFFFF' stroke-width='0.35'>"
                 f"<title>{tooltip}</title></rect>"
             )
         if lane == "Network RX":
             svg_parts.append(
-                f"<line x1='0' y1='{y + row_height}' x2='{timeline_width:.3f}' "
+                f"<line class='row-separator' x1='0' y1='{y + row_height}' "
+                f"x2='{timeline_width:.3f}' "
                 f"y2='{y + row_height}' stroke='#9AA5B1' stroke-width='0.8'/>"
             )
     svg_parts.append("</svg>")
@@ -672,6 +669,11 @@ h1 {{ margin: 0 0 5px; font-size: 22px; font-weight: 650; }}
 .legend {{ display: flex; flex-wrap: wrap; gap: 14px; padding: 11px 24px; background: #FFFFFF; border-bottom: 1px solid #D7DDE5; font-size: 12px; }}
 .legend span {{ display: inline-flex; align-items: center; gap: 5px; }}
 .legend i {{ width: 11px; height: 11px; border-radius: 2px; }}
+.timeline-toolbar {{ display: flex; align-items: center; gap: 8px; margin: 16px 16px 0; padding: 8px 10px; border: 1px solid #C9D1DA; background: #FFFFFF; }}
+.timeline-toolbar button {{ width: 32px; height: 30px; border: 1px solid #B8C1CC; background: #FFFFFF; color: #17212B; font-size: 17px; cursor: pointer; }}
+.timeline-toolbar button.fit {{ width: auto; padding: 0 11px; font-size: 12px; }}
+.timeline-toolbar input {{ width: min(340px, 40vw); }}
+.scale-readout {{ margin-left: auto; color: #4F5D6B; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }}
 .timeline-shell {{ display: grid; grid-template-columns: 152px minmax(0, 1fr); margin: 16px; border: 1px solid #C9D1DA; background: #FFFFFF; }}
 .labels {{ border-right: 1px solid #C9D1DA; }}
 .label-spacer {{ height: {top_height}px; border-bottom: 1px solid #D7DDE5; }}
@@ -681,20 +683,103 @@ h1 {{ margin: 0 0 5px; font-size: 22px; font-weight: 650; }}
 .lane-label span {{ color: #697582; font-size: 10px; }}
 .viewport {{ overflow: auto; }}
 .task:hover {{ fill-opacity: 1; stroke: #111827; stroke-width: 1; }}
-.details {{ margin: 16px; background: #FFFFFF; border: 1px solid #C9D1DA; overflow: auto; max-height: 520px; }}
-.details h2 {{ position: sticky; top: 0; margin: 0; padding: 12px 14px; background: #FFFFFF; border-bottom: 1px solid #D7DDE5; font-size: 15px; z-index: 2; }}
+.details {{ margin: 16px; background: #FFFFFF; border: 1px solid #C9D1DA; }}
+.details summary {{ padding: 12px 14px; cursor: pointer; font-size: 15px; font-weight: 650; }}
+.details-scroll {{ overflow: auto; max-height: 520px; border-top: 1px solid #D7DDE5; }}
 table {{ width: 100%; border-collapse: collapse; font-size: 11px; }}
-th {{ position: sticky; top: 42px; background: #EEF2F6; text-align: left; z-index: 1; }}
+th {{ position: sticky; top: 0; background: #EEF2F6; text-align: left; z-index: 1; }}
 th, td {{ padding: 6px 8px; border-bottom: 1px solid #E4E8ED; white-space: nowrap; }}
 td.key {{ max-width: 420px; overflow: hidden; text-overflow: ellipsis; }}
 @media (max-width: 900px) {{ .cards {{ grid-template-columns: repeat(2, 1fr); }} .timeline-shell {{ grid-template-columns: 130px minmax(0, 1fr); }} }}
 </style>
 </head>
 <body>
-<header><h1>{escape(title)}</h1><div class="sub">HTSim task start/done timeline. Hover a bar for exact task, bytes, FCT, route and predecessors. Scroll horizontally to inspect time.</div><div class="cards">{card_html}</div></header>
+<header><h1>{escape(title)}</h1><div class="sub">HTSim task start/done intervals, logical bytes, FCT and compute/network overlap.</div><div class="cards">{card_html}</div></header>
 <div class="legend">{legend_html}</div>
+<div class="timeline-panel" data-makespan-us="{makespan:.12g}" data-svg-height="{svg_height}" data-top-height="{top_height}" data-preferred-px-us="{pixels_per_us:.12g}">
+<div class="timeline-toolbar"><button type="button" class="zoom-out" title="Zoom out">−</button><input class="zoom-slider" type="range" min="0" max="8" step="0.25" value="0" aria-label="Timeline zoom"><button type="button" class="zoom-in" title="Zoom in">+</button><button type="button" class="fit" title="Fit complete timeline">Fit</button><output class="scale-readout"></output></div>
 <section class="timeline-shell"><div class="labels">{''.join(labels)}</div><div class="viewport">{''.join(svg_parts)}</div></section>
-<section class="details"><h2>Task details</h2><table><thead><tr><th>ID</th><th>Kind</th><th>Task</th><th>GPU endpoint</th><th>Category</th><th>Start us</th><th>End us</th><th>FCT us</th><th>Bytes</th><th>Logical Gbps</th></tr></thead><tbody>{_html_task_rows(events)}</tbody></table></section>
+</div>
+<details class="details"><summary>Task details ({len(events)})</summary><div class="details-scroll"><table><thead><tr><th>ID</th><th>Kind</th><th>Task</th><th>GPU endpoint</th><th>Category</th><th>Start us</th><th>End us</th><th>FCT us</th><th>Bytes</th><th>Logical Gbps</th></tr></thead><tbody>{_html_task_rows(events)}</tbody></table></div></details>
+<script>
+(() => {{
+  const panel = document.querySelector('.timeline-panel');
+  const viewport = panel.querySelector('.viewport');
+  const svg = panel.querySelector('.timeline-svg');
+  const slider = panel.querySelector('.zoom-slider');
+  const readout = panel.querySelector('.scale-readout');
+  const makespan = Number(panel.dataset.makespanUs);
+  const svgHeight = Number(panel.dataset.svgHeight);
+  const topHeight = Number(panel.dataset.topHeight);
+  let scale = 1;
+
+  function niceStep(raw) {{
+    const power = Math.pow(10, Math.floor(Math.log10(Math.max(raw, 1e-12))));
+    const value = raw / power;
+    const nice = value <= 1 ? 1 : value <= 2 ? 2 : value <= 5 ? 5 : 10;
+    return nice * power;
+  }}
+
+  function drawRuler(width) {{
+    const ruler = svg.querySelector('.ruler');
+    const step = niceStep(120 / scale);
+    const parts = [];
+    for (let time = 0; time <= makespan + step * 0.001; time += step) {{
+      const x = time * scale;
+      parts.push(`<line x1="${{x}}" y1="${{topHeight}}" x2="${{x}}" y2="${{svgHeight}}" stroke="#C6CDD6" stroke-width="0.7"/><text x="${{x + 3}}" y="18" fill="#4B5563" font-size="11">${{Number(time.toPrecision(7))}} us</text>`);
+    }}
+    ruler.innerHTML = parts.join('');
+  }}
+
+  function applyZoom(level, preserveCenter = true) {{
+    const oldScale = scale;
+    const centerTime = (viewport.scrollLeft + viewport.clientWidth / 2) / oldScale;
+    const fitScale = viewport.clientWidth / Math.max(makespan, 1e-12);
+    scale = fitScale * Math.pow(2, level);
+    const width = Math.max(viewport.clientWidth, makespan * scale);
+    svg.setAttribute('width', String(width));
+    svg.setAttribute('viewBox', `0 0 ${{width}} ${{svgHeight}}`);
+    svg.querySelectorAll('.row-background').forEach(item => item.setAttribute('width', String(width)));
+    svg.querySelectorAll('.row-separator').forEach(item => item.setAttribute('x2', String(width)));
+    svg.querySelectorAll('.task').forEach(item => {{
+      const start = Number(item.dataset.startUs);
+      const duration = Number(item.dataset.durationUs);
+      item.setAttribute('x', String(start * scale));
+      item.setAttribute('width', String(Math.max(duration * scale, 1.2)));
+    }});
+    drawRuler(width);
+    readout.value = `100 px = ${{(100 / scale).toPrecision(6)}} us · visible ${{(viewport.clientWidth / scale).toPrecision(6)}} us · total ${{makespan.toPrecision(7)}} us`;
+    if (preserveCenter && level > 0) {{
+      viewport.scrollLeft = Math.max(0, centerTime * scale - viewport.clientWidth / 2);
+    }} else {{
+      viewport.scrollLeft = 0;
+    }}
+  }}
+
+  slider.addEventListener('input', () => applyZoom(Number(slider.value)));
+  panel.querySelector('.zoom-out').addEventListener('click', () => {{
+    slider.value = String(Math.max(Number(slider.min), Number(slider.value) - 1));
+    applyZoom(Number(slider.value));
+  }});
+  panel.querySelector('.zoom-in').addEventListener('click', () => {{
+    slider.value = String(Math.min(Number(slider.max), Number(slider.value) + 1));
+    applyZoom(Number(slider.value));
+  }});
+  panel.querySelector('.fit').addEventListener('click', () => {{
+    slider.value = '0';
+    applyZoom(0, false);
+  }});
+  viewport.addEventListener('wheel', event => {{
+    if (!event.ctrlKey) return;
+    event.preventDefault();
+    const delta = event.deltaY < 0 ? 0.25 : -0.25;
+    slider.value = String(Math.max(Number(slider.min), Math.min(Number(slider.max), Number(slider.value) + delta)));
+    applyZoom(Number(slider.value));
+  }}, {{ passive: false }});
+  new ResizeObserver(() => applyZoom(Number(slider.value), Number(slider.value) > 0)).observe(viewport);
+  applyZoom(0, false);
+}})();
+</script>
 </body>
 </html>
 """

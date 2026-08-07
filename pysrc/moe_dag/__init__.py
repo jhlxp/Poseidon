@@ -1,4 +1,9 @@
-from .cost import ComputeEstimate, H100CostModel
+from .cost import (
+    ComputeCostModel,
+    ComputeEstimate,
+    H100CostModel,
+    JsonComputeCostModel,
+)
 from .emitter import EmissionResult, emit_workload
 from .graph import Task, TaskGraph
 from .schema import (
@@ -13,8 +18,10 @@ from .schema import (
 
 __all__ = [
     "ComputeEstimate",
+    "ComputeCostModel",
     "EmissionResult",
     "H100CostModel",
+    "JsonComputeCostModel",
     "ModelSpec",
     "MoEInvocation",
     "Placement",

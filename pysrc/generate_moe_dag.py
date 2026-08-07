@@ -4,13 +4,19 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from moe_dag import ModelSpec, Placement, ValidationError, emit_workload
+from moe_dag import (
+    JsonComputeCostModel,
+    ModelSpec,
+    Placement,
+    ValidationError,
+    emit_workload,
+)
 from moe_dag.models import TransformerWorkloadConfig, build_transformer_workload
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate an HTSim DAG for one Transformer MoE block."
+        description="Generate an HTSim DAG for a Transformer MoE workload."
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -27,6 +33,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ffn-hidden", type=int, default=18432)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--sequence-length", type=int, default=4096)
+    parser.add_argument("--num-layers", type=int, default=1)
+    parser.add_argument("--num-attention-heads", type=int)
+    parser.add_argument("--num-kv-heads", type=int)
+    parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--micro-batches", type=int, default=2)
     parser.add_argument("--chunk-tokens", type=int, default=32)
     parser.add_argument("--replicas-per-rank", type=int, default=2)
@@ -50,6 +60,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dispatch-dtype", default="fp8")
     parser.add_argument("--combine-dtype", default="bf16")
     parser.add_argument("--weight-dtype", default="bf16")
+    parser.add_argument(
+        "--compute-config",
+        type=Path,
+        help="JSON file containing fixed per-module theoretical/profiled times.",
+    )
+    parser.add_argument(
+        "--compute-time-source",
+        choices=("theoretical", "profiled"),
+        help="Override selected_source from --compute-config.",
+    )
     return parser.parse_args()
 
 
@@ -77,13 +97,30 @@ def main() -> int:
             name=args.name,
             hidden=args.hidden,
             ffn_hidden=args.ffn_hidden,
-            num_attention_heads=max(1, args.hidden // 128),
-            num_kv_heads=max(1, args.hidden // 128),
-            head_dim=128,
+            num_attention_heads=(
+                args.num_attention_heads or max(1, args.hidden // args.head_dim)
+            ),
+            num_kv_heads=(
+                args.num_kv_heads or max(1, args.hidden // args.head_dim)
+            ),
+            head_dim=args.head_dim,
             num_experts=args.num_experts,
             topk=args.topk,
             sequence_length=args.sequence_length,
+            num_layers=args.num_layers,
             micro_batches=args.micro_batches,
+        )
+        if args.compute_time_source and args.compute_config is None:
+            raise ValidationError(
+                "--compute-time-source requires --compute-config"
+            )
+        cost_model = (
+            JsonComputeCostModel.from_path(
+                args.compute_config,
+                selected_source=args.compute_time_source,
+            )
+            if args.compute_config is not None
+            else None
         )
         result = build_transformer_workload(
             TransformerWorkloadConfig(
@@ -105,7 +142,8 @@ def main() -> int:
                 dispatch_dtype=args.dispatch_dtype,
                 combine_dtype=args.combine_dtype,
                 weight_dtype=args.weight_dtype,
-            )
+            ),
+            cost_model=cost_model,
         )
         emitted = emit_workload(result.graph, args.output, metadata=result.metadata)
     except ValidationError as exc:

@@ -8,7 +8,7 @@
 |---|---|
 | [01_DAG工作负载生成总体设计.md](01_DAG工作负载生成总体设计.md) | Python 生成器的两层架构、目录、输入输出和能力边界 |
 | [02_第一层-MoE算法工作负载建模.md](02_第一层-MoE算法工作负载建模.md) | 共享 MoE IR、算法插件、payload 去冗余策略、字节核算和 barrier 映射 |
-| [03_第二层-模型到DAG生成.md](03_第二层-模型到DAG生成.md) | Transformer block、router、H100 理论计算占位、20 SM 通信预留和多层 workload |
+| [03_第二层-模型到DAG生成.md](03_第二层-模型到DAG生成.md) | Transformer block、router、多层 workload，以及理论公式/JSON 固定计算时间 |
 | [04_算法建模-NCCL.md](04_算法建模-NCCL.md) | NCCL MoE All-to-Allv、无 payload 去冗余、真实目标 rank 直达和验收边界 |
 | [05_算法建模-DeepEP.md](05_算法建模-DeepEP.md) | 训练/prefill 的 destination-rank 去重和目标端两段转发 |
 | [06_算法建模-EPLB.md](06_算法建模-EPLB.md) | estimated load、hierarchical expert replication/placement 和 placement epoch 边界 |
@@ -18,8 +18,9 @@
 | [10_MpRail源路由与服务器转发.md](10_MpRail源路由与服务器转发.md) | CM/DAG 显式路径、服务器内部 relay 转发、校验与完成语义 |
 | [11_测试与日志规范.md](11_测试与日志规范.md) | Python 功能测试分类及 `test_logs/` 产物结构 |
 | [12_MpRail链路负载可视化.md](12_MpRail链路负载可视化.md) | link-load 采样、七面板吞吐图、坐标解析和统计口径 |
-| [13_专用测试拓扑-EP32-1Plane.md](13_专用测试拓扑-EP32-1Plane.md) | 32 GPU、单 plane、8 Leaf/8 Spine、400 Gbps RDMA 的统一测试基准 |
-| [14_DAG执行时间线可视化.md](14_DAG执行时间线可视化.md) | 类 Nsight Systems 的每 GPU Compute/TX/RX 时间线、FCT、字节和 overlap 统计 |
+| [13_专用测试拓扑-EP32-1Plane.md](13_专用测试拓扑-EP32-1Plane.md) | 32 GPU 单 plane 拓扑及 DSV3 两层四算法 smoke/full 测试 |
+| [14_DAG执行时间线可视化.md](14_DAG执行时间线可视化.md) | 可缩放每 GPU Compute/TX/RX timeline、折叠明细和四算法合并页 |
+| [15_计算时间JSON配置.md](15_计算时间JSON配置.md) | 模块级 theoretical/profiled 固定时间、二选一规则、文件格式和适用边界 |
 
 ## 仿真器的两种输入模式
 
@@ -115,3 +116,19 @@ python3 visualization/dag_timeline.py \
 输出每 GPU `Compute / Network TX / Network RX` 的 HTML 时间线，以及逐 task
 FCT/bytes 和逐 GPU overlap 汇总。完整口径见
 [14_DAG执行时间线可视化.md](14_DAG执行时间线可视化.md)。
+
+## 运行 DSV3 两层四算法案例
+
+```bash
+python3 tests/run_dsv3_2layer_algorithms.py
+# 只有明确要求完整测试时：
+python3 tests/run_dsv3_2layer_algorithms.py --full --workers 4
+```
+
+该入口固定使用两个代表性 DSV3 MoE layer、两个 microbatch、
+NCCL/DeepEP/EPLB/MoonEP 和 EP32 单 plane/400 Gbps 拓扑。默认为
+`2 tokens/rank/microbatch` smoke；`--full` 才是 `4096 tokens/rank/microbatch`。
+每个算法都同时生成可缩放 HTML timeline 和 MpRail 链路负载图，最终组合到
+一个可折叠 `dsv3_algorithm_comparison.html` 入口。参数、边界和验收条件见
+[13_专用测试拓扑-EP32-1Plane.md](13_专用测试拓扑-EP32-1Plane.md)，计算时间选择见
+[15_计算时间JSON配置.md](15_计算时间JSON配置.md)。
