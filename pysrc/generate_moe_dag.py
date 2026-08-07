@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--algorithm",
-        choices=("nccl", "deepep", "moonep"),
+        choices=("nccl", "deepep", "eplb", "moonep"),
         default="deepep",
     )
     parser.add_argument("--name", default="moe_block")
@@ -31,6 +31,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-tokens", type=int, default=32)
     parser.add_argument("--replicas-per-rank", type=int, default=2)
     parser.add_argument("--token-padding", type=int, default=128)
+    parser.add_argument(
+        "--eplb-num-physical-experts",
+        type=int,
+        default=0,
+        help="Total physical expert slots; 0 adds one redundant slot per rank.",
+    )
+    parser.add_argument(
+        "--eplb-num-groups",
+        type=int,
+        default=0,
+        help="Logical expert groups; 0 uses the number of servers.",
+    )
+    parser.add_argument(
+        "--eplb-loads",
+        help="Comma-separated estimated load for each logical expert.",
+    )
     parser.add_argument("--dispatch-dtype", default="fp8")
     parser.add_argument("--combine-dtype", default="bf16")
     parser.add_argument("--weight-dtype", default="bf16")
@@ -40,6 +56,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
+        eplb_loads = None
+        if args.eplb_loads is not None:
+            try:
+                eplb_loads = tuple(
+                    float(value.strip()) for value in args.eplb_loads.split(",")
+                )
+            except ValueError as exc:
+                raise ValidationError(
+                    "--eplb-loads must be comma-separated numbers"
+                ) from exc
         placement = Placement(
             num_ranks=args.num_ranks,
             gpus_per_server=args.gpus_per_server,
@@ -68,6 +94,14 @@ def main() -> int:
                 chunk_tokens=args.chunk_tokens,
                 replicas_per_rank=args.replicas_per_rank,
                 token_padding=args.token_padding,
+                eplb_num_physical_experts=args.eplb_num_physical_experts,
+                eplb_num_groups=args.eplb_num_groups,
+                eplb_estimated_loads=eplb_loads,
+                eplb_load_source=(
+                    "cli_explicit_snapshot"
+                    if eplb_loads is not None
+                    else "current_invocation_proxy"
+                ),
                 dispatch_dtype=args.dispatch_dtype,
                 combine_dtype=args.combine_dtype,
                 weight_dtype=args.weight_dtype,

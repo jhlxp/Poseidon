@@ -6,6 +6,13 @@ from .common import (
     plan_token_payloads,
 )
 from .deepep import DeepEPBuilder, DeepEPConfig
+from .eplb import (
+    EPLBBuilder,
+    EPLBConfig,
+    EPLBExecution,
+    EPLBPlacementPlan,
+    plan_hierarchical_placement,
+)
 from .moonep import MoonEPBuilder, MoonEPConfig, MoonEPPlan
 from .nccl import NCCLBuilder, NCCLConfig
 
@@ -15,6 +22,10 @@ __all__ = [
     "TokenPayloadPolicy",
     "DeepEPBuilder",
     "DeepEPConfig",
+    "EPLBBuilder",
+    "EPLBConfig",
+    "EPLBExecution",
+    "EPLBPlacementPlan",
     "NCCLBuilder",
     "NCCLConfig",
     "MoonEPBuilder",
@@ -22,4 +33,5 @@ __all__ = [
     "MoonEPPlan",
     "destination_forward_route",
     "plan_token_payloads",
+    "plan_hierarchical_placement",
 ]

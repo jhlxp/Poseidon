@@ -103,6 +103,10 @@ def emit_workload(
                 "task_id": task_ids[task.key],
                 "barrier_id": barrier_id,
                 "predecessor_barrier_ids": predecessor_barriers,
+                "logical_stream": task.metadata.get(
+                    "logical_stream",
+                    "compute" if task.kind == "compute" else "communication",
+                ),
             }
         )
         record["predecessors"] = sorted(task.predecessors)
@@ -168,7 +172,8 @@ def emit_workload(
             f"- 算法：`{(metadata or {}).get('algorithm', '未指定')}`",
             "- network task 的完成点是整条 flow/chunk 收到完整 ACK。",
             "- compute task 使用生成时确定的固定 `compute_us`。",
-            "- 不模拟单 flow 包进度、CUDA stream、动态 SM 或 HBM 竞争。",
+            "- 逻辑 stream 顺序由生成器降低为 predecessor edges；HTSim 不做运行时 stream 调度。",
+            "- 不模拟单 flow 包进度、动态 SM、CUDA occupancy 或 HBM 竞争。",
             "",
             "## 产物",
             "",

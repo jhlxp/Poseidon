@@ -7,7 +7,7 @@ MoE workload 生成器与 HTSim/MpRail 仿真器应当解耦。
 生成器负责：
 
 - 描述模型、并行布局、expert placement 和 router 输出；
-- 把 NCCL、DeepEP、MoonEP 等算法展开成计算与通信任务图；
+- 把 NCCL、DeepEP、EPLB、MoonEP 等算法展开成计算与通信任务图；
 - 用 H100 SXM dense BF16 理论峰值把算子 FLOP 数换算成固定 `compute_us` 占位；
 - 根据 tensor 形状、数据类型、去重、padding 和转发方案计算 `transfer_bytes`；
 - 最终输出 HTSim 可读取的 `.dag` 和空 `.cm`。
@@ -35,7 +35,7 @@ HTSim 负责：
   MoE invocation + expert placement + token routes + algorithm config
                             |
                             v
-  NCCL / DeepEP / MoonEP 等算法专属 phase graph
+  NCCL / DeepEP / EPLB / MoonEP 等算法专属 phase graph
                             |
                             v
 共享 lowering
@@ -66,9 +66,11 @@ pysrc/
 │   │   ├── common.py
 │   │   ├── nccl.py
 │   │   ├── deepep.py
+│   │   ├── eplb.py
 │   │   └── moonep.py
 │   └── models/
-│       └── transformer.py
+│       ├── transformer.py
+│       └── streams.py
 tests/
 └── run_workload_generator.py
 ```
@@ -106,8 +108,15 @@ python3 pysrc/generate_moe_dag.py \
 
 - `nccl` rank-direct/no-dedup forward；
 - `deepep` 训练/prefill forward 核心路径；
+- `eplb` hierarchical placement、确定性 replica selection 和 DeepEP 稳态传输；
 - dispatch、combine、weight dtype 与 `chunk_tokens`；
 - `moonep` 的 per-server replica planning、`replicas_per_rank` 和 `token_padding`。
+
+EPLB 已作为 `--algorithm eplb` 接入。它根据 estimated expert loads 生成一段
+placement epoch 共用的 physical expert mapping，再为当前 token routes 确定 execution
+rank，并复用 DeepEP 的去冗余和目标端转发。稳态 DAG 不包含 planner 或 weight
+migration task；当前 CLI 可直接传负载快照，未传时使用第一次 invocation 的 route
+count 作为静态代理。
 
 DeepEP/MoonEP backward、expanded metadata、zero-copy 和 kernel profiling 尚未
 实现，CLI 不提供对应开关。DeepEP low-latency/decode 不属于当前项目范围。
@@ -172,7 +181,45 @@ barrier(A) -> barrier(B)
 
 多个 task 只有在启动前驱完全相同，并且所有消费者都应等待它们全部完成时，才能显式合并到同一个 barrier。emitter 不按可视化时间层做 levelize，也不能为了减少 barrier 数而引入交叉等待。
 
-### 5.3 首版 compute 只使用固定时长理论占位
+### 5.3 每 GPU 两条逻辑 stream
+
+模型层为每张 GPU **固定**一条 compute stream 和一条 communication stream。这是
+当前项目的 workload 执行契约，不是算法参数，也不提供改变 stream 数量的配置。
+NCCL、DeepEP、EPLB 和 MoonEP 都复用该模型层契约；算法插件只负责各自的 MoE
+phase graph。
+
+stream 不是新的 `.dag` 字段，而是在生成阶段降低为普通 predecessor edges：
+
+```text
+compute stream: Attention/Router -> Attention/Router -> Expert -> Expert -> Reduce -> Reduce
+comm stream:    Dispatch 0 -> Dispatch 1 -> Combine 0 -> Combine 1
+```
+
+相邻两个 microbatch 组成一个 double-buffer group。`micro_batches=N` 的固定分组为：
+
+```text
+N=1: (MB0)
+N=2: (MB0, MB1)
+N=3: (MB0, MB1) -> (MB2)
+N=4: (MB0, MB1) -> (MB2, MB3)
+```
+
+每组使用两条 stream 做组内 overlap；前一组的完整 workload 全部完成后，下一组
+才启动，组与组之间不 overlap。这里的“完整 workload”由生成范围决定：当前单
+Transformer block builder 表示两个 microbatch 都走完该 block；当第二层扩展为完整
+DeepSeek-V3 prefill 时，则表示两个 microbatch 都走完 DSV3 的全部层和最终任务后，
+下一组才开始。奇数个 microbatch 的最后一个单独成组。
+
+同一个 Dispatch/Combine phase 内的 destination flow 和 chunk 保持并行；不同通信
+phase 只在实际参与的 rank 上按 comm stream tail 串行。compute producer、
+communication phase 和 compute consumer 之间使用普通 DAG edge 表达 CUDA event
+语义。
+
+HTSim 不感知或调度 CUDA stream；它只执行 lowering 后的 barrier DAG。这样既禁止
+同一 GPU 上两个 compute task 错误重叠，也保留 `D0||Attention1`、`D1||Expert0`、
+`C0||Expert1` 和 `C1||Reduce0`。
+
+### 5.4 首版 compute 只使用固定时长理论占位
 
 首版不建立真实 kernel 性能模型。生成器先计算每个算子的理论 FLOP 数，再按单张 H100 SXM 的 dense BF16 Tensor Core 峰值换算。普通计算使用完整峰值；明确与通信 kernel 重叠的计算使用固定 SM 预留后的峰值：
 
@@ -202,6 +249,7 @@ compute_us_overlap = operation_flops / 839.15e12 * 1e6
 | 固定完整路径 | 已支持 | `explicit` route |
 | 严格消息级服务器转发 | 已支持 | `server_forward` route |
 | 任意 task 级依赖 | 已支持 | 默认每个 task 分配独立 barrier |
+| 每 GPU compute/comm stream 顺序 | 已支持静态 lowering | 模型生成器增加 predecessor edges；HTSim 不做运行时 stream 调度 |
 | chunk 级流水转发 | 已支持表达 | 显式拆成多个 network task，每个 flow 完成后释放自己的 barrier |
 | 单 flow 内部流式事件 | 不支持且首版不需要 | 不监听第 N 个 packet；需要时拆 chunk flow |
 | GPU compute | 固定时长事件 | 普通任务按 989 TFLOP/s，overlap 任务按 839.15 TFLOP/s |
@@ -225,7 +273,8 @@ MpRail 的 server-local FullMesh 也只是对 NVLink rank-to-rank 数据移动�
 5. 实现完整 transformer block forward：attention、residual、norm、MoE。
 6. 实现 H100 dense BF16 峰值和通信预留 20 SM 的固定时长占位。
 7. 实现 per-server MoonEP planning、weight prefetch 和 DeepEP scale-out 组合。
-8. 再增加训练 backward 和 gradient reduce。
+8. 实现 EPLB hierarchical placement、稳态 replica selection 和 DeepEP transport。
+9. 再增加训练 backward 和 gradient reduce。
 
 ## 8. 首版非目标
 
@@ -239,6 +288,7 @@ MpRail 的 server-local FullMesh 也只是对 NVLink rank-to-rank 数据移动�
 - 不在第一版同时支持任意 DP/TP/PP/EP 组合。
 
 统一算法验收使用 EP32、4 servers x 8 GPUs、plane=1、400 Gbps：NCCL 直达真实
-rank，DeepEP 使用 destination-side forwarding，MoonEP 在每个 expert home server
-内独立创建 replica 并复用 DeepEP scale-out transport。三者共享相同 routing
+rank，DeepEP 使用 destination-side forwarding，EPLB 使用持久 hierarchical
+placement，MoonEP 在每个 expert home server 内独立创建 replica 并复用 DeepEP
+scale-out transport。四者共享相同 routing
 assignments、expert placement 和 dtype，保证字节、路径和计算分布可比较。

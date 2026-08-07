@@ -71,8 +71,14 @@ moe_algorithm:
 ```text
 nccl           # 无去冗余、无 relay forwarding 的 rank-direct All-to-All
 deepep         # destination-rank 去重 + 同 index relay/目标端 forwarding
+eplb           # 持久 hierarchical placement + DeepEP 稳态传输
 moonep         # 动态 expert replica workload
 ```
+
+`eplb` 先为一段 placement epoch 生成 physical expert mapping，再使用确定性
+round-robin replica selector 和 DeepEP 构造每个 block 的通信计算 DAG。CLI 使用
+`--eplb-num-physical-experts`、`--eplb-num-groups` 和 `--eplb-loads` 配置它；没有
+显式 load snapshot 时，以第一次 invocation 的 route count 作为静态代理。
 
 首版限制为 `TP=1`、`PP=1`。先把 EP、router 和完整 block 依赖做对，再扩展 TP collectives 和 PP microbatch pipeline。
 
@@ -249,14 +255,51 @@ shared_expert_schedule = serial | overlap_dispatch | overlap_moe
 
 ### 7.2 Microbatch overlap
 
-训练/prefill 的框架双 batch 调度可以形成：
+训练/prefill 固定使用每 GPU 一条 compute stream 和一条 communication stream。
+两条 stream 是所有模型级 workload 共同使用的执行契约，不是可配置的 stream 池。
+相邻两个 microbatch 的固定顺序为：
 
 ```text
-microbatch n:   attention -> dispatch -> expert -> combine
-microbatch n+1:             attention -> dispatch -> expert -> combine
+Compute: Attention0 -> Router0 -> Attention1 -> Router1
+                                      -> Expert0 -> Expert1 -> Reduce0 -> Reduce1
+
+Comm:               Dispatch0 -> Dispatch1 -> Combine0 -> Combine1
+
+Overlap:             D0 || A1
+                                  D1 || E0
+                                                C0 || E1
+                                                         C1 || R0
 ```
 
-当前 barrier DAG 可以直接表达这种 overlap：每个 kernel/task 使用独立 barrier，只连接真实依赖，不按时间层合并。重叠 compute task 使用固定 112 SM 理论时长，network task 使用 HTSim FCT；首版不再引入 CUDA stream 或动态 occupancy 模型。
+`streams.py` 在完整 task graph 上增加顺序边。每个 rank 的 compute task 严格串行；
+每个 rank 的 communication phase 严格串行；一个 phase 内拆出的多条 flow/chunk
+仍并行。通信 phase 的完成 event 连接到真正消费数据的 Expert/Reduce，独立 compute
+不等待通信。
+
+`micro_batches=N` 不表示同时展开 N 路流水线，而是按相邻两个进行 double-buffer
+分组：
+
+```text
+group 0: MB0 + MB1
+group 1: MB2 + MB3
+group 2: MB4 + MB5
+...
+```
+
+前一组必须 drain，即该组覆盖的完整 workload 全部完成，后一组才能启动；组与组
+之间没有计算或通信 overlap。`N` 为奇数时，最后一个 microbatch 单独组成尾组。
+
+“完整 workload”不能一律写成“完整模型”，必须以 builder 的建模范围为准：
+
+- 当前 `build_transformer_workload()` 只生成一个 forward MoE block，因此组间边界是
+  两个 microbatch 都完成这个 block；
+- 将来完整 DSV3 builder 生成全部 Transformer 层时，组间边界就是两个 microbatch
+  都完成完整 DSV3 prefill，包括全部层及最终任务；
+- 不允许在前一组仍位于中间层时提前启动下一组，从而把当前双缓冲语义误解为
+  任意数量 microbatch 的 steady-state pipeline。
+
+这些 stream 语义完全通过 predecessor/barrier 表达，不增加 `.dag` 字段，也不要求
+HTSim 实现 CUDA runtime。HTSim 仍使用 network FCT 和固定 compute event 执行时间线。
 
 当前两 microbatch builder 将第一个 microbatch 的 Attention/Router 按 132 SM
 计算；后续 microbatch 的 Attention/Router 因可与前一 microbatch 通信重叠，按
@@ -308,6 +351,10 @@ global_task_key = (iteration, microbatch, pipeline_stage, layer, op, rank, shard
 - 每个 compute task 都记录 `operation_flops`、单卡峰值和理论 `compute_us`；
 - overlap compute task 使用 112/132 SM，普通 compute task 使用 132/132 SM；
 - 同一 rank、同一逻辑通信 phase 的多条 flow 只计一次 20 SM；
+- 同一 rank 的 compute stream 不存在 task overlap；
+- 同一 rank 的 communication phase 不存在 phase overlap；
+- 同一 phase 内多个 flow 保持并行；
+- double-buffer schedule 保留四个预期 compute/communication overlap 窗口；
 - task graph 无环；
 - HTSim barrier 映射没有未声明的交叉等待或保守串行化；
 - 最终 `.dag` 能通过 parser dry-run。
@@ -325,14 +372,15 @@ TP=1, PP=1, EP=8
 H=7168, top-k=8
 固定 expert placement
 可重放的 synthetic router assignment
-NCCL、DeepEP 单节点路径与 MoonEP 三种输出
+NCCL、DeepEP、EPLB 与 MoonEP 四种输出
 ```
 
 这个目标用于同条件比较节点内专家通信、负载不均衡和算法差异。跨服务器对比统一
 使用 EP32、4 servers x 8 GPUs、plane=1 的专用测试拓扑：NCCL 验证 rank-direct
 All-to-All 和 Spine 流量，DeepEP 验证 destination-rank 去重与目标端 forwarding，
-MoonEP 在每个 expert home server 内独立规划 replica，并复用 DeepEP 跨服务器
-transport。该 MoonEP 组合是本项目的核心算法抽象，不声称官方实现提供多节点 RDMA。
+EPLB 验证持久 hierarchical placement 和稳态 DeepEP transport，MoonEP 在每个
+expert home server 内独立规划 replica，并复用 DeepEP 跨服务器 transport。该
+MoonEP 组合是本项目的核心算法抽象，不声称官方实现提供多节点 RDMA。
 
 ## 12. 硬件规格来源
 

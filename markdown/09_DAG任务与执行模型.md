@@ -124,7 +124,7 @@ explicit rank:0 l0:r0:p0:b0 l1:p0:s1:b0 l0:r1:p0 rank:9
 server_forward src_relay:3 dst_relay:11
 ```
 
-完整语法、拓扑校验和完成语义见 [09_MpRail源路由与服务器转发.md](09_MpRail源路由与服务器转发.md)。compute task 不允许携带 route 组。
+完整语法、拓扑校验和完成语义见 [10_MpRail源路由与服务器转发.md](10_MpRail源路由与服务器转发.md)。compute task 不允许携带 route 组。
 
 ## 4. Barrier DAG 语义
 
@@ -216,7 +216,17 @@ Attention 1
 
 MpRail 的网络竞争由 Queue 和 UEC 决定。network task 和没有依赖冲突的 compute task 可以在事件时间线上同时推进；barrier 在二者都完成后释放，因此已经能够表达通信与计算 overlap。
 
-compute task 中相等的 `src_rank`/`dst_rank` 用于校验和记录计算归属。HTSim 只执行输入给定的固定 `compute_us`，不在运行时模拟 SM occupancy、kernel 抢占、同 GPU kernel 排队或 HBM 竞争。首版的 SM 影响由 workload generator 预先折算：普通计算使用 H100 的 132 SM/989 TFLOP/s，明确与通信重叠的计算按通信预留 20 SM、剩余 112 SM/约 839.15 TFLOP/s 计算固定时长。
+workload 生成器当前把每 GPU 一条 compute stream 和一条 communication stream
+静态降低为 predecessor edges。HTSim 不维护 stream 对象：同卡 compute 串行、跨
+communication phase 串行以及 CUDA event wait 都已经体现在输入 barrier 中。同一
+communication phase 的多条 flow/chunk 没有互相增加依赖，因此仍同时启动并竞争网络。
+
+两条 stream 的数量是固定契约。`micro_batches=N` 时，相邻两个 microbatch 构成
+double-buffer group，前一组的完整 workload drain 后下一组才启动；组间不 overlap，
+奇数尾项单独成组。当前 builder 的完整范围是一个 forward MoE block；完整 DSV3
+builder 接入后，同一规则扩大为两个 microbatch 走完全部 DSV3 层后再启动下一组。
+
+compute task 中相等的 `src_rank`/`dst_rank` 用于校验和记录计算归属。HTSim 只执行输入给定的固定 `compute_us`，不在运行时模拟 SM occupancy、kernel 抢占、CUDA stream scheduler 或 HBM 竞争。首版的 SM 影响由 workload generator 预先折算：普通计算使用 H100 的 132 SM/989 TFLOP/s，明确与通信重叠的计算按通信预留 20 SM、剩余 112 SM/约 839.15 TFLOP/s 计算固定时长。
 
 同一逻辑通信 phase 拆出的多条 flow 或 chunk 共享一次 20 SM 预留。这个归属记录在 manifest/task map 中，不增加 `.dag` 字段，HTSim 也不做动态 SM 恢复。
 

@@ -8,7 +8,8 @@
 
 ```text
 给定这些 source tokens、top-k experts、expert placement 和硬件 rank，
-NCCL、DeepEP 或 MoonEP 实际需要哪些计算、复制、转发、归并和同步？
+NCCL、DeepEP 或 MoonEP 实际需要哪些计算、复制、转发、归并和同步？EPLB 则先
+改变这些 invocation 共用的 physical expert placement。
 ```
 
 ## 2. 共享输入模型
@@ -107,6 +108,11 @@ NCCL 的 `AlgorithmPlan` 关闭去冗余并保留每条 top-k route；DeepEP 的
 destination-rank 去重和 relay；MoonEP 的 plan 按 home server 保存动态 replica、
 execution rank、weight prefetch 和 padding，并复用 DeepEP scale-out transport。
 三者不应塞进一个充满可选字段的通用 plan。
+
+EPLB planner 返回跨多个 invocation 使用的 `phy2log/log2phy/logcnt` placement
+plan。当前 builder 缓存该 plan，以确定性 round-robin 把当前 routes 分给 physical
+replicas，再构造 DeepEP 稳态 phase graph。estimated-load placement 和当前 batch
+route planning 在代码与 manifest 中仍是两个明确步骤。
 
 ## 5. Token 路由与字节核算
 
@@ -293,15 +299,21 @@ lowering 需要验证：
 - 无意外的同 rank network task；
 - compute metadata 记录理论 FLOP 数、是否 overlap、可用 SM 和所用峰值；
 - 同一 `(rank, communication_phase_id)` 只预留一次 20 SM；
+- 同一通信 phase 内的 flow/chunk 不互相依赖，保持并行；
+- 不同通信 phase 在参与 rank 的单一 comm stream 上按序执行；
+- 同一 rank 的 compute task 按 compute stream 顺序执行；
+- compute/communication producer-consumer event 被降低为 predecessor edge；
 - 没有把 network latency 重复写入 compute task。
 
 ## 10. 首版验收
 
-- 同一个 routing trace 在 NCCL/DeepEP/MoonEP 下共享逻辑 expert 选择。
+- 同一个 routing trace 在 NCCL/DeepEP/EPLB/MoonEP 下共享逻辑 expert 选择。
 - 算法输出的 token、weight、grad 字节分项可手算复核。
 - NCCL 保留 top-k route multiplicity，不执行 hidden payload 去冗余。
 - DeepEP 按 destination rank 去重，并为跨服务器 task 使用目标端转发。
+- EPLB hierarchical placement 与官方示例一致，稳态不生成 weight migration。
 - MoonEP 在每个 home server 内实现 floor/ceil route balance，padding 单独统计。
 - 输出 `.dag` 能被当前 HTSim 加载并完成。
 - manifest 能恢复每个 task 对应的算法 phase。
+- manifest/task map 能恢复 two-stream schedule、stream phase 和 stream sequence。
 - 固定随机种子时输出逐字节稳定。
