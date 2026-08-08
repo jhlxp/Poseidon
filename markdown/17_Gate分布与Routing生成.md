@@ -327,9 +327,9 @@ pysrc/moe_dag/
 ```
 
 Gate 模块只生成 `RoutingAssignment`，不依赖 HTSim，不创建 network task，
-不在内部实现 NCCL/DeepEP/EPLB/MoonEP 逻辑。Transformer builder 通过
+不在内部实现 NCCL/DeepEP/EPLB/MoonEP/ProbeEP 逻辑。Transformer builder 通过
 provider 参数注入 assignments，不再由 Transformer builder 写死 assignment
-生成逻辑。四种算法都会把统一的 `expert_load_profile_v1` 写入 manifest。
+生成逻辑。五种算法都会把统一的 `expert_load_profile_v1` 写入 manifest。
 
 ## 9. 当前配置
 
@@ -433,7 +433,7 @@ gate_load/
 
 HTML 可选择 layer/microbatch，使用相同的 load 横轴并排显示 before/after 的
 32 个 rank；每个 rank 内按 logical expert 分段。下方另画 Gate logical-expert
-分布，并提供按 state/rank 筛选的 expert-instance 明细。该模块也会进入四算法
+分布，并提供按 state/rank 筛选的 expert-instance 明细。该模块也会进入五算法
 可视化 ZIP，服务器 run 目录在 ZIP 校验成功后不保留散装 HTML。
 
 ## 11. 验证和功能测试
@@ -453,7 +453,7 @@ python3 tests/run_gate_workload_visualization.py
 5. 每 source rank 的 route count 恰好为 `S_r * K`。
 6. 同 seed 输出逐 assignment 完全相同，不同 seed 的直方图仍贴近目标。
 7. full 的 target/realized histogram 仅允许 largest-remainder 取整误差。
-8. 四算法同一 case 的 Gate assignment digest 完全相同。
+8. 五算法同一 case 的 Gate assignment digest 完全相同。
 9. NCCL logical route 总数不变，DeepEP unique rank/server payload 随分布正确变化。
 10. 错误 layer 数、CSV 列数、负数 count、越界 expert ID 和少于 K 个正权重
     expert 必须显式失败。
@@ -475,13 +475,13 @@ python3 tests/run_gate_workload_visualization.py
 GateProvider -> GateSample
   -> TransformerWorkloadConfig.gate_provider
   -> MoEInvocation.assignments
-  -> NCCL / DeepEP / EPLB / MoonEP builder
+  -> NCCL / DeepEP / EPLB / MoonEP / ProbeEP builder
   -> gate + expert_load_profile 写入 manifest
   -> gate_load_profile.html
-  -> 四算法 dsv3_visualization_bundle.zip
+  -> 五算法 dsv3_visualization_bundle.zip
 ```
 
-四算法 runner 会检查每个算法的 assignment digest 序列完全相同，然后才允许
+五算法 runner 会检查每个算法的 assignment digest 序列完全相同，然后才允许
 生成合并 ZIP。Gate 分布错误时，应先检查 pure-Python 的采样与守恒报告，不应用
 网络结果反向猜测问题。偏斜 Gate 也可能超过 MoonEP 配置的临时副本容量；runner
 不会静默放宽算法约束，可通过 `--moonep-replicas-per-rank` 显式给出容量。当前

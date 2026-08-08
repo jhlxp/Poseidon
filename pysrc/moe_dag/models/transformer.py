@@ -13,6 +13,9 @@ from ..algorithms import (
     MoonEPConfig,
     NCCLBuilder,
     NCCLConfig,
+    ProbeEPBuilder,
+    ProbeEPConfig,
+    ProbeNICControllerConfig,
 )
 from ..cost import ComputeCostModel, H100CostModel
 from ..gate import BalancedPermutedGateProvider, GateProvider
@@ -21,7 +24,7 @@ from ..schema import ModelSpec, MoEInvocation, Placement, ValidationError
 from .streams import apply_double_buffered_two_stream_schedule
 
 
-AlgorithmName = Literal["nccl", "deepep", "eplb", "moonep"]
+AlgorithmName = Literal["nccl", "deepep", "eplb", "moonep", "probeep"]
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,15 @@ class TransformerWorkloadConfig:
     chunk_tokens: int = 128
     replicas_per_rank: int = 0
     token_padding: int = 128
+    probeep_route_chunk_tokens: int = 0
+    probeep_weight_chunk_bytes: int = 4 * 1024 * 1024
+    probeep_max_remote_replicas: int = 64
+    probeep_initial_nic_budget_bytes: int = 16 * 1024 * 1024
+    probeep_min_nic_budget_bytes: int = 0
+    probeep_max_nic_budget_bytes: int = 128 * 1024 * 1024
+    probeep_multiplicative_decrease: float = 0.9
+    probeep_additive_increase_bytes: int = 1024 * 1024
+    probeep_deadband_ratio: float = 0.05
     eplb_num_physical_experts: int = 0
     eplb_num_groups: int = 0
     eplb_estimated_loads: tuple[float, ...] | None = None
@@ -49,8 +61,18 @@ class TransformerWorkloadConfig:
             raise ValidationError("tokens_per_rank must be positive")
         if self.model.num_experts != self.placement.num_experts:
             raise ValidationError("model and placement expert counts differ")
-        if self.algorithm not in {"nccl", "deepep", "eplb", "moonep"}:
+        if self.algorithm not in {"nccl", "deepep", "eplb", "moonep", "probeep"}:
             raise ValidationError(f"unsupported algorithm: {self.algorithm}")
+        if self.probeep_route_chunk_tokens < 0:
+            raise ValidationError(
+                "probeep_route_chunk_tokens must be non-negative"
+            )
+        if self.probeep_weight_chunk_bytes <= 0:
+            raise ValidationError("probeep_weight_chunk_bytes must be positive")
+        if self.probeep_max_remote_replicas < 0:
+            raise ValidationError(
+                "probeep_max_remote_replicas must be non-negative"
+            )
         if self.eplb_num_physical_experts < 0:
             raise ValidationError("eplb_num_physical_experts must be non-negative")
         if self.eplb_num_groups < 0:
@@ -122,6 +144,34 @@ def build_transformer_workload(
                 replicas_per_rank=config.replicas_per_rank,
                 token_padding=config.token_padding,
                 chunk_tokens=config.chunk_tokens,
+            ),
+        )
+    elif config.algorithm == "probeep":
+        algorithm_builder = ProbeEPBuilder(
+            cost,
+            ProbeEPConfig(
+                replicas_per_rank=config.replicas_per_rank,
+                token_padding=config.token_padding,
+                chunk_tokens=config.chunk_tokens,
+                route_chunk_tokens=(
+                    config.probeep_route_chunk_tokens or config.chunk_tokens
+                ),
+                weight_chunk_bytes=config.probeep_weight_chunk_bytes,
+                max_remote_replicas=config.probeep_max_remote_replicas,
+                nic_controller=ProbeNICControllerConfig(
+                    initial_budget_bytes=(
+                        config.probeep_initial_nic_budget_bytes
+                    ),
+                    min_budget_bytes=config.probeep_min_nic_budget_bytes,
+                    max_budget_bytes=config.probeep_max_nic_budget_bytes,
+                    multiplicative_decrease=(
+                        config.probeep_multiplicative_decrease
+                    ),
+                    additive_increase_bytes=(
+                        config.probeep_additive_increase_bytes
+                    ),
+                    deadband_ratio=config.probeep_deadband_ratio,
+                ),
             ),
         )
     else:
@@ -255,6 +305,25 @@ def build_transformer_workload(
         "chunk_tokens": config.chunk_tokens,
         "replicas_per_rank": config.replicas_per_rank,
         "token_padding": config.token_padding,
+        "probeep": {
+            "route_chunk_tokens": (
+                config.probeep_route_chunk_tokens or config.chunk_tokens
+            ),
+            "weight_chunk_bytes": config.probeep_weight_chunk_bytes,
+            "max_remote_replicas": config.probeep_max_remote_replicas,
+            "initial_nic_budget_bytes": (
+                config.probeep_initial_nic_budget_bytes
+            ),
+            "min_nic_budget_bytes": config.probeep_min_nic_budget_bytes,
+            "max_nic_budget_bytes": config.probeep_max_nic_budget_bytes,
+            "multiplicative_decrease": (
+                config.probeep_multiplicative_decrease
+            ),
+            "additive_increase_bytes": (
+                config.probeep_additive_increase_bytes
+            ),
+            "deadband_ratio": config.probeep_deadband_ratio,
+        },
         "eplb": {
             "num_physical_experts_requested": config.eplb_num_physical_experts,
             "num_groups_requested": config.eplb_num_groups,

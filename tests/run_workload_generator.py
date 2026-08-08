@@ -39,6 +39,11 @@ from moe_dag.algorithms import (  # noqa: E402
     MoonEPConfig,
     NCCLBuilder,
     NCCLConfig,
+    ProbeEPBuilder,
+    ProbeEPConfig,
+    ProbeNICController,
+    ProbeNICControllerConfig,
+    ProbeSampleFeedback,
     TokenPayloadPolicy,
     plan_hierarchical_placement,
     plan_token_payloads,
@@ -119,6 +124,47 @@ class FixedOperationCostModel:
             "communication_sms": self.communication_sms,
             "total_sms": self.total_sms,
             "durations_us": self._durations_us,
+        }
+
+
+class LinearTokenCostModel:
+    communication_sms = 20
+    total_sms = 132
+
+    def estimate(
+        self,
+        operation_flops: int,
+        *,
+        operation: str,
+        overlaps_communication: bool = False,
+        token_count: int | None = None,
+    ) -> ComputeEstimate:
+        require(token_count is not None and token_count > 0,
+                f"{operation} 缺少正 token_count")
+        us_per_token = {
+            "expert_ffn": 100.0,
+            "per_server_planning_proxy": 0.001,
+            "combine_reduce": 0.001,
+        }[operation]
+        duration_us = token_count * us_per_token
+        available_sms = 112 if overlaps_communication else 132
+        return ComputeEstimate(
+            operation_flops=operation_flops,
+            duration_us=duration_us,
+            overlaps_communication=overlaps_communication,
+            available_sms=available_sms,
+            peak_flops_per_second=operation_flops / duration_us * 1e6,
+            source=f"test_linear_token:{operation}",
+            token_count=token_count,
+            us_per_token=us_per_token,
+            token_kind="test_token",
+        )
+
+    def manifest(self) -> dict[str, object]:
+        return {
+            "model": "test_linear_token",
+            "communication_sms": self.communication_sms,
+            "total_sms": self.total_sms,
         }
 
 
@@ -586,7 +632,7 @@ def deepep_cli_case(run_dir: Path) -> str:
 
 
 def algorithm_cli_case(run_dir: Path) -> str:
-    for algorithm in ("nccl", "eplb", "moonep"):
+    for algorithm in ("nccl", "eplb", "moonep", "probeep"):
         output_dir = run_dir / "generated" / f"{algorithm}_cli"
         command = [
             sys.executable,
@@ -642,7 +688,7 @@ def algorithm_cli_case(run_dir: Path) -> str:
                 algorithm_metadata["weight_migration_modeled"] is False,
                 "EPLB CLI 稳态 workload 错误包含 weight migration",
             )
-    return "CLI 成功生成 nccl、eplb 与 moonep workload，manifest 算法名正确"
+    return "CLI 成功生成 nccl、eplb、moonep 与 probeep workload，manifest 算法名正确"
 
 
 def nccl_case(run_dir: Path) -> str:
@@ -839,6 +885,250 @@ def moonep_scaleout_case(run_dir: Path) -> str:
     require("server_forward" not in emitted.dag_path.read_text(encoding="utf-8"),
             "MoonEP DAG 错误保留 server_forward 封装")
     return "server1 每 rank 2 routes、server2 每 rank 1 route；14 个本地 replica flows，并复用 DeepEP 分层传输"
+
+
+def probeep_cross_server_case(run_dir: Path) -> str:
+    placement = Placement(16, 8, (0, 8))
+    assignments = tuple(
+        [RoutingAssignment(0, token, 0, 0) for token in range(160)]
+        + [RoutingAssignment(8, token, 0, 1) for token in range(32)]
+    )
+    invocation = MoEInvocation(
+        "probeep_cross_server",
+        placement,
+        (160, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0),
+        64,
+        128,
+        1,
+        "fp8",
+        "bf16",
+        "bf16",
+        assignments,
+    )
+    graph = TaskGraph("probeep_cross_server", 16)
+    result = ProbeEPBuilder(
+        LinearTokenCostModel(),
+        ProbeEPConfig(
+            replicas_per_rank=2,
+            token_padding=1,
+            chunk_tokens=8,
+            route_chunk_tokens=8,
+            weight_chunk_bytes=8192,
+            max_remote_replicas=8,
+            nic_controller=ProbeNICControllerConfig(
+                initial_budget_bytes=16 * 1024,
+                min_budget_bytes=0,
+                max_budget_bytes=64 * 1024,
+                additive_increase_bytes=1024,
+            ),
+        ),
+    ).build(graph, invocation)
+    graph.validate()
+
+    baseline = result.metadata["baseline_real_routes_by_rank"]
+    final = result.metadata["final_real_routes_by_rank"]
+    require(
+        [baseline[rank] for rank in range(16)] == [20] * 8 + [4] * 8,
+            "ProbeEP 的 MoonEP baseline 错误")
+    require(set(final.values()) == {12},
+            f"ProbeEP 没有达到全局 12 routes/rank: {final}")
+    remote_replicas = result.metadata["remote_replicas"]
+    require(len(remote_replicas) == 1, "同一 expert/server 应只建立 1 个跨服务器 replica")
+    require(
+        remote_replicas[0]["moved_route_count"] == 64,
+        "remote replica 应承接 server 间总计 64 routes",
+    )
+    require(
+        max(result.metadata["final_compute_us_by_rank"].values())
+        < max(result.metadata["baseline_compute_us_by_rank"].values()),
+        "ProbeEP 没有降低最大 Expert FFN 时间",
+    )
+
+    weight_rdma = [
+        task for task in graph.tasks if task.payload_kind == "expert_weight_rdma"
+    ]
+    scatter = [
+        task for task in graph.tasks if task.payload_kind == "expert_weight_scatter"
+    ]
+    gather = [
+        task for task in graph.tasks if task.payload_kind == "expert_weight_gather"
+    ]
+    require(weight_rdma and scatter and gather,
+            "ProbeEP 缺少 scatter/RDMA/gather 权重 legs")
+    require(
+        sum(task.transfer_bytes for task in weight_rdma)
+        == invocation.expert_weight_bytes,
+        "ProbeEP 跨机权重 RDMA 字节不守恒",
+    )
+    require(
+        all(
+            placement.rank_local(task.src_rank)
+            == placement.rank_local(task.dst_rank)
+            for task in weight_rdma
+        ),
+        "ProbeEP 权重 RDMA 没有使用 same-rail relay",
+    )
+    used_rails = {
+        int(task.metadata["rail"])
+        for task in weight_rdma
+    }
+    require(len(used_rails) >= 3,
+            f"ProbeEP 权重 chunks 没有使用多 NIC: rails={sorted(used_rails)}")
+    require(0 not in used_rails,
+            "已知 token fabric 热点 rail 0 不应优先承载 weight chunks")
+    require(
+        result.metadata["predicted_token_tx_bytes"][0] > 0
+        and result.metadata["predicted_token_rx_bytes"][8] > 0,
+        "ProbeEP 没有记录 layout 推导的 token NIC 基线负载",
+    )
+    remote_destinations = {
+        int(item["destination_rank"]) for item in remote_replicas
+    }
+    for rank in remote_destinations:
+        expert = graph.task(f"probeep_cross_server.expert.rank{rank}")
+        require(
+            any(
+                graph.task(predecessor).payload_kind
+                in {"expert_weight_rdma", "expert_weight_gather"}
+                for predecessor in expert.predecessors
+            ),
+            f"rank {rank} Expert FFN 没有等待 remote weights",
+        )
+    require(
+        not any(
+            task.metadata.get("logical_resource") == "cpu"
+            for task in graph.tasks
+        ),
+        "ProbeEP 离线规划错误进入运行时 DAG",
+    )
+    require(result.metadata["planner_runtime_model"] == "not_in_dag",
+            "ProbeEP manifest 没有声明 planner 开销不进入 DAG")
+    local_prefetches = result.metadata["local_prefetches"]
+    require(
+        any(item["scope"] == "remote_server" for item in local_prefetches),
+        "remote seed 没有通过 NVLink 展开服务器内 replicas",
+    )
+
+    emit_workload(
+        graph,
+        run_dir / "generated" / "probeep_cross_server",
+        metadata=result.metadata,
+    )
+    return (
+        "20/4 routes/rank 经 1 个跨机 seed replica 达到全局 12；"
+        f"{len(weight_rdma)} 个权重 RDMA chunks 避开 token 热点 rail 0，"
+        f"使用 {len(used_rails)} 条轻载 rail"
+    )
+
+
+def probeep_controller_case() -> str:
+    mib = 1024 * 1024
+    controller = ProbeNICController(
+        4,
+        ProbeNICControllerConfig(
+            initial_budget_bytes=10 * mib,
+            min_budget_bytes=1 * mib,
+            max_budget_bytes=20 * mib,
+            multiplicative_decrease=0.9,
+            additive_increase_bytes=1 * mib,
+            deadband_ratio=0.05,
+        ),
+    )
+    decrease = controller.update(
+        ProbeSampleFeedback(
+            sample_id=0,
+            compute_us_by_rank=(100.0,) * 4,
+            nic_us_by_rank=(125.0, 60.0, 55.0, 50.0),
+            migration_bytes_by_rank=(8 * mib, 4 * mib, 4 * mib, 4 * mib),
+            pending_migration_exists=True,
+        )
+    )
+    require(decrease.action == "multiplicative_decrease",
+            "NIC 瓶颈没有触发 multiplicative decrease")
+    require(decrease.bottleneck_ranks == (0,),
+            f"错误的 bottleneck ranks: {decrease.bottleneck_ranks}")
+    require(controller.budgets == (9 * mib, 10 * mib, 10 * mib, 10 * mib),
+            "0.9 NIC budget 更新错误")
+
+    increase = controller.update(
+        ProbeSampleFeedback(
+            sample_id=1,
+            compute_us_by_rank=(120.0,) * 4,
+            nic_us_by_rank=(50.0, 45.0, 40.0, 35.0),
+            migration_bytes_by_rank=(0, 0, 0, 0),
+            pending_migration_exists=True,
+        )
+    )
+    require(increase.action == "additive_increase",
+            "compute bottleneck 没有触发 additive increase")
+    require(controller.budgets == (10 * mib, 11 * mib, 11 * mib, 11 * mib),
+            "additive NIC budget 更新错误")
+
+    hold = controller.update(
+        ProbeSampleFeedback(
+            sample_id=2,
+            compute_us_by_rank=(120.0,) * 4,
+            nic_us_by_rank=(50.0,) * 4,
+            migration_bytes_by_rank=(0, 0, 0, 0),
+            pending_migration_exists=False,
+        )
+    )
+    require(hold.action == "hold", "无 pending migration 时错误增加 budget")
+    require(controller.budgets == (10 * mib, 11 * mib, 11 * mib, 11 * mib),
+            "无迁移 sample 错误把 budget 改为实际发送字节")
+    return "AIMD controller 完成 0.9 decrease、1 MiB increase 和无迁移 hold"
+
+
+def probeep_sample_sequence_case() -> str:
+    model = ModelSpec(
+        name="probeep_four_samples",
+        hidden=128,
+        ffn_hidden=256,
+        num_attention_heads=1,
+        num_kv_heads=1,
+        head_dim=128,
+        num_experts=8,
+        topk=2,
+        sequence_length=16,
+        num_layers=2,
+        micro_batches=2,
+    )
+    result = build_transformer_workload(
+        TransformerWorkloadConfig(
+            model=model,
+            placement=Placement(8, 4, tuple(range(8))),
+            tokens_per_rank=2,
+            algorithm="probeep",
+            chunk_tokens=2,
+            replicas_per_rank=2,
+            token_padding=1,
+        ),
+        cost_model=FixedOperationCostModel(),
+    )
+    result.graph.validate()
+    sample_ids = [
+        item["sample_id"]
+        for item in result.metadata["micro_batch_algorithms"]
+    ]
+    require(sample_ids == [0, 1, 2, 3],
+            f"2 layer x 2 microbatch sample IDs 错误: {sample_ids}")
+    require(result.metadata["stream_schedule"]["cpu_task_count"] == 0,
+            "ProbeEP 不应把离线 planner 放入 DAG")
+    require(result.metadata["stream_schedule"]["cpu_streams_global"] == 0,
+            "ProbeEP timeline 不应出现 CPU planner stream")
+    cpu_tasks = [
+        task for task in result.graph.tasks
+        if task.metadata.get("logical_resource") == "cpu"
+    ]
+    require(not cpu_tasks, "ProbeEP timeline 仍包含 CPU planner task")
+    require(
+        all(
+            item["planner_runtime_model"] == "not_in_dag"
+            for item in result.metadata["micro_batch_algorithms"]
+        ),
+        "ProbeEP sample manifest 的 planner runtime 口径不一致",
+    )
+    return "2 layer x 2 microbatch 生成 4 个 sample，离线 planner 不进入 DAG/timeline"
 
 
 def model_pipeline_case(run_dir: Path) -> str:
@@ -1550,6 +1840,41 @@ def htsim_moonep_case(run_dir: Path) -> str:
     return f"HTSim 完成 MoonEP EP32 DAG；14 个本地 prefetch 和 {network_tasks - 14} 个分层 token tasks 全部完成"
 
 
+def htsim_probeep_case(run_dir: Path) -> str:
+    generated = run_dir / "generated" / "probeep_cross_server"
+    manifest = json.loads((generated / "manifest.json").read_text(encoding="utf-8"))
+    log = execute_htsim(
+        run_dir,
+        "htsim_probeep_cross_server",
+        generated / "nodes.cm",
+        generated / "workload.dag",
+    )
+    require(
+        f"DAG_SUMMARY tasks={manifest['task_count']} "
+        f"barriers={manifest['barrier_count']}" in log,
+        "ProbeEP 生成 DAG 未完整结束",
+    )
+    tasks = json.loads(
+        (generated / "task_map.json").read_text(encoding="utf-8")
+    )["tasks"]
+    network_tasks = sum(task["kind"] == "transfer" for task in tasks)
+    require(
+        len(re.findall(r"^DAG_NETWORK_DONE", log, re.MULTILINE))
+        == network_tasks,
+        "ProbeEP 权重与 token network tasks 没有全部完成",
+    )
+    require("SERVER_FORWARD_BEGIN" not in log,
+            "ProbeEP 显式三段权重迁移错误进入 server_forward")
+    require("scope=same_rail" in log,
+            "ProbeEP 跨服务器 weight chunks 没有进入 same-rail fabric")
+    require("scope=same_server" in log,
+            "ProbeEP 权重 scatter/gather 没有进入本地 FullMesh")
+    return (
+        f"HTSim 完成 ProbeEP DAG：{network_tasks} 个 network tasks，"
+        "权重 scatter/same-rail RDMA/gather 全部完成"
+    )
+
+
 def htsim_eplb_case(run_dir: Path) -> str:
     generated = run_dir / "generated" / "eplb_deepep_steady_state"
     manifest = json.loads((generated / "manifest.json").read_text(encoding="utf-8"))
@@ -1604,7 +1929,8 @@ def write_report(run_dir: Path, results: list[CaseResult]) -> None:
             "",
             "已验证字节计算、显式 chunk task、flow 完成依赖、barrier lowering、",
             "NCCL direct/no-dedup、DeepEP 两级去冗余/分层传输、EPLB hierarchical placement/",
-            "steady-state transport、MoonEP per-server replica/DeepEP scale-out 组合以及 HTSim 加载执行。",
+            "steady-state transport、MoonEP per-server replica/DeepEP scale-out、"
+            "ProbeEP 跨服务器多 NIC 权重迁移以及 HTSim 加载执行。",
             "逻辑双 stream 已降低为 DAG edges；不测试运行时 CUDA stream scheduler、",
             "单 flow 包进度事件、动态 SM、HBM 竞争或 kernel profiling。",
         ]
@@ -1638,6 +1964,9 @@ def main() -> int:
     suite.run("nccl_rank_direct", lambda: nccl_case(run_dir))
     suite.run("moonep_balanced_replica", lambda: moonep_case(run_dir))
     suite.run("moonep_deepep_scaleout", lambda: moonep_scaleout_case(run_dir))
+    suite.run("probeep_cross_server", lambda: probeep_cross_server_case(run_dir))
+    suite.run("probeep_nic_controller", probeep_controller_case)
+    suite.run("probeep_sample_sequence", probeep_sample_sequence_case)
     suite.run("two_microbatch_overlap", lambda: model_pipeline_case(run_dir))
     suite.run("relay_stream_participant", relay_stream_participant_case)
     suite.run("multi_layer_group_schedule", multi_layer_group_schedule_case)
@@ -1656,6 +1985,7 @@ def main() -> int:
         suite.run("htsim_nccl_rank_direct", lambda: htsim_nccl_case(run_dir))
         suite.run("htsim_eplb_deepep_steady_state", lambda: htsim_eplb_case(run_dir))
         suite.run("htsim_moonep_deepep_scaleout", lambda: htsim_moonep_case(run_dir))
+        suite.run("htsim_probeep_cross_server", lambda: htsim_probeep_case(run_dir))
     except Exception as exc:
         suite.results.append(CaseResult("htsim_generated_dag", "failed", str(exc)))
     write_report(run_dir, suite.results)

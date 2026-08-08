@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run four DSV3 algorithms in smoke or explicit full mode and compare them."""
+"""Run DSV3 algorithms in smoke or explicit full mode and compare them."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ COMPARISON = ROOT / "visualization" / "dsv3_algorithm_comparison.py"
 COMPUTE_CONFIG = (
     PYSRC / "compute_profiles" / "H100_DSV3_EP32_compute_4096tpr.json"
 )
-ALGORITHMS = ("nccl", "deepep", "eplb", "moonep")
+ALGORITHMS = ("nccl", "deepep", "eplb", "moonep", "probeep")
 sys.path.insert(0, str(PYSRC))
 sys.path.insert(0, str(ROOT))
 
@@ -122,7 +122,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--algorithms",
         default=",".join(ALGORITHMS),
-        help="Comma-separated subset of nccl,deepep,eplb,moonep.",
+        help="Comma-separated subset of nccl,deepep,eplb,moonep,probeep.",
     )
     parser.add_argument(
         "--gate-provider",
@@ -148,7 +148,17 @@ def parse_args() -> argparse.Namespace:
         "--moonep-replicas-per-rank",
         type=int,
         default=2,
-        help="MoonEP temporary replica capacity; skewed Gate inputs may need more than 2.",
+        help="MoonEP/ProbeEP local replica capacity; skewed Gate inputs may need more than 2.",
+    )
+    parser.add_argument(
+        "--probeep-max-remote-replicas",
+        type=int,
+        default=8,
+    )
+    parser.add_argument(
+        "--probeep-weight-chunk-bytes",
+        type=int,
+        default=4 * 1024 * 1024,
     )
     parser.add_argument(
         "--simulation-end-us",
@@ -423,6 +433,12 @@ def validate_case(
             if record["kind"] != "compute":
                 continue
             metadata = record["metadata"]
+            if metadata.get("logical_resource") == "cpu":
+                require(
+                    record["duration_us"] > 0,
+                    f"CPU planner {record['key']} has no modeled duration",
+                )
+                continue
             token_count = metadata.get("compute_token_count")
             us_per_token = metadata.get("compute_us_per_token")
             require(
@@ -556,6 +572,8 @@ def run_algorithm(
     mode: RunMode,
     gate: GateRun,
     moonep_replicas_per_rank: int,
+    probeep_max_remote_replicas: int,
+    probeep_weight_chunk_bytes: int,
 ) -> dict[str, object]:
     case_dir = root_dir / "algorithms" / algorithm
     case_dir.mkdir(parents=True)
@@ -592,6 +610,9 @@ def run_algorithm(
                 chunk_tokens=mode.chunk_tokens,
                 replicas_per_rank=moonep_replicas_per_rank,
                 token_padding=128,
+                probeep_route_chunk_tokens=mode.chunk_tokens,
+                probeep_weight_chunk_bytes=probeep_weight_chunk_bytes,
+                probeep_max_remote_replicas=probeep_max_remote_replicas,
                 gate_provider=create_gate_provider(
                     gate.provider,
                     seed=gate.seed,
@@ -644,7 +665,7 @@ def write_report(
 ) -> None:
     passed = sum(item["status"] == "passed" for item in results)
     lines = [
-        "# DSV3 两层四算法测试报告",
+        "# DSV3 两层算法测试报告",
         "",
         f"- 模式：`{mode.name}`",
         f"- tokens/rank/microbatch：{mode.tokens_per_rank}",
@@ -697,6 +718,10 @@ def main() -> int:
         raise SystemExit("--workers must be positive")
     if args.moonep_replicas_per_rank < 0:
         raise SystemExit("--moonep-replicas-per-rank must be non-negative")
+    if args.probeep_max_remote_replicas < 0:
+        raise SystemExit("--probeep-max-remote-replicas must be non-negative")
+    if args.probeep_weight_chunk_bytes <= 0:
+        raise SystemExit("--probeep-weight-chunk-bytes must be positive")
     algorithms = tuple(
         value.strip() for value in args.algorithms.split(",") if value.strip()
     )
@@ -736,7 +761,7 @@ def main() -> int:
     run_dir = (
         ROOT
         / "test_logs"
-        / f"run_{timestamp}_dsv3_2layer_4algo_{mode.name}"
+        / f"run_{timestamp}_dsv3_2layer_{len(algorithms)}algo_{mode.name}"
     )
     run_dir.mkdir(parents=True)
     (run_dir / "配置.json").write_text(
@@ -747,6 +772,10 @@ def main() -> int:
                 "workers": min(args.workers, len(algorithms)),
                 "gate": asdict(gate),
                 "moonep_replicas_per_rank": args.moonep_replicas_per_rank,
+                "probeep_max_remote_replicas": (
+                    args.probeep_max_remote_replicas
+                ),
+                "probeep_weight_chunk_bytes": args.probeep_weight_chunk_bytes,
                 "topology": {
                     "ranks": 32,
                     "servers": 4,
@@ -799,6 +828,8 @@ def main() -> int:
                 mode,
                 gate,
                 args.moonep_replicas_per_rank,
+                args.probeep_max_remote_replicas,
+                args.probeep_weight_chunk_bytes,
             ): algorithm
             for algorithm in algorithms
         }
@@ -845,7 +876,10 @@ def main() -> int:
         command.extend(
             [
                 "--title",
-                f"DSV3 2-layer / EP32 / {mode.name} / 4 algorithms",
+                (
+                    f"DSV3 2-layer / EP32 / {mode.name} / "
+                    f"{len(algorithms)} algorithms"
+                ),
             ]
         )
         completed = subprocess.run(

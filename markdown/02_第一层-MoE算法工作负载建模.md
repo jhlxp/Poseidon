@@ -107,7 +107,11 @@ summarize(plan) -> AlgorithmReport
 NCCL 的 `AlgorithmPlan` 关闭去冗余并保留每条 top-k route；DeepEP 的 plan 保存
 destination-rank 去重和 relay；MoonEP 的 plan 按 home server 保存动态 replica、
 execution rank、weight prefetch 和 padding，并复用 DeepEP scale-out transport。
-三者不应塞进一个充满可选字段的通用 plan。
+ProbeEP 使用独立 plan 和 builder：先做不读取任何网络状态的 server 间计算迁移，
+再做 server 内 rank 计算均衡；反馈式 per-rank NIC budget 只接纳/延后完整 remote
+replica，已接纳权重 chunk 再避开 layout 推导出的 token 热点 NIC。planner 只输出
+placement/intents，不作为 CPU task 进入 DAG；其复杂度由论文单独分析。ProbeEP 不导入或调用 MoonEP builder；二者也不应
+塞进一个充满可选字段的通用 plan。
 
 EPLB planner 返回跨多个 invocation 使用的 `phy2log/log2phy/logcnt` placement
 plan。当前 builder 缓存该 plan，以确定性 round-robin 把当前 routes 分给 physical
@@ -307,12 +311,14 @@ lowering 需要验证：
 
 ## 10. 首版验收
 
-- 同一个 routing trace 在 NCCL/DeepEP/EPLB/MoonEP 下共享逻辑 expert 选择。
+- 同一个 routing trace 在 NCCL/DeepEP/EPLB/MoonEP/ProbeEP 下共享逻辑 expert 选择。
 - 算法输出的 token、weight、grad 字节分项可手算复核。
 - NCCL 保留 top-k route multiplicity，不执行 hidden payload 去冗余。
 - DeepEP 按 destination rank 和 destination server 两级去重，显式生成 RDMA/NVLink legs。
 - EPLB hierarchical placement 与官方示例一致，稳态不生成 weight migration。
 - MoonEP 在每个 home server 内实现 floor/ceil route balance，padding 单独统计。
+- ProbeEP 从独立 per-server baseline 出发，跨服务器 replica 的完整权重按多 NIC
+  chunks 守恒，remote FFN 等待全部权重与 token 到达。
 - 输出 `.dag` 能被当前 HTSim 加载并完成。
 - manifest 能恢复每个 task 对应的算法 phase。
 - manifest/task map 能恢复 two-stream schedule、stream phase 和 stream sequence。

@@ -124,7 +124,7 @@ explicit rank:0 l0:r0:p0:b0 l1:p0:s1:b0 l0:r1:p0 rank:9
 server_forward src_relay:3 dst_relay:11
 ```
 
-完整语法、拓扑校验和完成语义见 [10_MpRail源路由与服务器转发.md](10_MpRail源路由与服务器转发.md)。compute task 不允许携带 route 组。
+完整语法、拓扑校验和完成语义见 [11_MpRail源路由与服务器转发.md](11_MpRail源路由与服务器转发.md)。compute task 不允许携带 route 组。
 
 ## 4. Barrier DAG 语义
 
@@ -222,6 +222,10 @@ workload 生成器当前把每 GPU 一条 compute stream 和一条 communication
 静态降低为 predecessor edges。HTSim 不维护 stream 对象：同卡 compute 串行、跨
 communication phase 串行以及 CUDA event wait 都已经体现在输入 barrier 中。同一
 communication phase 的多条 flow/chunk 没有互相增加依赖，因此仍同时启动并竞争网络。
+
+ProbeEP planner 只在离线 workload 生成阶段确定 placement、migration intents 和
+chunk rail，不生成 `.dag` task。Python 对 expanded routes 的处理时间不属于被仿真
+系统的 compute，也不会出现在 GPU/CPU timeline 或 makespan 中。
 
 两条 stream 的数量是固定契约。`micro_batches=N` 时，相邻两个 microbatch 构成
 double-buffer group，前一组的完整 workload drain 后下一组才启动；组间不 overlap，

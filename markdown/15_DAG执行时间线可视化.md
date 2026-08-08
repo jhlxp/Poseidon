@@ -105,6 +105,10 @@ overlap        = intersection(compute_active, network_active)
 动态 SM、HBM 或通信 kernel 资源调度。当前 compute 仍是固定时长事件，通信重叠时
 可使用生成器约定的 20 SM 静态预留。
 
+ProbeEP planner 是离线决策，不生成 task，因此 ProbeEP timeline 只有 GPU
+`Compute / Network TX / Network RX`，不显示 CPU planner lane。Python route lowering
+耗时也不计入 makespan 或 overlap。
+
 ## 4. 输出
 
 每次运行产生：
@@ -225,7 +229,7 @@ python3 visualization/dag_timeline.py \
 缩放时 bar、背景、分割线和刻度使用同一 `px/us` 比例重算。因此同一
 水平距离对应的实际时间是明确的，不会只是把 SVG 图片放大。
 
-### 5.2 四算法合并页
+### 5.2 五算法合并页
 
 ```bash
 python3 tests/run_dsv3_2layer_algorithms.py
@@ -235,11 +239,11 @@ python3 tests/run_dsv3_2layer_algorithms.py --full --workers 4
 标准入口先为每个算法临时生成独立的 `algorithm_dashboard.html`。单算法页面完整
 包含可折叠 Gate/expert before-after、独立可缩放 timeline、MpRail 链路负载图、
 makespan/task/bytes/overlap 摘要和相关 CSV 下载。直接打开任一算法页面，不需要
-再回到四算法总览才能查看该算法的完整信息。
+再回到五算法总览才能查看该算法的完整信息。
 
-根目录再生成 `dsv3_algorithm_comparison.html`：NCCL、DeepEP、EPLB 和 MoonEP
-各有一个可折叠区域，页头支持全部展开/收起；每个区域嵌入对应的完整算法
-dashboard，并提供单独打开链接。四个 timeline 都固定包含 GPU 0-31；
+根目录再生成 `dsv3_algorithm_comparison.html`：NCCL、DeepEP、EPLB、MoonEP 和
+ProbeEP 各有一个可折叠区域，页头支持全部展开/收起；每个区域嵌入对应的完整算法
+dashboard，并提供单独打开链接。五个 timeline 都固定包含 GPU 0-31；
 `selected_ranks` 和 overlap 汇总也必须覆盖全部 32 rank。
 
 合并页通过相对路径引用各算法的 HTML、PNG 和 CSV，不把大文件重复内联到
@@ -254,12 +258,12 @@ algorithms/<algorithm>/link_load/*
 ```
 
 ZIP 不包含 workload、HTSim log、`htsim.dat` 或原始 `output_metrics`。ZIP 写入并
-校验成功后，runner 立即删除服务器 run 目录中的总览 HTML、四个算法 dashboard、
-四个 Gate HTML 和四个 timeline HTML；CSV、JSON、PNG、workload 和仿真日志仍
+校验成功后，runner 立即删除服务器 run 目录中的总览 HTML、五个算法 dashboard、
+五个 Gate HTML 和五个 timeline HTML；CSV、JSON、PNG、workload 和仿真日志仍
 按原样保留。因此标准 run 成功后
 服务器目录中应有 `0` 个散装 HTML。
 
-下载 ZIP 后解压：打开根目录的 `dsv3_algorithm_comparison.html` 查看四算法总览；
+下载 ZIP 后解压：打开根目录的 `dsv3_algorithm_comparison.html` 查看五算法总览；
 打开 `algorithms/<algorithm>/algorithm_dashboard.html` 只查看一个算法的完整信息。
 
 ## 6. 应当观察什么
@@ -273,7 +277,7 @@ ZIP 不包含 workload、HTSim log、`htsim.dat` 或原始 `output_metrics`。ZI
 5. Dispatch/Combine 的字节是否符合算法去冗余规则；
 6. network task 的 FCT 是否存在明显长尾；
 7. 再结合链路负载图定位 endpoint、rail 或 spine 瓶颈。
-8. 对 EPLB/MoonEP 比较 Gate before 与 execution after 的 rank `max/mean`，并确认
+8. 对 EPLB/MoonEP/ProbeEP 比较 Gate before 与 execution after 的 rank `max/mean`，并确认
    total routes 和 logical-expert histogram 没有改变。
 
 只有 DAG timeline 和物理链路 timeline 使用相同 HTSim run、相同时间轴时，才能把
@@ -312,10 +316,10 @@ python3 tests/run_gate_workload_visualization.py
   逐 rank CSV 和总览 JSON 完整生成；
 - 两个伪算法 case 能合成可折叠总览页，并生成仅含 timeline 和链路图的
   可解压 ZIP。
-- EP32 smoke/full 的四个 timeline summary 均报告 `selected_ranks=0..31`，ZIP 内
+- EP32 smoke/full 的五个 timeline summary 均报告 `selected_ranks=0..31`，ZIP 内
   页面可恢复 GPU 00 到 GPU 31，服务器 run 目录不保留散装 HTML。
 - Gate 测试验证 raw `32 x 58 x 9` physical receive 数据向 256 logical experts
   折叠守恒、五种 provider 可复现、before/after 逻辑路由守恒，以及 HTML/CSV/JSON
   三种产物完整生成。
-- 四算法 runner 验证四份 manifest 的 Gate assignment digest 序列完全相同；ZIP
-  同时包含四个完整算法 dashboard、各算法 Gate/timeline HTML 和一个总 dashboard。
+- 五算法 runner 验证五份 manifest 的 Gate assignment digest 序列完全相同；ZIP
+  同时包含五个完整算法 dashboard、各算法 Gate/timeline HTML 和一个总 dashboard。

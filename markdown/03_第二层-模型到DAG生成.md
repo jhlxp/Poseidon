@@ -76,6 +76,7 @@ nccl           # 无去冗余、无 relay forwarding 的 rank-direct All-to-All
 deepep         # destination-rank 去重 + 同 index relay/目标端 forwarding
 eplb           # 持久 hierarchical placement + DeepEP 稳态传输
 moonep         # 动态 expert replica workload
+probeep        # 探测式跨服务器 replica + 多 NIC 权重迁移
 ```
 
 `eplb` 先为一段 placement epoch 生成 physical expert mapping，再使用确定性
@@ -249,7 +250,7 @@ attention 仍需按 prefill/decode 和实际 shape 计算 FLOP 数，但同样�
 单 token 单价，再与当前 task 的 `token_count` 相乘得到 `compute_us`。JSON 模式
 仍记录理论 `operation_flops`，但不再用它换算时间，也不按 overlap SM 比例二次
 缩放。不同 rank 的 expert route 数不同，FFN 时间也必须不同。完整格式、模块名和失败规则见
-[15_计算时间JSON配置.md](15_计算时间JSON配置.md)。
+[16_计算时间JSON配置.md](16_计算时间JSON配置.md)。
 
 ### 6.3 与网络的边界
 

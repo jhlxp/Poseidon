@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--algorithm",
-        choices=("nccl", "deepep", "eplb", "moonep"),
+        choices=("nccl", "deepep", "eplb", "moonep", "probeep"),
         default="deepep",
     )
     parser.add_argument("--name", default="moe_block")
@@ -56,6 +56,52 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-tokens", type=int, default=32)
     parser.add_argument("--replicas-per-rank", type=int, default=2)
     parser.add_argument("--token-padding", type=int, default=128)
+    parser.add_argument(
+        "--probeep-route-chunk-tokens",
+        type=int,
+        default=0,
+        help="Routes moved per probe step; 0 reuses --chunk-tokens.",
+    )
+    parser.add_argument(
+        "--probeep-weight-chunk-bytes",
+        type=int,
+        default=4 * 1024 * 1024,
+    )
+    parser.add_argument(
+        "--probeep-max-remote-replicas",
+        type=int,
+        default=64,
+    )
+    parser.add_argument(
+        "--probeep-initial-nic-budget-bytes",
+        type=int,
+        default=16 * 1024 * 1024,
+    )
+    parser.add_argument(
+        "--probeep-min-nic-budget-bytes",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--probeep-max-nic-budget-bytes",
+        type=int,
+        default=128 * 1024 * 1024,
+    )
+    parser.add_argument(
+        "--probeep-multiplicative-decrease",
+        type=float,
+        default=0.9,
+    )
+    parser.add_argument(
+        "--probeep-additive-increase-bytes",
+        type=int,
+        default=1024 * 1024,
+    )
+    parser.add_argument(
+        "--probeep-deadband-ratio",
+        type=float,
+        default=0.05,
+    )
     parser.add_argument(
         "--eplb-num-physical-experts",
         type=int,
@@ -195,6 +241,29 @@ def main() -> int:
                 chunk_tokens=args.chunk_tokens,
                 replicas_per_rank=args.replicas_per_rank,
                 token_padding=args.token_padding,
+                probeep_route_chunk_tokens=(
+                    args.probeep_route_chunk_tokens
+                ),
+                probeep_weight_chunk_bytes=args.probeep_weight_chunk_bytes,
+                probeep_max_remote_replicas=(
+                    args.probeep_max_remote_replicas
+                ),
+                probeep_initial_nic_budget_bytes=(
+                    args.probeep_initial_nic_budget_bytes
+                ),
+                probeep_min_nic_budget_bytes=(
+                    args.probeep_min_nic_budget_bytes
+                ),
+                probeep_max_nic_budget_bytes=(
+                    args.probeep_max_nic_budget_bytes
+                ),
+                probeep_multiplicative_decrease=(
+                    args.probeep_multiplicative_decrease
+                ),
+                probeep_additive_increase_bytes=(
+                    args.probeep_additive_increase_bytes
+                ),
+                probeep_deadband_ratio=args.probeep_deadband_ratio,
                 eplb_num_physical_experts=args.eplb_num_physical_experts,
                 eplb_num_groups=args.eplb_num_groups,
                 eplb_estimated_loads=eplb_loads,

@@ -7,7 +7,7 @@ MoE workload 生成器与 HTSim/MpRail 仿真器应当解耦。
 生成器负责：
 
 - 描述模型、并行布局、expert placement 和 router 输出；
-- 把 NCCL、DeepEP、EPLB、MoonEP 等算法展开成计算与通信任务图；
+- 把 NCCL、DeepEP、EPLB、MoonEP、ProbeEP 等算法展开成计算与通信任务图；
 - 用 H100 SXM dense BF16 理论峰值把算子 FLOP 数换算成固定 `compute_us` 占位；
 - 根据 tensor 形状、数据类型、去重、padding 和转发方案计算 `transfer_bytes`；
 - 最终输出 HTSim 可读取的 `.dag` 和空 `.cm`。
@@ -67,7 +67,8 @@ pysrc/
 │   │   ├── nccl.py
 │   │   ├── deepep.py
 │   │   ├── eplb.py
-│   │   └── moonep.py
+│   │   ├── moonep.py
+│   │   └── probeep.py
 │   └── models/
 │       ├── transformer.py
 │       └── streams.py
@@ -111,6 +112,8 @@ python3 pysrc/generate_moe_dag.py \
 - `eplb` hierarchical placement、确定性 replica selection 和 DeepEP 稳态传输；
 - dispatch、combine、weight dtype 与 `chunk_tokens`；
 - `moonep` 的 per-server replica planning、`replicas_per_rank` 和 `token_padding`。
+- `probeep` 的独立 per-server baseline、跨服务器临时 replica、route/weight chunk、
+  多 NIC 权重迁移和通信掩盖预算。
 
 EPLB 已作为 `--algorithm eplb` 接入。它根据 estimated expert loads 生成一段
 placement epoch 共用的 physical expert mapping，再为当前 token routes 确定 execution
@@ -118,7 +121,7 @@ rank，并复用 DeepEP 的两级去冗余和分层 transport。稳态 DAG 不�
 migration task；当前 CLI 可直接传负载快照，未传时使用第一次 invocation 的 route
 count 作为静态代理。
 
-DeepEP/MoonEP backward、expanded metadata、zero-copy 和 kernel profiling 尚未
+DeepEP/MoonEP/ProbeEP backward、expanded metadata、zero-copy 和 kernel profiling 尚未
 实现，CLI 不提供对应开关。DeepEP low-latency/decode 不属于当前项目范围。
 
 ### 4.2 输出
@@ -248,7 +251,7 @@ HTSim 中的 compute task 始终是固定 `compute_us`。生成器支持两种�
 H100 理论 FLOP 公式，或者模块级 JSON per-token 时间。JSON 同时保存
 `theoretical_us_per_token` 和 `profiled_us_per_token`，通过 `selected_source`
 二选一，再乘当前 task 的实际 token 数，格式见
-[15_计算时间JSON配置.md](15_计算时间JSON配置.md)。
+[16_计算时间JSON配置.md](16_计算时间JSON配置.md)。
 
 未传 JSON 时，生成器按单张 H100 SXM 的 dense BF16 Tensor Core 峰值换算。普通
 计算使用完整峰值；明确与通信 kernel 重叠的计算使用固定 SM 预留后的峰值：

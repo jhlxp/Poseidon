@@ -16,6 +16,9 @@ _EXPERT_COMPUTE = {"expert_ffn"}
 _FINAL_COMPUTE = {"combine_reduce", "combine_final_reduce"}
 _TRANSFER_PHASE = {
     "expert_weight_prefetch": "prefetch",
+    "expert_weight_scatter": "prefetch",
+    "expert_weight_rdma": "prefetch",
+    "expert_weight_gather": "prefetch",
     "dispatch_hidden": "dispatch",
     "combine_partial": "combine",
 }
@@ -28,6 +31,8 @@ _SERVER_FORWARD_RE = re.compile(
 class TwoStreamScheduleResult:
     added_dependencies: int
     compute_task_count: int
+    cpu_task_count: int
+    cpu_streams_global: int
     communication_task_count: int
     communication_phase_count: int
     layer_count: int
@@ -46,6 +51,8 @@ class TwoStreamScheduleResult:
             "stream_order_lowering": "predecessor_edges",
             "added_dependencies": self.added_dependencies,
             "compute_task_count": self.compute_task_count,
+            "cpu_task_count": self.cpu_task_count,
+            "cpu_streams_global": self.cpu_streams_global,
             "communication_task_count": self.communication_task_count,
             "communication_phase_count": self.communication_phase_count,
         }
@@ -116,6 +123,7 @@ def apply_double_buffered_two_stream_schedule(
     compute_sections: dict[
         tuple[int, int], dict[str, dict[int, list[Task]]]
     ] = {}
+    cpu_sections: dict[tuple[int, int], list[Task]] = {}
     transfer_phases: dict[tuple[int, int], dict[str, list[Task]]] = {}
     for micro_batch in range(len(microbatch_fragments)):
         for layer in layer_ids:
@@ -127,10 +135,16 @@ def apply_double_buffered_two_stream_schedule(
                 "final": {rank: [] for rank in range(graph.num_ranks)},
             }
             phases = {"prefetch": [], "dispatch": [], "combine": []}
+            cpu_tasks: list[Task] = []
             for task in tasks:
                 task.metadata["micro_batch"] = micro_batch
                 task.metadata["layer"] = layer
                 if task.kind == "compute":
+                    if task.metadata.get("logical_resource") == "cpu":
+                        task.metadata["logical_stream"] = "cpu"
+                        task.metadata["stream_section"] = "planner"
+                        cpu_tasks.append(task)
+                        continue
                     assert task.rank is not None
                     section = _compute_section(task)
                     sections[section][task.rank].append(task)
@@ -142,6 +156,7 @@ def apply_double_buffered_two_stream_schedule(
                     task.metadata["logical_stream"] = "communication"
                     task.metadata["stream_phase"] = phase
             compute_sections[fragment_key] = sections
+            cpu_sections[fragment_key] = cpu_tasks
             transfer_phases[fragment_key] = phases
 
     added_dependencies = 0
@@ -271,6 +286,21 @@ def apply_double_buffered_two_stream_schedule(
             for predecessor in previous_terminals:
                 add_dependency(tasks[0], predecessor)
 
+    # One logical host-CPU stream: planning can overlap accelerator work, but
+    # separate planner invocations do not execute concurrently.
+    cpu_order: list[Task] = []
+    for pair_start in range(0, len(microbatch_fragments), 2):
+        pair = range(
+            pair_start, min(pair_start + 2, len(microbatch_fragments))
+        )
+        for layer in layer_ids:
+            for micro_batch in pair:
+                cpu_order.extend(cpu_sections[(micro_batch, layer)])
+    for sequence, task in enumerate(cpu_order):
+        task.metadata["cpu_stream_sequence"] = sequence
+    for predecessor, task in zip(cpu_order, cpu_order[1:]):
+        add_dependency(task, predecessor)
+
     # One communication stream per rank. Flow tasks inside one phase remain parallel.
     phase_order: list[tuple[str, list[Task]]] = []
     for pair_start in range(0, len(microbatch_fragments), 2):
@@ -305,7 +335,17 @@ def apply_double_buffered_two_stream_schedule(
     graph.validate()
     return TwoStreamScheduleResult(
         added_dependencies=added_dependencies,
-        compute_task_count=sum(task.kind == "compute" for task in graph.tasks),
+        compute_task_count=sum(
+            task.kind == "compute"
+            and task.metadata.get("logical_resource") != "cpu"
+            for task in graph.tasks
+        ),
+        cpu_task_count=sum(
+            task.kind == "compute"
+            and task.metadata.get("logical_resource") == "cpu"
+            for task in graph.tasks
+        ),
+        cpu_streams_global=1 if cpu_order else 0,
         communication_task_count=sum(task.kind == "transfer" for task in graph.tasks),
         communication_phase_count=len(phase_order),
         layer_count=len(layer_ids),

@@ -85,7 +85,7 @@ DAG transfer task，具有各自的 barrier、端点、字节和完成事件。�
 task 可以成为多个 local fanout task 的共同前驱。
 
 `server_forward` 仍是 MpRail 的通用源路由能力，文档见
-[10_MpRail源路由与服务器转发.md](10_MpRail源路由与服务器转发.md)，但不是当前
+[11_MpRail源路由与服务器转发.md](11_MpRail源路由与服务器转发.md)，但不是当前
 DeepEP/EPLB/MoonEP builder 的 lowering 方式。
 
 ## 4. Dispatch

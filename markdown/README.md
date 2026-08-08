@@ -13,15 +13,16 @@
 | [05_算法建模-DeepEP.md](05_算法建模-DeepEP.md) | 训练/prefill 的 rank/server 两级去冗余及显式 RDMA/NVLink hierarchy legs |
 | [06_算法建模-EPLB.md](06_算法建模-EPLB.md) | estimated load、hierarchical expert replication/placement 和 placement epoch 边界 |
 | [07_算法建模-MoonEP.md](07_算法建模-MoonEP.md) | per-server 动态 expert replica、权重预取和 DeepEP scale-out 组合 |
-| [08_MpRail拓扑开发文档.md](08_MpRail拓扑开发文档.md) | 拓扑定义、端口模型、路由、配置和开发边界 |
-| [09_DAG任务与执行模型.md](09_DAG任务与执行模型.md) | `.cm` 纯 flow 与 `.dag` 一体化 workload、barrier 依赖和完成语义 |
-| [10_MpRail源路由与服务器转发.md](10_MpRail源路由与服务器转发.md) | CM/DAG 显式路径、服务器内部 relay 转发、校验与完成语义 |
-| [11_测试与日志规范.md](11_测试与日志规范.md) | Python 功能测试分类及 `test_logs/` 产物结构 |
-| [12_MpRail链路负载可视化.md](12_MpRail链路负载可视化.md) | link-load 采样、七面板吞吐图、坐标解析和统计口径 |
-| [13_专用测试拓扑-EP32-1Plane.md](13_专用测试拓扑-EP32-1Plane.md) | 32 GPU、8 Leaf/4 Spine 单 plane 拓扑及 DSV3 两层四算法 smoke/full 测试 |
-| [14_DAG执行时间线可视化.md](14_DAG执行时间线可视化.md) | GPU 0-31 可缩放 timeline、Gate/expert before-after、折叠明细和四算法合并页 |
-| [15_计算时间JSON配置.md](15_计算时间JSON配置.md) | 模块级 theoretical/profiled 固定时间、二选一规则、文件格式和适用边界 |
-| [16_Gate分布与Routing生成.md](16_Gate分布与Routing生成.md) | Gate provider、UltraEP/FAST 合成分布、raw receive 精确 quota 和 routing fidelity |
+| [08_算法建模-ProbeEP.md](08_算法建模-ProbeEP.md) | 两阶段计算均衡、反馈式 NIC 窗口、跨服务器 replica 与多 NIC 分块 RDMA |
+| [09_MpRail拓扑开发文档.md](09_MpRail拓扑开发文档.md) | 拓扑定义、端口模型、路由、配置和开发边界 |
+| [10_DAG任务与执行模型.md](10_DAG任务与执行模型.md) | `.cm` 纯 flow 与 `.dag` 一体化 workload、barrier 依赖和完成语义 |
+| [11_MpRail源路由与服务器转发.md](11_MpRail源路由与服务器转发.md) | CM/DAG 显式路径、服务器内部 relay 转发、校验与完成语义 |
+| [12_测试与日志规范.md](12_测试与日志规范.md) | Python 功能测试分类及 `test_logs/` 产物结构 |
+| [13_MpRail链路负载可视化.md](13_MpRail链路负载可视化.md) | link-load 采样、七面板吞吐图、坐标解析和统计口径 |
+| [14_专用测试拓扑-EP32-1Plane.md](14_专用测试拓扑-EP32-1Plane.md) | 32 GPU、8 Leaf/4 Spine 单 plane 拓扑及 DSV3 两层五算法 smoke/full 测试 |
+| [15_DAG执行时间线可视化.md](15_DAG执行时间线可视化.md) | GPU 0-31 可缩放 timeline、Gate/expert before-after、折叠明细和五算法合并页 |
+| [16_计算时间JSON配置.md](16_计算时间JSON配置.md) | 模块级 theoretical/profiled 固定时间、二选一规则、文件格式和适用边界 |
+| [17_Gate分布与Routing生成.md](17_Gate分布与Routing生成.md) | Gate provider、UltraEP/FAST 合成分布、raw receive 精确 quota 和 routing fidelity |
 
 ## 仿真器的两种输入模式
 
@@ -52,7 +53,7 @@ GPU -> server-local FullMesh -> plane-specific L0-EPS
 - 同服务器 GPU 之间使用独立的高速 FullMesh 本地路径。
 
 固定 rank/Leaf 映射和测试参数见
-[13_专用测试拓扑-EP32-1Plane.md](13_专用测试拓扑-EP32-1Plane.md)。
+[14_专用测试拓扑-EP32-1Plane.md](14_专用测试拓扑-EP32-1Plane.md)。
 
 实现顺序固定为：文档契约、拓扑与路由、DAG 接入、Python 功能测试。
 
@@ -104,7 +105,7 @@ python3 visualization/mprail_link_load.py \
 ```
 
 采样开关、五类面板和统计语义见
-[12_MpRail链路负载可视化.md](12_MpRail链路负载可视化.md)。
+[13_MpRail链路负载可视化.md](13_MpRail链路负载可视化.md)。
 
 ## 绘制 DAG 执行时间线
 
@@ -117,8 +118,8 @@ python3 visualization/dag_timeline.py \
 ```
 
 输出每 GPU `Compute / Network TX / Network RX` 的 HTML 时间线，以及逐 task
-FCT/bytes 和逐 GPU overlap 汇总。完整口径见
-[14_DAG执行时间线可视化.md](14_DAG执行时间线可视化.md)。
+FCT/bytes 和逐 GPU overlap 汇总。ProbeEP 的离线 planner 不进入 timeline。完整口径见
+[15_DAG执行时间线可视化.md](15_DAG执行时间线可视化.md)。
 
 Gate 分布和算法执行前后专家负载可单独生成：
 
@@ -130,9 +131,9 @@ python3 visualization/gate_load_profile.py \
 
 页面按 layer/microbatch 对比 baseline placement 与算法 execution placement 的
 rank/expert-instance load；分布语义和 provider 配置见
-[16_Gate分布与Routing生成.md](16_Gate分布与Routing生成.md)。
+[17_Gate分布与Routing生成.md](17_Gate分布与Routing生成.md)。
 
-## 运行 DSV3 两层四算法案例
+## 运行 DSV3 两层五算法案例
 
 ```bash
 python3 tests/run_dsv3_2layer_algorithms.py
@@ -141,12 +142,12 @@ python3 tests/run_dsv3_2layer_algorithms.py --full --workers 4
 ```
 
 该入口固定使用两个代表性 DSV3 MoE layer、两个 microbatch、
-NCCL/DeepEP/EPLB/MoonEP 和 EP32 单 plane/400 Gbps 拓扑。默认为
+NCCL/DeepEP/EPLB/MoonEP/ProbeEP 和 EP32 单 plane/400 Gbps 拓扑。默认为
 `2 tokens/rank/microbatch` smoke；`--full` 才是 `4096 tokens/rank/microbatch`。
 每个算法都生成一个完整 `algorithm_dashboard.html`，其中包含 Gate/expert
-before-after、GPU 0-31 完整可缩放 timeline 和 MpRail 链路负载图；四个算法页面
+before-after、GPU 0-31 完整可缩放 timeline 和 MpRail 链路负载图；五个算法页面
 再组合到 ZIP 根目录的可折叠 `dsv3_algorithm_comparison.html` 总入口，并生成不含仿真大文件的
 `dsv3_visualization_bundle.zip` 供下载。ZIP 成功后服务器 run 目录不保留散装
 HTML，其他产物仍保留。参数、边界和验收条件见
-[13_专用测试拓扑-EP32-1Plane.md](13_专用测试拓扑-EP32-1Plane.md)，计算时间选择见
-[15_计算时间JSON配置.md](15_计算时间JSON配置.md)。
+[14_专用测试拓扑-EP32-1Plane.md](14_专用测试拓扑-EP32-1Plane.md)，计算时间选择见
+[16_计算时间JSON配置.md](16_计算时间JSON配置.md)。

@@ -15,6 +15,15 @@ from .eplb import (
 )
 from .moonep import MoonEPBuilder, MoonEPConfig, MoonEPPlan
 from .nccl import NCCLBuilder, NCCLConfig
+from .probeep import (
+    ProbeControllerUpdate,
+    ProbeEPBuilder,
+    ProbeEPConfig,
+    ProbeEPPlan,
+    ProbeNICController,
+    ProbeNICControllerConfig,
+    ProbeSampleFeedback,
+)
 
 __all__ = [
     "AlgorithmBuildResult",
@@ -31,6 +40,13 @@ __all__ = [
     "MoonEPBuilder",
     "MoonEPConfig",
     "MoonEPPlan",
+    "ProbeEPBuilder",
+    "ProbeEPConfig",
+    "ProbeEPPlan",
+    "ProbeNICController",
+    "ProbeNICControllerConfig",
+    "ProbeSampleFeedback",
+    "ProbeControllerUpdate",
     "destination_forward_route",
     "plan_token_payloads",
     "plan_hierarchical_placement",

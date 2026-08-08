@@ -60,9 +60,12 @@ def task_record(
     operation: str | None = None,
     payload_kind: str | None = None,
     predecessors: tuple[str, ...] = (),
+    logical_resource: str = "gpu",
 ) -> dict[str, object]:
     return {
-        "available_sms": 112 if kind == "compute" else None,
+        "available_sms": (
+            0 if logical_resource == "cpu" else (112 if kind == "compute" else None)
+        ),
         "barrier_group": None,
         "barrier_id": task_id - 1,
         "chunk_id": 0 if kind == "transfer" else None,
@@ -71,9 +74,14 @@ def task_record(
         "duration_us": duration_us,
         "key": key,
         "kind": kind,
-        "metadata": ({"operation": operation} if operation else {}),
+        "metadata": {
+            **({"operation": operation} if operation else {}),
+            "logical_resource": logical_resource,
+        },
         "operation_flops": 1 if kind == "compute" else 0,
-        "overlaps_communication": kind == "compute" and rank == 0,
+        "overlaps_communication": (
+            kind == "compute" and rank == 0 and logical_resource == "gpu"
+        ),
         "payload_kind": payload_kind,
         "peak_flops_per_second": 1.0 if kind == "compute" else None,
         "predecessor_barrier_ids": list(range(len(predecessors))),
@@ -93,9 +101,9 @@ def build_inputs(input_dir: Path) -> tuple[Path, Path, Path]:
         "format_version": 1,
         "graph": "synthetic_overlap",
         "num_ranks": 2,
-        "task_count": 4,
-        "barrier_count": 4,
-        "compute_task_count": 3,
+        "task_count": 5,
+        "barrier_count": 5,
+        "compute_task_count": 4,
         "transfer_task_count": 1,
         "transfer_bytes_by_payload": {"dispatch_hidden": 1_000_000},
         "metadata": {},
@@ -135,6 +143,15 @@ def build_inputs(input_dir: Path) -> tuple[Path, Path, Path]:
             operation="expert_ffn",
             predecessors=("mb0.attention.rank0",),
         ),
+        task_record(
+            5,
+            "mb0.probeep.cpu_planner",
+            "compute",
+            rank=0,
+            duration_us=1.0,
+            operation="probeep_planner",
+            logical_resource="cpu",
+        ),
     ]
     manifest_path = workload_dir / "manifest.json"
     task_map_path = workload_dir / "task_map.json"
@@ -158,7 +175,9 @@ def build_inputs(input_dir: Path) -> tuple[Path, Path, Path]:
                 "DAG_TASK_DONE task=1 barrier=0 time_us=10",
                 "DAG_TASK_START task=4 barrier=3 src_rank=0 dst_rank=0 transfer_bytes=0 compute_us=5 time_us=10",
                 "DAG_TASK_DONE task=4 barrier=3 time_us=15",
-                "DAG_SUMMARY tasks=4 barriers=4 makespan_us=15",
+                "DAG_TASK_START task=5 barrier=4 src_rank=0 dst_rank=0 transfer_bytes=0 compute_us=1 time_us=0.5",
+                "DAG_TASK_DONE task=5 barrier=4 time_us=1.5",
+                "DAG_SUMMARY tasks=5 barriers=5 makespan_us=15",
             ]
         )
         + "\n",
@@ -171,7 +190,7 @@ def parser_overlap_case(task_map_path: Path, log_path: Path) -> str:
     tasks = read_task_map(task_map_path, 2)
     events = read_execution_log(log_path, tasks)
     summaries = summarize_ranks(events, 2)
-    require(len(events) == 4, "没有解析出全部 4 个 task")
+    require(len(events) == 5, "没有解析出全部 5 个 task")
     require(events[1].actual_duration_us == 6.0, "network task FCT 应为 6us")
     require(
         math.isclose(events[1].logical_throughput_gbps or 0.0, 4000 / 3),
@@ -185,7 +204,8 @@ def parser_overlap_case(task_map_path: Path, log_path: Path) -> str:
             "GPU1 compute/network overlap 应为 2us")
     require(summaries[0].tx_bytes == 1_000_000, "GPU0 TX bytes 错误")
     require(summaries[1].rx_bytes == 1_000_000, "GPU1 RX bytes 错误")
-    return "4 task join 完整；network FCT=6us；GPU0/GPU1 overlap=6us/2us"
+    require(summaries[0].compute_tasks == 2, "CPU planner 不应计入 GPU compute")
+    return "5 task join 完整；CPU planner 与 GPU compute 分离；GPU0/GPU1 overlap=6us/2us"
 
 
 def invalid_log_case(task_map_path: Path, log_path: Path, input_dir: Path) -> str:
@@ -259,15 +279,17 @@ def cli_case(
     (run_dir / "命令.txt").write_text(" ".join(command) + "\n", encoding="utf-8")
     (run_dir / "绘图.log").write_text(completed.stdout, encoding="utf-8")
     require(completed.returncode == 0, f"可视化 CLI 返回码 {completed.returncode}")
-    require("parsed 4 tasks across 2 ranks; makespan 15 us" in completed.stdout,
+    require("parsed 5 tasks across 2 ranks; makespan 15 us" in completed.stdout,
             "CLI 汇总不正确")
-    return "CLI 成功生成 2 GPU Compute/TX/RX timeline"
+    return "CLI 成功生成 CPU planner 与 2 GPU Compute/TX/RX timeline"
 
 
 def artifacts_case(output_dir: Path) -> str:
     html = (output_dir / "dag_gpu_timeline.html").read_text(encoding="utf-8")
     require("GPU 00" in html and "Network TX" in html and "Network RX" in html,
             "HTML 缺少 GPU 三 lane")
+    require("Host CPU" in html and "CPU Planner" in html,
+            "HTML 缺少独立 CPU planner lane")
     require(html.count("<title>") == 1 and "Predecessors:" not in html,
             "SVG 仍在重复内联 tooltip 或 predecessor 文本")
     require("data-task-id='2'" in html and "class=\"hover-tooltip\"" in html,
@@ -312,7 +334,7 @@ def artifacts_case(output_dir: Path) -> str:
         "HTML 缺少 Fit/水平缩放和动态时间比例",
     )
     require(
-        '<details class="details"><summary>Task details (4)</summary>' in html,
+        '<details class="details"><summary>Task details (5)</summary>' in html,
         "Task details 没有使用三角折叠控件",
     )
     require("renderTaskTable" in html and "DecompressionStream" in html,
@@ -330,6 +352,10 @@ def artifacts_case(output_dir: Path) -> str:
         (output_dir / "dag_timeline_summary.json").read_text(encoding="utf-8")
     )
     require(overview["makespan_us"] == 15.0, "overview makespan 错误")
+    require(overview["compute_task_count"] == 3,
+            "overview 不应将 CPU planner 计入 GPU compute")
+    require(overview["cpu_planner_task_count"] == 1,
+            "overview 缺少 CPU planner 计数")
     require(overview["logical_transfer_bytes"] == 1_000_000,
             "overview logical bytes 错误")
     require(overview["selected_rank_compute_network_overlap_sum_us"] == 8.0,
@@ -395,7 +421,7 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
         timeout=30,
         check=False,
     )
-    require(completed.returncode == 0, "四算法总览 HTML 生成失败")
+    require(completed.returncode == 0, "多算法总览 HTML 生成失败")
     html = output.read_text(encoding="utf-8")
     require(html.count('<details class="algorithm"') == 2,
             "算法没有分别使用可折叠分区")
@@ -432,7 +458,7 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
         and "mprail_link_load_by_layer.png" in nccl_dashboard,
         "单算法 dashboard 没有囊括 Gate、timeline 和链路负载",
     )
-    return "单算法完整 dashboard 和四算法总 dashboard 均正确打包"
+    return "单算法完整 dashboard 和多算法总 dashboard 均正确打包"
 
 
 class Suite:

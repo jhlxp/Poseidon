@@ -142,10 +142,11 @@ layer 1。这里是测试内逻辑编号，不是官方模型的物理层号。
 | sequence length | 4096 |
 | dispatch dtype | FP8 |
 | combine dtype | BF16 |
-| 算法 | NCCL、DeepEP、EPLB、MoonEP |
+| 算法 | NCCL、DeepEP、EPLB、MoonEP、ProbeEP |
 | 功能回归 | 2 tokens/rank/microbatch，chunk 32 |
 | 完整测试 | 4096 tokens/rank/microbatch，chunk 4096 |
 | 完整测试 compute config | `pysrc/compute_profiles/H100_DSV3_EP32_compute_4096tpr.json` |
+| ProbeEP planner | 不进入 DAG；论文单独分析复杂度/实现开销 |
 
 这里的 `4096` 是**每个 rank、每个 microbatch 的本地 token 数**，不是 32 rank
 合计值。32 rank 时，每个 microbatch 的全局 token 数为：
@@ -189,7 +190,8 @@ HTSim 仍对大 flow 内部的 packet 执行逐包网络仿真。
 
 不同算法的 task 和逻辑总字节不应强制相同：NCCL 保留 route multiplicity；DeepEP
 显式计算 rank payload、server/RDMA payload 和目标服务器 local fanout/reduce；EPLB
-与 MoonEP 还会改变 execution placement。完整测试通过每次 invocation 的以下关系
+与 MoonEP 还会改变 execution placement；ProbeEP 进一步加入跨服务器 replica 和
+分块权重迁移。完整测试通过每次 invocation 的以下关系
 验收去冗余，而不使用旧 uniform/round-robin 的固定 task 数：
 
 ```text
@@ -259,9 +261,9 @@ double-buffer group 才 drain。
 
 因此“DSV3”表示采用 DSV3 的核心 MoE shape 和通信口径，不表示当前 DAG 已覆盖
 官方完整模型的所有 kernel。计算 JSON 的格式和 profiling 切换方法见
-[15_计算时间JSON配置.md](15_计算时间JSON配置.md)。
+[16_计算时间JSON配置.md](16_计算时间JSON配置.md)。
 
-## 11. 运行四算法测试与产物
+## 11. 运行五算法测试与产物
 
 ```bash
 cd /home/xuheng/EP_ExpertTrans
@@ -278,20 +280,20 @@ python3 tests/run_dsv3_2layer_algorithms.py \
 ```
 
 默认入口是 `2 tokens/rank/microbatch` smoke，用于日常功能回归。`--full`
-才使用 4096tpr JSON 和完整通信字节。四个算法默认由 4 个独立进程
+才使用 4096tpr JSON 和完整通信字节。五个算法分别使用独立进程，默认最多 4 个
 并行仿真；`--workers` 可限制并发数。
 
 每次运行生成独立目录：
 
 ```text
-test_logs/run_<timestamp>_dsv3_2layer_4algo_<smoke|full>/
+test_logs/run_<timestamp>_dsv3_2layer_5algo_<smoke|full>/
 ├── 配置.json
 ├── 构建.log
 ├── 测试报告.md
 ├── summary.json
 ├── dsv3_visualization_bundle.zip
 └── algorithms/
-    └── <nccl|deepep|eplb|moonep>/
+    └── <nccl|deepep|eplb|moonep|probeep>/
         ├── workload/
         │   ├── workload.dag
         │   ├── nodes.cm
@@ -315,12 +317,12 @@ test_logs/run_<timestamp>_dsv3_2layer_4algo_<smoke|full>/
 ```
 
 EP32 smoke/full 的 timeline 必须展示 rank 0-31，也就是四台服务器的全部 32 张
-GPU，不能只截取 server 0。ZIP 中的四算法区域和每个 `Task details` 均可折叠；
+GPU，不能只截取 server 0。ZIP 中的五算法区域和每个 `Task details` 均可折叠；
 每条 timeline 默认
 Fit 全局，可水平缩放并实时显示 `100 px` 对应的微秒数。
-`dsv3_visualization_bundle.zip` 只打包总览 HTML、四算法 Gate/expert before-after、
+`dsv3_visualization_bundle.zip` 只打包总览 HTML、五算法 Gate/expert before-after、
 timeline 和链路负载产物，不包含 workload 和 simulation 大文件。服务器 run 目录
-不保留散装 HTML。可用 `--gate-provider` 选择分布；同一次四算法实验必须使用完全
+不保留散装 HTML。可用 `--gate-provider` 选择分布；同一次五算法实验必须使用完全
 相同的 Gate assignment digest 序列。MoonEP 的 `replicas_per_rank` 是真实容量约束；
 偏斜分布在默认值 2 下无法满足 planner 的严格 rank 均衡时会明确失败，不会静默
 改变 Gate。通过 `--moonep-replicas-per-rank` 显式配置实验容量，并在 `配置.json`
@@ -336,7 +338,7 @@ algorithms/<algorithm>/algorithm_dashboard.html
 ```
 
 单算法 dashboard 已包含该算法的 Gate、timeline、link-load 和 CSV 入口；根页面
-再统一嵌入四个算法 dashboard。两级页面都依赖 ZIP 中的相对路径资源，因此必须
+再统一嵌入五个算法 dashboard。两级页面都依赖 ZIP 中的相对路径资源，因此必须
 先完整解压 ZIP。
 
 ## 12. DSV3 两层验收条件
@@ -346,24 +348,25 @@ algorithms/<algorithm>/algorithm_dashboard.html
 2. smoke 必须报告 `tokens_per_rank=2`、`chunk_tokens=32`；full 必须报告
    `tokens_per_rank=4096`、`chunk_tokens=4096`。
 3. stream manifest 必须报告每 rank 一条 compute、一条 communication stream。
+   ProbeEP 必须报告 `cpu_task_count=0`、`cpu_streams_global=0`。
 4. `mb0.layer1.attention.rank0` 必须等待 `mb0.layer0` 的同 rank
    Combine/Reduce，且不得等待 `mb1.layer0` 的 Combine/Reduce。
 5. workload 必须包含跨服务器和跨 rail transfer；NCCL 不得出现 hierarchy leg，
-   DeepEP/EPLB/MoonEP 必须包含 dispatch/combine 的 fabric/local 四类 leg，且三者
-   都不得再把算法通信封装为 `server_forward`。
+   DeepEP/EPLB/MoonEP/ProbeEP 必须包含 dispatch/combine 的 fabric/local 四类 leg，
+   且四者都不得再把算法通信封装为 `server_forward`。
 6. full compute manifest 必须记录 4096tpr JSON 路径和 `selected_source`。
-7. 四个 HTSim 进程必须完成各自 manifest 中全部 task/barrier。
+7. 五个 HTSim 进程必须完成各自 manifest 中全部 task/barrier。
 8. 两个 layer 上的参与 GPU 集合中都必须实际出现 `D0||A1`、`D1||E0`、
    `C0||E1`、`C1||Reduce0`；不要求八个窗口固定落在同一张 GPU。另外
    必须实际出现 `L1 MB0 Attention || L0 MB1 Combine` 跨层窗口。
 9. 每个算法的 task CSV、rank overlap CSV、timeline summary、Gate load CSV/JSON、
    链路负载 PNG 和链路/endpoint summary 必须在服务器 run 目录中保留。
-10. ZIP 必须包含四个单算法完整 dashboard 和一个总 dashboard；总览包含四个
+10. ZIP 必须包含五个单算法完整 dashboard 和一个总 dashboard；总览包含五个
     可折叠算法区域，单算法页面能进入覆盖 rank 0-31 的 Gate before-after、
-    可缩放 timeline 和 MpRail 链路负载图；四份
+    可缩放 timeline 和 MpRail 链路负载图；五份
     timeline summary 的 `selected_ranks` 必须均为完整 `0..31`。
 11. 可视化 ZIP 必须可完整解压，包含总览页和所有被引用资源，且不得
     包含 workload 或 simulation 目录。
 12. ZIP 校验通过后，服务器 run 目录中不得留下任何 `*.html`。
-13. 四算法每个 layer/microbatch 的 Gate assignment digest 必须逐项相等；每份
+13. 五算法每个 layer/microbatch 的 Gate assignment digest 必须逐项相等；每份
     before/after profile 的 total routes 和 logical expert histogram 必须守恒。

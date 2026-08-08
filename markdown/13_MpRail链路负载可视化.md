@@ -62,7 +62,7 @@ HTSIM_LINK_LOAD_SAMPLE_US=1 \
 | 数百 us 到数 ms | 5-10 us |
 | 更长实验 | 50-1000 us |
 
-DSV3 四算法标准入口固定使用：
+DSV3 五算法标准入口固定使用：
 
 ```text
 2-token smoke:  HTSIM_LINK_LOAD_SAMPLE_US=1
