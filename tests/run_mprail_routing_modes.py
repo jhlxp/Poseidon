@@ -132,10 +132,10 @@ def base_command(matrix_path: Path, case_dir: Path, algorithm: str) -> list[str]
         "-topology", "mprail",
         "-mprail_planes", "1",
         "-mprail_gpus_per_server", "8",
-        "-mprail_l1_eps_per_plane", "8",
+        "-mprail_l1_eps_per_plane", "4",
         "-mprail_l0_l1_links_per_spine", "1",
         "-linkspeed", "400000",
-        "-local_linkspeed", "3200000",
+        "-local_linkspeed", "7200000",
         "-local_latency_ns", "50",
         "-hop_latency", "0.1",
         "-switch_latency", "0.02",
@@ -202,7 +202,7 @@ def run_mode(
         detail = (
             f"8 条流的包内熵均固定={stable}；"
             "固定使用 plane 0；"
-            f"实际使用 {len(active_paths)}/8 条 L0->L1 spine 链路"
+            f"实际使用 {len(active_paths)}/4 条 L0->L1 spine 链路"
         )
     else:
         entropy_changes = len(entropies.get("0->9", [])) > 1
@@ -212,7 +212,7 @@ def run_mode(
         detail = (
             f"单流报文熵数量 {len(entropies.get('0->9', []))}；"
             "固定使用 plane 0；"
-            f"实际使用 {len(active_paths)}/8 条 L0->L1 spine 链路；"
+            f"实际使用 {len(active_paths)}/4 条 L0->L1 spine 链路；"
             f"报文级物理分流={physical_spray}"
         )
 

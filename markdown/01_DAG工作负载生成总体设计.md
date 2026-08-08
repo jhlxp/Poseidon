@@ -114,7 +114,7 @@ python3 pysrc/generate_moe_dag.py \
 
 EPLB 已作为 `--algorithm eplb` 接入。它根据 estimated expert loads 生成一段
 placement epoch 共用的 physical expert mapping，再为当前 token routes 确定 execution
-rank，并复用 DeepEP 的去冗余和目标端转发。稳态 DAG 不包含 planner 或 weight
+rank，并复用 DeepEP 的两级去冗余和分层 transport。稳态 DAG 不包含 planner 或 weight
 migration task；当前 CLI 可直接传负载快照，未传时使用第一次 invocation 的 route
 count 作为静态代理。
 
@@ -153,7 +153,8 @@ generated_workloads/<name>/
 也不能定义一个固定的 `dispatch -> expert -> combine` 模板后只替换路由。NCCL
 保留全部 top-k payload 并直达 expert rank；MoonEP 还包含在线规划、动态冗余
 expert、权重预取和训练梯度归并，并复用 DeepEP scale-out transport；DeepEP 按
-destination rank 去重，并通过目标服务器同 local-index relay 完成目标端转发。
+destination rank 和 destination server 两级去重，通过同 index relay 显式完成
+RDMA、local fanout 和 local reduce。
 这些不是普通 all-to-all 的参数变化。
 
 因此采用：
@@ -219,6 +220,28 @@ HTSim 不感知或调度 CUDA stream；它只执行 lowering 后的 barrier DAG�
 同一 GPU 上两个 compute task 错误重叠，也保留 `D0||Attention1`、`D1||Expert0`、
 `C0||Expert1` 和 `C1||Reduce0`。
 
+多层 workload 在 double-buffer group 内使用跨层 wavefront，不按 layer 整体 drain：
+
+```text
+Layer N / MB0 Final
+    -> Layer N+1 / MB0 Attention+Router
+    -> Layer N / MB1 Final
+    -> Layer N+1 / MB1 Attention+Router
+```
+
+同一 microbatch 的下一层 Attention 仍必须等待本 microbatch 上一层的
+Combine/Final；MB0 下一层 Attention 不等待 MB1 上一层尾部。因此可形成：
+
+```text
+compute stream: Layer N+1 / MB0 Attention
+comm stream:    Layer N   / MB1 Combine
+overlap:        cross-layer Attention || Combine
+```
+
+通信 phase 仍在单条 communication stream 上串行；跨层 wavefront 只新增合法的
+compute/communication overlap，不允许 compute/compute 或 communication/communication
+重叠。
+
 ### 5.4 Compute 使用固定时长
 
 HTSim 中的 compute task 始终是固定 `compute_us`。生成器支持两种写入来源：默认
@@ -266,12 +289,12 @@ compute_us_overlap = operation_flops / 839.15e12 * 1e6
 | GPU compute | 固定时长事件 | 默认 H100 理论公式，或 JSON theoretical/profiled 二选一 |
 | 通信/计算 SM 竞争 | 静态近似 | 每 rank 的逻辑通信 phase 固定预留 20/132 SM |
 | HBM/NVLink memory contention | 未支持 | 不进入首版 compute 占位，报告中标注 |
-| multicast/one-to-many 原语 | 未支持且当前不需要 | DeepEP 按 destination rank 生成点到点逻辑 task |
+| multicast/one-to-many 原语 | 无专用原语 | DeepEP 用一个 fabric task 加多个 local fanout task 表达 |
 
-单个 `server_forward` 最多执行三阶段 store-and-forward。DeepEP 固定
-`src_relay=src_rank`，跳过源端阶段，因此每个跨服务器逻辑 task 实际执行 fabric
-flow 和可选的 destination-local flow。`chunk_tokens` 通过多个逻辑 task 表达
-chunk overlap，单条 flow 内 packet-progress 不建模。
+`server_forward` 仍支持通用三阶段 store-and-forward，但 DeepEP/EPLB/MoonEP
+不再用它封装算法传输。算法 builder 显式输出 fabric、local fanout/local reduce
+task，使一份服务器级 RDMA payload 可以被多个 rank 共享。`chunk_tokens` 通过多个
+完整 flow task 表达 chunk overlap，单条 flow 内 packet-progress 不建模。
 
 MpRail 的 server-local FullMesh 也只是对 NVLink rank-to-rank 数据移动的网络级近似。UEC flow 的可靠传输、ACK 和拥塞控制不等价于 NVLink load/store、TMA 或 symmetric-memory 语义。首版可以研究字节、依赖和本地带宽竞争，但不能把理论 compute 占位或节点内 FCT 宣称为真实 DeepEP/MoonEP kernel latency。
 
@@ -279,7 +302,7 @@ MpRail 的 server-local FullMesh 也只是对 NVLink rank-to-rank 数据移动�
 
 1. 实现 schema、placement、routing assignment、task-level graph 和确定性 ID。
 2. 实现 HTSim emitter、manifest 和静态校验。
-3. 实现 NCCL direct/no-dedup 与 DeepEP destination-forward coarse 模型。
+3. 实现 NCCL direct/no-dedup 与 DeepEP hierarchical scaleout/scaleup 模型。
 4. 实现单个 MoE sublayer：router、dispatch、expert、combine。
 5. 实现完整 transformer block forward：attention、residual、norm、MoE。
 6. 实现 H100 dense BF16 峰值和通信预留 20 SM 的固定时长占位。
@@ -299,7 +322,7 @@ MpRail 的 server-local FullMesh 也只是对 NVLink rank-to-rank 数据移动�
 - 不在第一版同时支持任意 DP/TP/PP/EP 组合。
 
 统一算法验收使用 EP32、4 servers x 8 GPUs、plane=1、400 Gbps：NCCL 直达真实
-rank，DeepEP 使用 destination-side forwarding，EPLB 使用持久 hierarchical
+rank，DeepEP 使用 hierarchical scaleout/scaleup transport，EPLB 使用持久 hierarchical
 placement，MoonEP 在每个 expert home server 内独立创建 replica 并复用 DeepEP
 scale-out transport。四者共享相同 routing
 assignments、expert placement 和 dtype，保证字节、路径和计算分布可比较。

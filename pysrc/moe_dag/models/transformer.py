@@ -267,8 +267,8 @@ def build_transformer_workload(
             "weight": config.weight_dtype,
         },
         "routing_provider": {
-            "name": "uniform_deterministic",
-            "random_seed": None,
+            "name": "balanced_permuted_deterministic",
+            "random_seed": 0,
         },
         "compute_cost": cost.manifest(),
         "stream_schedule": stream_schedule.manifest(),

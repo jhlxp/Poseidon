@@ -72,7 +72,7 @@ uint32_t parse_positive_u32_arg(const char* option, const char* value) {
 void exit_error(char* progr) {
     cout << "Usage " << progr << " [-nodes N]\n\t[-cwnd cwnd_size]\n\t[-q queue_size]\n\t[-queue_type composite|random|lossless|lossless_input|]\n\t[-tm traffic_matrix_file]\n\t[-dag task_file]\n\t[-topology mprail]\n\t[-strat route_strategy (single,rand,perm,pull,ecmp,\n\tecmp_host path_count,ecmp_ar,ecmp_rr,\n\tecmp_host_ar ar_thresh)]\n\t[-log log_level]\n\t[-seed random_seed]\n\t[-end end_time_in_usec]\n\t[-mtu MTU]\n\t[-hop_latency x] per hop wire latency in us,default 1\n\t[-target_q_delay x] target_queuing_delay in us, default is 6us \n\t[-switch_latency x] switching latency in us, default 0\n\t[-host_queue_type  swift|prio|fair_prio]\n\t[-logtime dt] sample time for sinklogger, etc\n\t[-conn_reuse] enable connection reuse" << endl;
     cout << "\t[-local_tray_size N] rank group size for direct intra-server routing\n"
-         << "\t[-local_linkspeed Mbps] direct intra-server link speed, default host linkspeed\n"
+         << "\t[-local_linkspeed Mbps] direct intra-server link/injection speed, MpRail default 7200000\n"
          << "\t[-local_latency_ns ns] direct intra-server one-way latency, default 200ns\n"
          << "\t[-mprail_planes N] independent EPS planes, default 8\n"
          << "\t[-mprail_gpus_per_server N] ranks in a FullMesh server, default 8\n"
@@ -1085,6 +1085,7 @@ int main(int argc, char **argv) {
     logfile.setStartTime(timeFromSec(0));
 
     vector<unique_ptr<UecNIC>> nics;
+    vector<unique_ptr<UecNIC>> mprail_local_nics;
 
     UecSinkLoggerSampling* sink_logger = NULL;
     if (log_sink) {
@@ -1641,6 +1642,7 @@ int main(int argc, char **argv) {
     }
 
     vector<unique_ptr<UecPullPacer>> pacers;
+    vector<unique_ptr<UecPullPacer>> mprail_local_pacers;
     vector<PCIeModel*> pcie_models;
     vector<OversubscribedCC*> oversubscribed_ccs;
 
@@ -1660,6 +1662,20 @@ int main(int argc, char **argv) {
         if (log_nic) {
             nic_logger->monitorNic(nic.get());
         }
+
+        if (mprail_mode) {
+            mprail_local_pacers.emplace_back(make_unique<UecPullPacer>(
+                    local_linkspeed, 0.99,
+                    UecBasePacket::unquantize(UecSink::_credit_per_pull),
+                    eventlist, 1));
+            mprail_local_nics.emplace_back(make_unique<UecNIC>(
+                    ix, eventlist, local_linkspeed, 1));
+        }
+    }
+    if (mprail_mode) {
+        cout << "MPRAIL_LOCAL_INJECTION independent=yes speed_gbps="
+             << local_linkspeed / 1000000000
+             << " ports_per_rank=1" << endl;
     }
 
     // used just to print out stats data at the end
@@ -1720,10 +1736,19 @@ int main(int argc, char **argv) {
         if (!mprail_topology) {
             throw logic_error("MpRail route flow requested without MpRail topology");
         }
+        const bool local_flow = mprail_topology->rank_server(src)
+                == mprail_topology->rank_server(dst);
+        UecNIC& source_nic = local_flow
+                ? *mprail_local_nics.at(src) : *nics.at(src);
+        UecNIC& destination_nic = local_flow
+                ? *mprail_local_nics.at(dst) : *nics.at(dst);
+        const uint32_t flow_ports = local_flow ? 1 : ports;
+        const linkspeed_bps flow_linkspeed = local_flow
+                ? local_linkspeed : linkspeed;
         auto* flow_src = new UecSrc(
                 traffic_logger, eventlist,
                 make_uec_multipath(explicit_route != nullptr),
-                *nics.at(src), ports);
+                source_nic, flow_ports);
         if (requested_flow_id.has_value()) {
             flow_src->setFlowId(requested_flow_id.value());
         }
@@ -1736,12 +1761,15 @@ int main(int argc, char **argv) {
         UecSink* flow_sink = nullptr;
         if (receiver_driven) {
             flow_sink = new UecSink(
-                    NULL, pacers.at(dst).get(), *nics.at(dst), ports);
+                    NULL,
+                    local_flow ? mprail_local_pacers.at(dst).get()
+                               : pacers.at(dst).get(),
+                    destination_nic, flow_ports);
         } else {
             flow_sink = new UecSink(
-                    NULL, linkspeed, 1.1,
+                    NULL, flow_linkspeed, 1.1,
                     UecBasePacket::unquantize(UecSink::_credit_per_pull),
-                    eventlist, *nics.at(dst), ports);
+                    eventlist, destination_nic, flow_ports);
         }
         if (requested_flow_id.has_value()) {
             flow_sink->setFlowId(requested_flow_id.value());
@@ -1763,7 +1791,7 @@ int main(int argc, char **argv) {
         if (log_flow_events && event_logger) {
             flow_src->logFlowEvents(*event_logger);
         }
-        if (UecSink::_model_pcie) {
+        if (UecSink::_model_pcie && !local_flow) {
             flow_sink->setPCIeModel(pcie_models.at(dst));
         }
         if (UecSink::_oversubscribed_cc) {
@@ -1778,8 +1806,7 @@ int main(int argc, char **argv) {
         if (sink_logger) {
             sink_logger->monitorSink(flow_sink);
         }
-        if (mprail_topology->rank_server(src)
-                == mprail_topology->rank_server(dst)) {
+        if (local_flow) {
             ++local_flow_count;
         } else {
             ++fabric_flow_count;
@@ -2277,6 +2304,14 @@ int main(int argc, char **argv) {
 
         if (!conn_reuse 
             || (crt->flowid and flowmap.find(crt->flowid) == flowmap.end())) {
+            const bool mprail_local_flow = mprail_topology && local_tray_route;
+            UecNIC& source_nic = mprail_local_flow
+                    ? *mprail_local_nics.at(src) : *nics.at(src);
+            UecNIC& destination_nic = mprail_local_flow
+                    ? *mprail_local_nics.at(dest) : *nics.at(dest);
+            const uint32_t flow_ports = mprail_local_flow ? 1 : ports;
+            const linkspeed_bps flow_linkspeed = mprail_local_flow
+                    ? local_linkspeed : linkspeed;
             unique_ptr<UecMultipath> mp = nullptr;
             if (load_balancing_algo == BITMAP){
                 mp = make_unique<UecMpBitmap>(path_entropy_size, UecSrc::_debug);
@@ -2295,7 +2330,8 @@ int main(int argc, char **argv) {
                 abort();
             }
 
-            uec_src = new UecSrc(traffic_logger, eventlist, move(mp), *nics.at(src), ports);
+            uec_src = new UecSrc(
+                    traffic_logger, eventlist, move(mp), source_nic, flow_ports);
 
             if (crt->flowid) {
                 uec_src->setFlowId(crt->flowid);
@@ -2311,10 +2347,16 @@ int main(int argc, char **argv) {
             }
 
             if (receiver_driven)
-                uec_snk = new UecSink(NULL, pacers[dest].get(), *nics.at(dest),
-                                      ports);
+                uec_snk = new UecSink(
+                        NULL,
+                        mprail_local_flow ? mprail_local_pacers.at(dest).get()
+                                          : pacers.at(dest).get(),
+                        destination_nic, flow_ports);
             else //each connection has its own pacer, so receiver driven mode does not kick in! 
-                uec_snk = new UecSink(NULL,linkspeed,1.1,UecBasePacket::unquantize(UecSink::_credit_per_pull),eventlist,*nics.at(dest), ports);
+                uec_snk = new UecSink(
+                        NULL, flow_linkspeed, 1.1,
+                        UecBasePacket::unquantize(UecSink::_credit_per_pull),
+                        eventlist, destination_nic, flow_ports);
 
             flowmap[uec_src->flowId()] = { uec_src, uec_snk };
 
@@ -2354,7 +2396,7 @@ int main(int argc, char **argv) {
             logfile.writeName(*uec_src);
             uec_snk->setSrc(src);
 
-            if (UecSink::_model_pcie){
+            if (UecSink::_model_pcie && !mprail_local_flow){
                 uec_snk->setPCIeModel(pcie_models[dest]);
             }
                             

@@ -21,9 +21,10 @@ GPU 1  Compute       [Router---]          [Expert------]
 - `Network TX`：该 rank 是逻辑 network task source；
 - `Network RX`：该 rank 是逻辑 network task destination。
 
-`server_forward` 的 `src_relay/dst_relay` 也计入相应 TX/RX lane。由于一个逻辑 task
-可能包含多个串行 subflow，relay lane 首版仍画该 task 的完整 FCT，而不是每个
-subflow 的精确子区间。
+DeepEP/EPLB/MoonEP 的 fabric/local hierarchy leg 已经是独立 task，按各自真实端点
+进入 TX/RX lane。通用 `server_forward` 的 `src_relay/dst_relay` 也会计入相应
+TX/RX lane；由于它仍是一个包含多个串行 subflow 的逻辑 task，relay lane 首版画
+该 task 的完整 FCT，而不是每个 subflow 的精确子区间。
 
 同一时间横坐标下 Compute 与 TX/RX 同时出现，就表示当前 DAG 和 HTSim 执行结果中
 存在计算通信 overlap。
@@ -74,7 +75,8 @@ logical FCT   = DAG_TASK_DONE - DAG_TASK_START
 ```
 
 若 task 使用 `server_forward`，FCT 包含该逻辑 task 的 fabric 和 destination-local
-等全部串行 subflow，bar 不把内部 phase 再拆开。HTML hover 会显示 `route_spec`。
+等全部串行 subflow，bar 不把内部 phase 再拆开。HTML hover 显示 task
+摘要，点击 bar 后的 Task Inspector 会显示完整 `route_spec`。
 
 逐 task CSV 额外给出：
 
@@ -117,14 +119,37 @@ overlap        = intersection(compute_active, network_active)
 
 | 输出 | 用途 |
 |---|---|
-| `dag_gpu_timeline.html` | 自包含交互时间线；Fit/缩放、hover 查看 task、字节、FCT、route 和依赖 |
+| `dag_gpu_timeline.html` | 自包含交互时间线；Fit/缩放、hover 摘要、点击 Inspector 和按需展开依赖 |
 | `dag_task_timeline.csv` | 每个 task 的 start/end/FCT/bytes/logical throughput |
 | `dag_rank_overlap_summary.csv` | 每 GPU compute/network active、overlap、TX/RX 字节 |
 | `dag_timeline_summary.json` | makespan、task 数、payload 字节和统计语义 |
 
-HTML 下方的 `Task details` 默认收起，点击左侧三角后展开逐 task
-明细表。大量 task 在同一 network lane 并发时，bar 可能视觉重合；hover 和
-明细表仍能逐项恢复。可使用 `--ranks` 只观察部分 GPU。
+HTML 下方的 `Task details` 默认收起，只在首次展开时生成逐 task
+明细表。大量 task 在同一 network lane 并发时，bar 可能视觉重合；hover、
+Inspector 和明细表仍能逐项恢复。独立调试时可使用 `--ranks` 只观察部分 GPU；
+统一 EP32 smoke/full 禁止筛选，固定展示 rank 0-31。
+
+### 4.1 HTML 数据组织
+
+timeline 不在每个 SVG bar 中写入一份完整 tooltip。当前数据流为：
+
+```text
+task data:          每个 task 只保存一次
+SVG bar:            data-task-id + lane
+hover:              通过 task_id 动态读取摘要
+click:              固定 Task Inspector
+predecessor expand: 解压 gzip 数据，按 task_id 恢复完整名称
+Task details:       首次展开时从同一份 task data 生成表格
+```
+
+`server_forward` task 即使同时画在 TX/RX/relay lane，也只复用一份 task
+元数据。predecessor 列表使用 task ID 引用并 gzip 内联，不在 HTML 中重复
+数千次长 task key。浏览器需支持标准 `DecompressionStream('gzip')`；当前
+Chrome 和 Firefox 可直接离线打开。
+
+这种组织避免 task metadata 随 lane 数重复膨胀。完整 predecessor 信息仍可在
+Inspector 中按需恢复；文件大小以当次 ZIP 和 task 数为准，不在文档中固化旧的
+局部-rank 样本值。
 
 ## 5. 使用方法
 
@@ -134,10 +159,12 @@ python3 visualization/dag_timeline.py \
   --htsim-log <case-dir>/htsim.log \
   --output-dir <case-dir>/dag_timeline \
   --gpus-per-server 8 \
+  --ranks 0-31 \
   --title "DeepEP EP32 timeline"
 ```
 
-只观察 server 0 和 server 2：
+以下局部筛选只用于独立调试，不得用于统一 EP32 smoke/full 产物。只观察 server 0
+和 server 2：
 
 ```bash
 python3 visualization/dag_timeline.py \
@@ -166,13 +193,27 @@ python3 tests/run_dsv3_2layer_algorithms.py
 python3 tests/run_dsv3_2layer_algorithms.py --full --workers 4
 ```
 
-标准入口生成 `dsv3_algorithm_comparison.html`：NCCL、DeepEP、EPLB 和
-MoonEP 各有一个可折叠区域，页头支持全部展开/收起。每个区域包含该算法
-独立可缩放 timeline、makespan/task/bytes/overlap 摘要，以及同次 HTSim run
-的可折叠 MpRail 链路负载图。
+标准入口在打包阶段临时生成 `dsv3_algorithm_comparison.html`：NCCL、DeepEP、
+EPLB 和 MoonEP 各有一个可折叠区域，页头支持全部展开/收起。每个区域
+包含该算法独立可缩放 timeline、makespan/task/bytes/overlap 摘要，以及同次
+HTSim run 的可折叠 MpRail 链路负载图。四个 timeline 都固定包含 GPU 0-31；
+`selected_ranks` 和 overlap 汇总也必须覆盖全部 32 rank。
 
 合并页通过相对路径引用各算法的 HTML、PNG 和 CSV，不把大文件重复内联到
-一个文件。查看或移动结果时应保留整个 run 目录。
+一个文件。同时生成 `dsv3_visualization_bundle.zip`，其内只包含：
+
+```text
+dsv3_algorithm_comparison.html
+algorithms/<algorithm>/timeline/*
+algorithms/<algorithm>/link_load/*
+```
+
+ZIP 不包含 workload、HTSim log、`htsim.dat` 或原始 `output_metrics`。ZIP 写入并
+校验成功后，runner 立即删除服务器 run 目录中的总览 HTML 和四个 timeline
+HTML；CSV、JSON、PNG、workload 和仿真日志仍按原样保留。因此标准 run 成功后
+服务器目录中应有 `0` 个散装 HTML。
+
+下载 ZIP 后解压，打开根目录的 `dsv3_algorithm_comparison.html` 即可离线查看。
 
 ## 6. 应当观察什么
 
@@ -195,8 +236,8 @@ MoonEP 各有一个可折叠区域，页头支持全部展开/收起。每个区
 - `server_forward` relay 使用现有 TX/RX lane，但首版不拆出 subflow 子区间。
 - 不根据重叠 bar 推导真实 SM occupancy；stream 顺序来自生成器的静态 DAG edges。
 - 不用逻辑 throughput 替代物理链路 sampler。
-- 当前不画 predecessor 箭头；依赖保留在 HTML tooltip 和 task CSV 中，避免 EP32
-  图被大量连线覆盖。
+- 当前不画 predecessor 箭头；完整依赖保留在点击后的 Inspector 和 task
+  CSV 中，避免 EP32 图被大量连线覆盖。
 
 这些边界不妨碍当前目标：观察每个 GPU 的计算、通信、实际持续时间、传输字节和
 二者的 DAG overlap。
@@ -216,6 +257,10 @@ python3 tests/run_dag_timeline_visualization.py
 - GPU0 计算通信 overlap 为 6us；
 - GPU1 计算通信 overlap 为 2us；
 - 不完整日志被拒绝；
-- HTML hover、Fit/缩放控件、动态尺度、可折叠 Task details、逐 task CSV、
+- task data 只内联一份，SVG 不含重复 `<title>`，完整 predecessor gzip 可恢复；
+- HTML hover、点击 Inspector、Fit/缩放控件、动态尺度、可折叠 Task details、逐 task CSV、
   逐 rank CSV 和总览 JSON 完整生成；
-- 两个伪算法 case 能合成可折叠总览页，并引用各自的 timeline 和链路负载图。
+- 两个伪算法 case 能合成可折叠总览页，并生成仅含 timeline 和链路图的
+  可解压 ZIP。
+- EP32 smoke/full 的四个 timeline summary 均报告 `selected_ranks=0..31`，ZIP 内
+  页面可恢复 GPU 00 到 GPU 31，服务器 run 目录不保留散装 HTML。

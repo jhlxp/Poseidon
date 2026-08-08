@@ -23,7 +23,8 @@ struct MpRailTopologyConfig {
     bool packet_spray = false;
 
     linkspeed_bps external_linkspeed = 100000000000ULL;
-    linkspeed_bps local_linkspeed = 3200000000000ULL;
+    // H100 SXM exposes 900 GB/s aggregate bidirectional NVLink bandwidth.
+    linkspeed_bps local_linkspeed = 7200000000000ULL;
     mem_b queue_size = 0;
     bool enable_ecn = false;
     mem_b ecn_threshold = 0;

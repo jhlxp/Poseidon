@@ -22,8 +22,8 @@ rank-direct/no-dedup DAG。NCCL 内部 collective kernel 仍不在仿真范围�
 
 | 能力 | NCCL MoE All-to-All | DeepEP |
 |---|---|---|
-| token hidden payload 去冗余 | 关闭；每条 top-k expert route 都保留一份 payload | 开启；按 destination rank 去重 |
-| 服务器内部 relay forwarding | 不使用 | 使用同 local-index relay，再执行目标端本地转发 |
+| token hidden payload 去冗余 | 关闭；每条 top-k expert route 都保留一份 payload | 先按 destination rank，再按 destination server 去重 |
+| 服务器内部 relay forwarding | 不使用 | Dispatch local fanout；Combine local reduce/gather |
 | fabric 目的端 | 实际 expert 所在 `dst_rank` | 目标服务器的同 local-index relay rank |
 | 非同 local-index 跨服务器传输 | 直接进入跨 rail Leaf-Spine 路径 | 先送同 index relay，避免该次 fabric 跨 rail |
 
@@ -36,7 +36,7 @@ multiplicity，不能把重复 token payload 从字节数中删除。
 去冗余通信属于第一层 MoE 算法基座的公共能力，不应硬编码在 DeepEP builder
 内部。完整公共契约见
 [02_第一层-MoE算法工作负载建模.md](02_第一层-MoE算法工作负载建模.md)，
-目标接口应显式记录：
+共享 rank-level 接口显式记录：
 
 ```text
 TokenPayloadPolicy
@@ -50,7 +50,8 @@ TokenPayloadPolicy
 deduplicate = true
 ```
 
-- DeepEP、MoonEP 以及后续优化算法默认开启 destination-rank 去重。
+- DeepEP、EPLB、MoonEP 默认开启 destination-rank 去重，并在算法 transport 层继续
+  按 destination server 合并 scale-out payload。
 - NCCL 是唯一默认关闭该能力的算法：`deduplicate=false`、scope 为 `none`。
 - emitter 只负责把 planner 给出的 transfer item 降低为 DAG task，不能再次猜测
   或改变去重策略。
@@ -81,7 +82,15 @@ none:
 
 destination_rank:
   同一 src token 发往同一 dst rank 只保留一份 payload
+
+destination_rank_then_server:
+  先保留每个唯一 dst rank payload；RDMA 再对同一 dst server 只发送一份 payload，
+  由显式 local fanout/reduce legs 连接各 execution rank
 ```
+
+`destination_rank_then_server` 是算法 plan/manifest 的组合 scope，不是
+`TokenPayloadPolicy.scope` 的新增枚举值；共享 policy 先完成 rank-level 计划，
+hierarchical transport 再完成 server-level 合并。
 
 去重只改变 payload item 和 `transfer_bytes`，不能改变 expert route 数、expert
 compute FLOP、top-k combine 语义或 routing metadata。
@@ -96,7 +105,7 @@ compute FLOP、top-k combine 语义或 routing metadata。
 dst_rank = placement.expert_rank(expert_id)
 ```
 
-不创建 destination-side relay，也不附加 `server_forward` route。
+不创建 DeepEP hierarchy legs，也不附加 `server_forward` route。
 
 ### 4.2 字节数
 
@@ -131,7 +140,7 @@ NCCL 直接使用 `src_rank -> dst_rank`：
 - 跨服务器且 `src % 8 == dst % 8`：走同 rail L0，不经过 Spine。
 - 跨服务器且 `src % 8 != dst % 8`：走 `src L0 -> L1 Spine -> dst L0`。
 
-第三种路径正是 NCCL 相比 DeepEP relay forwarding 更容易形成 Spine incast 的
+第三种路径正是 NCCL 相比 DeepEP same-index relay hierarchy 更容易形成 Spine incast 的
 来源。NCCL builder 不应附加 `server_forward` route；普通 MpRail 路由根据真实
 端点自然选择 same-rail 或 cross-rail 路径。
 
@@ -159,7 +168,7 @@ combine_route_bytes = H * bytes(combine_dtype)
 ```
 
 相同 `(execution_rank, origin_rank)` 的 route 可以聚合成 chunk flow，但仍按
-route count 计算字节。NCCL combine 不使用 destination-side `server_forward`；
+route count 计算字节。NCCL combine 不使用 DeepEP hierarchy 或 `server_forward`；
 目的端收到全部 top-k partial 后再执行 `combine_reduce` compute task。
 
 ## 7. DAG 依赖
@@ -215,8 +224,10 @@ same_rail_bytes
 cross_rail_bytes
 ```
 
-这样才能直接量化 NCCL 无去冗余和无 relay forwarding 带来的额外字节与 Spine
-流量。
+这样才能直接量化 NCCL 无去冗余和无 relay hierarchy 带来的额外 RDMA 字节与
+Spine 流量。比较时必须分开统计 fabric 与 server-local bytes；DeepEP 显式记录
+local fanout/reduce 后，逻辑总字节可能高于 NCCL，但受 400 Gbps 限制的 fabric
+字节仍会显著减少。
 
 ## 9. 验收测试
 
@@ -226,12 +237,15 @@ cross_rail_bytes
    rank 去重只发送一份。
 2. 一个 token 的 experts 分布在不同目标 rank：NCCL 按每条 route 发送，DeepEP
    按每个 destination rank 发送。
-3. `src=0, dst=8`：跨服务器同 rail，不经过 Spine。
-4. `src=0, dst=9`：跨服务器不同 rail，实际经过 L1 Spine。
-5. NCCL task graph 中不存在 `server_forward` route。
-6. dispatch/combine 总字节严格等于 route multiplicity 乘 dtype payload。
-7. NCCL 与 DeepEP 使用完全相同的 assignments 和 placement 做对照。
-8. 生成的完整 DAG 能在 EP32、plane=1、400 Gbps 专用拓扑上完成。
+3. 一个 token 命中同一服务器的多个 rank：DeepEP fabric 只保留一份 server payload，
+   NCCL 仍按全部 routes 直达真实 rank。
+4. `src=0, dst=8`：跨服务器同 rail，不经过 Spine。
+5. `src=0, dst=9`：跨服务器不同 rail，实际经过 L1 Spine。
+6. NCCL task graph 中不存在 hierarchy leg 或 `server_forward` route。
+7. dispatch/combine 总字节严格等于 route multiplicity 乘 dtype payload。
+8. NCCL 与 DeepEP 使用完全相同的 assignments 和 placement 做对照，并分别比较
+   fabric 与 server-local 字节。
+9. 生成的完整 DAG 能在 EP32、plane=1、400 Gbps 专用拓扑上完成。
 
 ## 10. 不在首版范围
 

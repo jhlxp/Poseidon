@@ -98,10 +98,10 @@ class Suite:
             "-topology", "mprail",
             "-mprail_planes", "1",
             "-mprail_gpus_per_server", "8",
-            "-mprail_l1_eps_per_plane", "8",
+            "-mprail_l1_eps_per_plane", "4",
             "-mprail_l0_l1_links_per_spine", "1",
             "-linkspeed", "400000",
-            "-local_linkspeed", "3200000",
+            "-local_linkspeed", "7200000",
             "-local_latency_ns", "50",
             "-hop_latency", "0.1",
             "-switch_latency", "0.02",
@@ -187,8 +187,8 @@ def validate_explicit_same_server(log: str, returncode: int) -> str:
             "同服务器显式路径未生效")
     require("MPRAIL_L0" not in log and "MPRAIL_L1" not in log,
             "同服务器显式路径进入了交换网络")
-    require("speed_gbps=3200" in log, "同服务器显式路径没有使用本地高速链路")
-    return "rank:0 rank:3 只使用 3200Gbps server-local FullMesh"
+    require("speed_gbps=7200" in log, "同服务器显式路径没有使用 H100 NVLink 速率")
+    return "rank:0 rank:3 只使用 7200Gbps server-local FullMesh"
 
 
 def validate_explicit_same_rail(log: str, returncode: int) -> str:

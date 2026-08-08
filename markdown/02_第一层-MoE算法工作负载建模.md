@@ -194,11 +194,11 @@ output_bytes = H * bytes(combine_dtype)
 
 ### 5.5 Flow 聚合
 
-IR 不为每个 token 创建一个 HTSim flow。经过 `TokenPayloadPolicy` 处理之后，按以下
-key 聚合：
+IR 不为每个 token 创建一个 HTSim flow。NCCL 按真实 rank pair 聚合；DeepEP 类
+算法先形成 rank payload，再形成 server payload。最终 task 的聚合坐标包括：
 
 ```text
-(phase, src_rank, dst_rank, payload_kind, route_spec, chunk_id)
+(phase, hierarchy_leg, src_rank, dst_rank, payload_kind, chunk_id)
 ```
 
 聚合后 `bytes` 是该 key 下所有逻辑 payload 的总和。NCCL 即使把多条 route
@@ -208,19 +208,19 @@ message 数和 aggregated flow 数。
 
 同 rank bypass 不生成 `src_rank == dst_rank` 的 network task，因为当前 DAG 禁止这种输入。本地读写、copy 或 reduce 计入对应 ComputeTask。
 
-## 6. DeepEP 目标端转发
+## 6. DeepEP 分层传输
 
-DeepEP 对去重后的每个 `(src_rank, dst_rank)` chunk 生成一个逻辑 transfer task。
-跨服务器时，task 端点仍写真实 source/destination rank，并附加：
+DeepEP 类算法先按 `(src_rank, token_id, execution_rank)` 去冗余，再按
+`(src_rank, token_id, execution_server)` 合并 scale-out payload。
 
-```text
-server_forward src_relay:<src_rank> dst_relay:<目标服务器中与 src 同 local-index 的 rank>
-```
+Dispatch 显式生成 `src -> same-index relay` 的 `dispatch_fabric`，完成后生成
+`relay -> execution_rank` 的 `dispatch_local` fanout。Combine 先生成
+`execution_rank -> relay` 的 `combine_local_reduce`，对应 partial 完成后再生成
+一条 `relay -> origin` 的 `combine_fabric`。
 
-因为 `src_relay == src_rank`，HTSim 跳过 source-local phase，只执行 fabric flow 和
-可选的 destination-local flow。两个 subflow 严格串行，整个逻辑 task 在最后一个
-subflow 完成后释放 barrier。不同 chunk 是不同逻辑 task，可以相互流水；单条 flow
-内部的 packet progress 不暴露给 DAG。
+每个 leg 是独立 DAG task 和 barrier。DeepEP builder 不附加 `server_forward`；后者
+仅保留为 MpRail 通用源路由功能。不同 chunk 可以流水，单条 flow 内的 packet
+progress 不暴露给 DAG。
 
 ## 7. 冗余专家建模
 
@@ -239,7 +239,7 @@ subflow 完成后释放 barrier。不同 chunk 是不同逻辑 task，可以相�
 - 权重和梯度通信与 token 通信之间的依赖。
 
 因此冗余专家属于 per-server 算法 planner，而不是 emitter 的额外 flag。跨服务器
-token dispatch/combine 使用 DeepEP destination-side forwarding；expert weight
+token dispatch/combine 使用 DeepEP hierarchical transport；expert weight
 prefetch 始终是同服务器 local flow。
 
 ## 8. Compute 固定时长占位
@@ -299,7 +299,7 @@ lowering 需要验证：
 - 无意外的同 rank network task；
 - compute metadata 记录理论 FLOP 数、是否 overlap、可用 SM 和所用峰值；
 - 同一 `(rank, communication_phase_id)` 只预留一次 20 SM；
-- 同一通信 phase 内的 flow/chunk 不互相依赖，保持并行；
+- 同一通信 phase 内的独立 flow/chunk 保持并行；local leg 只依赖对应 fabric leg；
 - 不同通信 phase 在参与 rank 的单一 comm stream 上按序执行；
 - 同一 rank 的 compute task 按 compute stream 顺序执行；
 - compute/communication producer-consumer event 被降低为 predecessor edge；
@@ -310,7 +310,7 @@ lowering 需要验证：
 - 同一个 routing trace 在 NCCL/DeepEP/EPLB/MoonEP 下共享逻辑 expert 选择。
 - 算法输出的 token、weight、grad 字节分项可手算复核。
 - NCCL 保留 top-k route multiplicity，不执行 hidden payload 去冗余。
-- DeepEP 按 destination rank 去重，并为跨服务器 task 使用目标端转发。
+- DeepEP 按 destination rank 和 destination server 两级去重，显式生成 RDMA/NVLink legs。
 - EPLB hierarchical placement 与官方示例一致，稳态不生成 weight migration。
 - MoonEP 在每个 home server 内实现 floor/ceil route balance，padding 单独统计。
 - 输出 `.dag` 能被当前 HTSim 加载并完成。

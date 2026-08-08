@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -223,18 +224,39 @@ def make_uniform_assignments(
     topk: int,
     num_experts: int,
 ) -> tuple[RoutingAssignment, ...]:
+    if topk <= 0 or topk > num_experts:
+        raise ValidationError("topk must be in [1, num_experts]")
+
+    expert_order = list(range(num_experts))
+    random.Random(0).shuffle(expert_order)
     assignments: list[RoutingAssignment] = []
+    global_token_id = 0
     for src_rank, token_count in enumerate(tokens_per_source_rank):
         for token_id in range(token_count):
-            first_expert = (src_rank * max(token_count, 1) + token_id) % num_experts
+            first_slot = (global_token_id * topk) % num_experts
             for slot in range(topk):
                 assignments.append(
                     RoutingAssignment(
                         src_rank=src_rank,
                         token_id=token_id,
                         topk_slot=slot,
-                        expert_id=(first_expert + slot) % num_experts,
+                        expert_id=expert_order[(first_slot + slot) % num_experts],
                         route_weight=1.0 / topk,
                     )
                 )
+            global_token_id += 1
     return tuple(assignments)
+
+
+def make_contiguous_expert_placement(
+    num_experts: int,
+    num_ranks: int,
+) -> tuple[int, ...]:
+    if num_experts <= 0:
+        raise ValidationError("num_experts must be positive")
+    if num_ranks <= 0:
+        raise ValidationError("num_ranks must be positive")
+    return tuple(
+        min(num_ranks - 1, expert_id * num_ranks // num_experts)
+        for expert_id in range(num_experts)
+    )

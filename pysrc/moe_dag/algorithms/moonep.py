@@ -9,11 +9,10 @@ from ..graph import TaskGraph
 from ..schema import MoEInvocation, RoutingAssignment, ValidationError
 from .common import (
     AlgorithmBuildResult,
-    TokenPayload,
-    TokenPayloadPolicy,
-    chunked,
-    destination_forward_route,
-    plan_token_payloads,
+    HierarchicalTransferSummary,
+    build_hierarchical_combine,
+    build_hierarchical_dispatch,
+    plan_hierarchical_token_payloads,
 )
 
 
@@ -261,40 +260,27 @@ class MoonEPBuilder:
                 assignment
             )
 
-        payloads_by_src_execution = plan_token_payloads(
+        payload_plan = plan_hierarchical_token_payloads(
             invocation.sorted_assignments(),
             lambda assignment: plan.execution_rank[self._route_key(assignment)],
-            TokenPayloadPolicy(),
+            placement,
         )
 
         dispatch_arrivals: dict[int, set[str]] = defaultdict(set)
-        for (src, dst), payloads in payloads_by_src_execution.items():
-            if src == dst:
-                continue
-            dst_server = placement.rank_server(dst)
-            for chunk_id, payload_chunk in enumerate(
-                chunked(payloads, self.config.chunk_tokens)
-            ):
-                key = (
-                    f"{invocation.invocation_id}.dispatch."
-                    f"src{src}.dst{dst}.chunk{chunk_id}"
-                )
-                route_spec, relay = destination_forward_route(placement, src, dst)
-                graph.add_transfer(
-                    key,
-                    src,
-                    dst,
-                    len(payload_chunk) * invocation.dispatch_token_bytes,
-                    "dispatch_hidden",
-                    f"{invocation.invocation_id}:dispatch:rank:{src}",
-                    predecessors=planning_keys_by_server[dst_server],
-                    route_spec=route_spec,
-                    chunk_id=chunk_id,
-                    metadata=self._token_transfer_metadata(
-                        payload_chunk, relay, route_spec
-                    ),
-                )
-                dispatch_arrivals[dst].add(key)
+        transfer_summary = HierarchicalTransferSummary()
+        build_hierarchical_dispatch(
+            graph,
+            invocation,
+            payload_plan,
+            algorithm="moonep",
+            chunk_tokens=self.config.chunk_tokens,
+            predecessors_for_server=lambda server: set(
+                planning_keys_by_server[server]
+            ),
+            metadata_sample_limit=self.config.payload_metadata_sample_limit,
+            arrivals=dispatch_arrivals,
+            summary=transfer_summary,
+        )
 
         expert_keys: dict[int, str] = {}
         padded_routes_by_rank: dict[int, int] = {}
@@ -338,34 +324,19 @@ class MoonEPBuilder:
             expert_keys[rank] = key
 
         combine_arrivals: dict[int, set[str]] = defaultdict(set)
-        for (origin, execution_rank), payloads in payloads_by_src_execution.items():
-            if origin == execution_rank:
-                continue
-            for chunk_id, payload_chunk in enumerate(
-                chunked(payloads, self.config.chunk_tokens)
-            ):
-                key = (
-                    f"{invocation.invocation_id}.combine."
-                    f"src{execution_rank}.dst{origin}.chunk{chunk_id}"
-                )
-                route_spec, relay = destination_forward_route(
-                    placement, execution_rank, origin
-                )
-                graph.add_transfer(
-                    key,
-                    execution_rank,
-                    origin,
-                    len(payload_chunk) * invocation.combine_token_bytes,
-                    "combine_partial",
-                    f"{invocation.invocation_id}:combine:rank:{origin}",
-                    predecessors={expert_keys[execution_rank]},
-                    route_spec=route_spec,
-                    chunk_id=chunk_id,
-                    metadata=self._token_transfer_metadata(
-                        payload_chunk, relay, route_spec
-                    ),
-                )
-                combine_arrivals[origin].add(key)
+        local_expert_origins: set[int] = set()
+        build_hierarchical_combine(
+            graph,
+            invocation,
+            payload_plan,
+            expert_keys,
+            algorithm="moonep",
+            chunk_tokens=self.config.chunk_tokens,
+            metadata_sample_limit=self.config.payload_metadata_sample_limit,
+            arrivals=combine_arrivals,
+            local_expert_origins=local_expert_origins,
+            summary=transfer_summary,
+        )
 
         rank_terminals: dict[int, frozenset[str]] = {}
         terminal_keys: set[str] = set()
@@ -373,7 +344,7 @@ class MoonEPBuilder:
             if token_count == 0:
                 continue
             predecessors = set(combine_arrivals[rank])
-            if (rank, rank) in payloads_by_src_execution and rank in expert_keys:
+            if rank in local_expert_origins and rank in expert_keys:
                 predecessors.add(expert_keys[rank])
             key = f"{invocation.invocation_id}.combine_reduce.rank{rank}"
             graph.add_compute(
@@ -395,34 +366,41 @@ class MoonEPBuilder:
 
         created = graph.tasks[before:]
         transfer_bytes: dict[str, int] = defaultdict(int)
-        server_forward_tasks = 0
         for task in created:
             if task.kind != "transfer":
                 continue
             transfer_bytes[task.payload_kind or "unspecified"] += task.transfer_bytes
-            if task.route_spec and task.route_spec.startswith("server_forward "):
-                server_forward_tasks += 1
         return AlgorithmBuildResult(
-            algorithm="moonep_deepep_scaleout_forward",
+            algorithm="moonep_deepep_hierarchical",
             terminal_keys=frozenset(terminal_keys),
             rank_terminal_keys=rank_terminals,
             metadata={
                 "planner": "deterministic_per_server_capacity_balancer_v2",
-                "scale_out_transport": "deepep_destination_forward",
+                "scale_out_transport": "deepep_hierarchical",
                 "replica_scope": "home_server",
                 "replicas_per_rank": self.config.replicas_per_rank,
                 "token_padding": self.config.token_padding,
                 "chunk_tokens": self.config.chunk_tokens,
                 "token_payload_policy": {
                     "deduplicate": True,
-                    "scope": "destination_rank",
+                    "scope": "destination_rank_then_server",
                 },
                 "routes_by_server": plan.routes_by_server,
                 "target_routes_by_rank": plan.target_routes_by_rank,
                 "real_routes_by_rank": plan.real_routes_by_rank,
                 "padded_routes_by_rank": padded_routes_by_rank,
                 "replicas": replica_records,
-                "server_forward_task_count": server_forward_tasks,
+                "route_count": payload_plan.route_count,
+                "unique_token_payload_count": payload_plan.rank_payload_count,
+                "unique_server_payload_count": payload_plan.server_payload_count,
+                "deduplicated_route_count": (
+                    payload_plan.route_count - payload_plan.rank_payload_count
+                ),
+                "scaleout_deduplicated_route_count": (
+                    payload_plan.route_count - payload_plan.server_payload_count
+                ),
+                "server_forward_task_count": 0,
+                "hierarchical_transfer": transfer_summary.manifest(),
                 "expert_weight_prefetch_bytes": transfer_bytes.get(
                     "expert_weight_prefetch", 0
                 ),
@@ -438,29 +416,3 @@ class MoonEPBuilder:
             assignment.token_id,
             assignment.topk_slot,
         )
-
-    def _token_transfer_metadata(
-        self,
-        payloads: tuple[TokenPayload, ...],
-        relay: int | None,
-        route_spec: str | None,
-    ) -> dict[str, object]:
-        sample = payloads[: self.config.payload_metadata_sample_limit]
-        return {
-            "payloads": [
-                {
-                    "src_rank": payload.src_rank,
-                    "token_id": payload.token_id,
-                    "route_count": len(payload.routes),
-                    "topk_slots": [route.topk_slot for route in payload.routes],
-                    "expert_ids": [route.expert_id for route in payload.routes],
-                }
-                for payload in sample
-            ],
-            "payload_count": len(payloads),
-            "payload_sample_count": len(sample),
-            "payload_metadata_truncated": len(sample) < len(payloads),
-            "deduplicated_by_destination_rank": True,
-            "forwarding": "destination" if route_spec else "local",
-            "dst_relay": relay,
-        }

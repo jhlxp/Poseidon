@@ -135,8 +135,8 @@ python3 pysrc/generate_moe_dag.py \
 ## 6. 固定时间的适用边界
 
 模块时间不是跨 shape 通用常数。例如 `expert_ffn` 会受到 token route 数、padding、
-expert placement 和算法影响。一个 DeepEP uniform workload 的固定时间不能直接代表
-MoonEP/EPLB 负载不均衡 workload。
+expert placement 和算法影响。一个 balanced-permuted 基线的固定时间不能直接代表
+MoonEP/EPLB 改变 execution placement 后的负载 shape。
 
 因此每份 JSON 必须准确写 `profile_scope`。以下任一参数改变时，应重新确认或新建
 配置：
@@ -149,7 +149,8 @@ MoonEP/EPLB 负载不均衡 workload。
 
 `H100_DSV3_EP32_compute_4096tpr.json` 服务于正常
 `4096 tokens/rank/microbatch` 的训练/prefill 四算法对比基线。当前固定
-`expert_ffn` 时间按 uniform routing 下每 rank 32768 routes 的平衡参考 shape 计算；
+`expert_ffn` 时间按 balanced-permuted routing 下每 rank 32768 routes 的平衡参考
+shape 计算；
 因此本轮比较主要隔离通信和 planning 差异，不声称已反映算法改变实际
 per-rank expert shape 后的 kernel 时间差异。
 

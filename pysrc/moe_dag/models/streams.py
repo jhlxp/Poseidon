@@ -41,7 +41,7 @@ class TwoStreamScheduleResult:
             "layer_count": self.layer_count,
             "microbatch_group_size": self.microbatch_group_size,
             "microbatch_group_completion": "complete_workload_drain",
-            "schedule_order": "group_then_layer_then_stream_section",
+            "schedule_order": "group_then_layer_wavefront",
             "phase_internal_flows_parallel": True,
             "stream_order_lowering": "predecessor_edges",
             "added_dependencies": self.added_dependencies,
@@ -207,18 +207,37 @@ def apply_double_buffered_two_stream_schedule(
                 for task in tasks:
                     task.metadata["stream_phase_id"] = phase_id
 
-    # One compute stream per rank. Each adjacent microbatch pair drains every layer.
+    # One compute stream per rank. At a layer boundary, MB0 enters the next
+    # layer before MB1's current-layer final, allowing next Attention to
+    # overlap with the tail of MB1 Combine on the communication stream.
     for rank in range(graph.num_ranks):
         compute_order: list[Task] = []
         for pair_start in range(0, len(microbatch_fragments), 2):
-            pair = range(
+            pair = tuple(range(
                 pair_start, min(pair_start + 2, len(microbatch_fragments))
-            )
-            for layer in layer_ids:
-                for section_name in ("front", "expert", "final"):
-                    for micro_batch in pair:
+            ))
+            first_layer = layer_ids[0]
+            for micro_batch in pair:
+                compute_order.extend(
+                    compute_sections[(micro_batch, first_layer)]["front"][rank]
+                )
+            for layer_index, layer in enumerate(layer_ids):
+                for micro_batch in pair:
+                    compute_order.extend(
+                        compute_sections[(micro_batch, layer)]["expert"][rank]
+                    )
+                next_layer = (
+                    layer_ids[layer_index + 1]
+                    if layer_index + 1 < len(layer_ids)
+                    else None
+                )
+                for micro_batch in pair:
+                    compute_order.extend(
+                        compute_sections[(micro_batch, layer)]["final"][rank]
+                    )
+                    if next_layer is not None:
                         compute_order.extend(
-                            compute_sections[(micro_batch, layer)][section_name][rank]
+                            compute_sections[(micro_batch, next_layer)]["front"][rank]
                         )
         for sequence, task in enumerate(compute_order):
             task.metadata["stream_sequence"] = sequence

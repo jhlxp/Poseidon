@@ -277,7 +277,7 @@ MoonEP 改变当前 invocation 每条 token route 的 execution placement。
 - logical expert 可能有多个 physical ranks；
 - replica selector 改变 dispatch 的最终 destination rank；
 - 每 rank 的 route count 和 Expert FFN `compute_us` 随之变化；
-- DeepEP 仍负责去冗余和 destination-side forwarding；
+- DeepEP 仍负责 rank/server 两级去冗余和显式 RDMA/NVLink hierarchy legs；
 - combine 从实际 execution rank 返回 origin rank。
 
 EPLB planner 本身不需要伪造成每个 block 的 compute task。只有研究 planner 开销
@@ -307,7 +307,7 @@ python3 pysrc/generate_moe_dag.py \
 - 未传 loads 时，第一次 invocation 的 route count 作为静态代理，后续 microbatch
   复用同一 placement；
 - runtime selector 固定为确定性 round-robin；
-- token transport 固定复用 DeepEP destination-rank 去重和目标端转发；
+- token transport 固定复用 DeepEP destination-rank/server 两级去冗余和分层传输；
 - 稳态 workload 不生成 planning、weight migration 或 weight prefetch task。
 
 `rebalance_interval`、历史 moving-average 计算器、placement epoch 切换和迁移流尚未

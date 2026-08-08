@@ -168,9 +168,9 @@ void MpRailTopology::connect_endpoints(
         Route* routeback = make_local_route(dst, src, uec_src.getPort(0));
         routeout->set_reverse(routeback);
         routeback->set_reverse(routeout);
-        for (uint32_t plane = 0; plane < _cfg.planes; ++plane) {
-            uec_src.connectPort(plane, *routeout, *routeback, uec_snk, start_time);
-        }
+        // Server-local traffic uses one plane-independent NVLink/NVSwitch
+        // injection resource, not one RDMA NIC port per fabric plane.
+        uec_src.connectPort(0, *routeout, *routeback, uec_snk, start_time);
         cout << "MPRAIL_FLOW flow=" << uec_src.flowId()
              << " src=" << src << " dst=" << dst
              << " scope=same_server plane=-1 spine=-1" << endl;
@@ -333,9 +333,7 @@ void MpRailTopology::connect_explicit_endpoints(
         Route* routeback = make_local_route(dst, src, uec_src.getPort(0));
         routeout->set_reverse(routeback);
         routeback->set_reverse(routeout);
-        for (uint32_t port = 0; port < _cfg.planes; ++port) {
-            uec_src.connectPort(port, *routeout, *routeback, uec_snk, start_time);
-        }
+        uec_src.connectPort(0, *routeout, *routeback, uec_snk, start_time);
         cout << "MPRAIL_EXPLICIT_FLOW flow=" << uec_src.flowId()
              << " src=" << src << " dst=" << dst
              << " path=" << mprail_route_spec_to_string(route) << endl;

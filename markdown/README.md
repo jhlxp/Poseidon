@@ -10,7 +10,7 @@
 | [02_第一层-MoE算法工作负载建模.md](02_第一层-MoE算法工作负载建模.md) | 共享 MoE IR、算法插件、payload 去冗余策略、字节核算和 barrier 映射 |
 | [03_第二层-模型到DAG生成.md](03_第二层-模型到DAG生成.md) | Transformer block、router、多层 workload，以及理论公式/JSON 固定计算时间 |
 | [04_算法建模-NCCL.md](04_算法建模-NCCL.md) | NCCL MoE All-to-Allv、无 payload 去冗余、真实目标 rank 直达和验收边界 |
-| [05_算法建模-DeepEP.md](05_算法建模-DeepEP.md) | 训练/prefill 的 destination-rank 去重和目标端两段转发 |
+| [05_算法建模-DeepEP.md](05_算法建模-DeepEP.md) | 训练/prefill 的 rank/server 两级去冗余及显式 RDMA/NVLink hierarchy legs |
 | [06_算法建模-EPLB.md](06_算法建模-EPLB.md) | estimated load、hierarchical expert replication/placement 和 placement epoch 边界 |
 | [07_算法建模-MoonEP.md](07_算法建模-MoonEP.md) | per-server 动态 expert replica、权重预取和 DeepEP scale-out 组合 |
 | [08_MpRail拓扑开发文档.md](08_MpRail拓扑开发文档.md) | 拓扑定义、端口模型、路由、配置和开发边界 |
@@ -18,8 +18,8 @@
 | [10_MpRail源路由与服务器转发.md](10_MpRail源路由与服务器转发.md) | CM/DAG 显式路径、服务器内部 relay 转发、校验与完成语义 |
 | [11_测试与日志规范.md](11_测试与日志规范.md) | Python 功能测试分类及 `test_logs/` 产物结构 |
 | [12_MpRail链路负载可视化.md](12_MpRail链路负载可视化.md) | link-load 采样、七面板吞吐图、坐标解析和统计口径 |
-| [13_专用测试拓扑-EP32-1Plane.md](13_专用测试拓扑-EP32-1Plane.md) | 32 GPU 单 plane 拓扑及 DSV3 两层四算法 smoke/full 测试 |
-| [14_DAG执行时间线可视化.md](14_DAG执行时间线可视化.md) | 可缩放每 GPU Compute/TX/RX timeline、折叠明细和四算法合并页 |
+| [13_专用测试拓扑-EP32-1Plane.md](13_专用测试拓扑-EP32-1Plane.md) | 32 GPU、8 Leaf/4 Spine 单 plane 拓扑及 DSV3 两层四算法 smoke/full 测试 |
+| [14_DAG执行时间线可视化.md](14_DAG执行时间线可视化.md) | 覆盖 GPU 0-31 的可缩放 Compute/TX/RX timeline、折叠明细和四算法合并页 |
 | [15_计算时间JSON配置.md](15_计算时间JSON配置.md) | 模块级 theoretical/profiled 固定时间、二选一规则、文件格式和适用边界 |
 
 ## 仿真器的两种输入模式
@@ -42,7 +42,7 @@ GPU -> server-local FullMesh -> plane-specific L0-EPS
     -> same-plane L1-EPS -> destination L0-EPS -> GPU
 ```
 
-- 统一测试目标为 1 个 plane、8 条 rail、8 台 L0 Leaf 和 8 台 L1 Spine。
+- 统一测试目标为 1 个 plane、8 条 rail、8 台 L0 Leaf 和 4 台 L1 Spine。
 - rail 由 GPU 在服务器内的 local index 定义；4 台 8-GPU server 时每条 rail 挂 4 张 GPU。
 - 每张 GPU 只有一条 400 Gbps RDMA fabric 链路。
 - `plane=1` 仅是测试基准；仿真器支持最多 8 个完全独立的并行 scale-out plane。
@@ -72,7 +72,9 @@ python3 pysrc/generate_moe_dag.py \
 不能配置为其他数量。`micro_batches=N` 按 `(MB0, MB1)`、`(MB2, MB3)` 依次分组，
 前一组完成生成范围内的完整 workload 后下一组才启动，组间不 overlap，奇数尾项
 单独成组。完整 DSV3 workload 中，这意味着每组两个 microbatch 走完全部 DSV3 层
-后才进入下一组。stream 顺序最终表现为普通 predecessor barriers。生成器功能与
+后才进入下一组。组内多层使用 wavefront，允许 `Layer N+1 / MB0 Attention`
+与 `Layer N / MB1 Combine` 重叠；同 MB 数据依赖和两条 stream 各自串行不变。
+stream 顺序最终表现为普通 predecessor barriers。生成器功能与
 HTSim 集成测试运行：
 
 EPLB 稳态 workload 示例：
@@ -128,7 +130,9 @@ python3 tests/run_dsv3_2layer_algorithms.py --full --workers 4
 该入口固定使用两个代表性 DSV3 MoE layer、两个 microbatch、
 NCCL/DeepEP/EPLB/MoonEP 和 EP32 单 plane/400 Gbps 拓扑。默认为
 `2 tokens/rank/microbatch` smoke；`--full` 才是 `4096 tokens/rank/microbatch`。
-每个算法都同时生成可缩放 HTML timeline 和 MpRail 链路负载图，最终组合到
-一个可折叠 `dsv3_algorithm_comparison.html` 入口。参数、边界和验收条件见
+每个算法都为 GPU 0-31 生成完整可缩放 timeline 和 MpRail 链路负载图，最终组合到
+ZIP 内的可折叠 `dsv3_algorithm_comparison.html` 入口，并生成不含仿真大文件的
+`dsv3_visualization_bundle.zip` 供下载。ZIP 成功后服务器 run 目录不保留散装
+HTML，其他产物仍保留。参数、边界和验收条件见
 [13_专用测试拓扑-EP32-1Plane.md](13_专用测试拓扑-EP32-1Plane.md)，计算时间选择见
 [15_计算时间JSON配置.md](15_计算时间JSON配置.md)。

@@ -17,8 +17,11 @@
 并支持多个 microbatch 和跨层依赖。当前不是下面完整算子清单的逐 kernel 实现：
 norm、RoPE、residual、shared expert、TP/PP 和 backward 仍是后续范围。
 
-当前合成 routing 为确定性的 uniform assignment。真实 trace、Zipf/hot-expert
-provider 尚未接入 CLI；第一层 API 可以直接传入完整 `RoutingAssignment`。
+当前内置合成 routing 是 `balanced_permuted_deterministic`：固定 seed 0 打散
+expert index，再按 TopK 分组循环。它保证 expert route 总量严格均衡，同时允许同一
+token 的多个 expert 落到同 rank 或同 server，从而能够验证 DeepEP 两级去冗余。
+真实 trace、Zipf/hot-expert provider 尚未接入 CLI；第一层 API 可以直接传入完整
+`RoutingAssignment`。
 
 ## 2. 模型规格
 
@@ -152,7 +155,8 @@ tokens_per_rank_per_microbatch = 4096
 
 ## 5. Router 输入来源
 
-支持三类 routing provider：
+模型层把 routing provider 分成以下三类；当前 CLI 只内置第 5.2 节中的
+balanced-permuted 功能基线：
 
 ### 5.1 Trace
 
@@ -166,8 +170,9 @@ tokens_per_rank_per_microbatch = 4096
 
 ### 5.2 合成分布
 
-用于功能测试和参数扫描：
+规划用于功能测试和参数扫描的合成分布包括：
 
+- balanced-permuted deterministic（当前已实现，seed 0）；
 - perfectly balanced；
 - uniform random；
 - Zipf/skew；
@@ -250,7 +255,7 @@ overlap SM 比例二次缩放。完整格式、模块名和失败规则见
 只有模型计算 FLOP 进入 `compute_us`。以下时间不加入 compute task：
 
 - HTSim 已经仿真的 network task FCT；
-- `server_forward` 的网络和本地 flow 时间；
+- DeepEP hierarchy legs 或通用 `server_forward` 的网络/本地 flow 时间；
 - 等待 predecessor barrier 的时间。
 
 profiling 时间不能包含 RDMA/NVLink 等待，否则会与 HTSim network FCT 重复计算。
@@ -297,6 +302,16 @@ Overlap:             D0 || A1
 每个 rank 的 communication phase 严格串行；一个 phase 内拆出的多条 flow/chunk
 仍并行。通信 phase 的完成 event 连接到真正消费数据的 Expert/Reduce，独立 compute
 不等待通信。
+
+当 `num_layers > 1` 时，compute stream 在层边界使用 wavefront：
+
+```text
+L0 Final0 -> L1 Attention0/Router0 -> L0 Final1 -> L1 Attention1/Router1
+```
+
+`L1 Attention0` 只保留 `L0 Final0` 的真实同 microbatch 数据依赖，不再等待
+`L0 Final1`。这使 `L1 MB0 Attention || L0 MB1 Combine` 成为合法跨层
+overlap。单 compute stream 和单 communication stream 的各自串行约束不变。
 
 `micro_batches=N` 不表示同时展开 N 路流水线，而是按相邻两个进行 double-buffer
 分组：
@@ -375,34 +390,38 @@ global_task_key = (iteration, microbatch, pipeline_stage, layer, op, rank, shard
 - 同一 rank、同一逻辑通信 phase 的多条 flow 只计一次 20 SM；
 - 同一 rank 的 compute stream 不存在 task overlap；
 - 同一 rank 的 communication phase 不存在 phase overlap；
-- 同一 phase 内多个 flow 保持并行；
+- 同一 phase 内独立 flow 保持并行；DeepEP local leg 只等待对应 fabric leg；
 - double-buffer schedule 保留四个预期 compute/communication overlap 窗口；
+- 多层 schedule 保留 `Layer N+1 / MB0 Attention || Layer N / MB1 Combine`
+  跨层 overlap；
+- 下一层 MB0 Attention 不得依赖上一层 MB1 Final；
 - task graph 无环；
 - HTSim barrier 映射没有未声明的交叉等待或保守串行化；
 - 最终 `.dag` 能通过 parser dry-run。
 
 ## 11. 首版示例目标
 
-第一个端到端对比配置建议固定为：
+统一端到端对比配置固定为：
 
 ```text
-1 transformer block
+2 representative DSV3 MoE layers
 prefill forward
-TP=1, PP=1, EP=8
-1 server x 8 GPUs
-每 rank 4096 tokens
-H=7168, top-k=8
-固定 expert placement
-可重放的 synthetic router assignment
+TP=1, PP=1, EP=32
+4 servers x 8 GPUs
+2 microbatches
+每 rank 每 microbatch 4096 tokens（smoke 为 2）
+H=7168, E=256, top-k=8
+连续 expert placement
+seed 0 的 balanced-permuted router assignment
 NCCL、DeepEP、EPLB 与 MoonEP 四种输出
 ```
 
-这个目标用于同条件比较节点内专家通信、负载不均衡和算法差异。跨服务器对比统一
-使用 EP32、4 servers x 8 GPUs、plane=1 的专用测试拓扑：NCCL 验证 rank-direct
-All-to-All 和 Spine 流量，DeepEP 验证 destination-rank 去重与目标端 forwarding，
-EPLB 验证持久 hierarchical placement 和稳态 DeepEP transport，MoonEP 在每个
-expert home server 内独立规划 replica，并复用 DeepEP 跨服务器 transport。该
-MoonEP 组合是本项目的核心算法抽象，不声称官方实现提供多节点 RDMA。
+该配置使用 plane=1、8 Leaf、4 Spine、400 Gbps RDMA 的专用测试拓扑。NCCL 验证
+rank-direct All-to-All 和 Spine 流量；DeepEP 验证 rank/server 两级去冗余以及显式
+RDMA/NVLink hierarchy legs；EPLB 验证持久 hierarchical placement 和稳态 DeepEP
+transport；MoonEP 在每个 expert home server 内独立规划 replica，并复用 DeepEP
+跨服务器 transport。该 MoonEP 组合是本项目的核心算法抽象，不声称官方实现提供
+多节点 RDMA。
 
 ## 12. 硬件规格来源
 

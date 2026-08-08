@@ -10,6 +10,7 @@ from moe_dag import (
     Placement,
     ValidationError,
     emit_workload,
+    make_contiguous_expert_placement,
 )
 from moe_dag.models import TransformerWorkloadConfig, build_transformer_workload
 
@@ -89,8 +90,9 @@ def main() -> int:
         placement = Placement(
             num_ranks=args.num_ranks,
             gpus_per_server=args.gpus_per_server,
-            expert_to_rank=tuple(
-                expert % args.num_ranks for expert in range(args.num_experts)
+            expert_to_rank=make_contiguous_expert_placement(
+                args.num_experts,
+                args.num_ranks,
             ),
         )
         model = ModelSpec(

@@ -77,6 +77,46 @@ def fixed_compute(duration_us: float) -> ComputeEstimate:
     )
 
 
+class FixedOperationCostModel:
+    communication_sms = 20
+    total_sms = 132
+
+    _durations_us = {
+        "attention": 10.0,
+        "router_projection": 1.0,
+        "expert_ffn": 5.0,
+        "combine_reduce": 0.01,
+        "combine_final_reduce": 0.01,
+        "per_server_planning_proxy": 0.5,
+    }
+
+    def estimate(
+        self,
+        operation_flops: int,
+        *,
+        operation: str,
+        overlaps_communication: bool = False,
+    ) -> ComputeEstimate:
+        duration_us = self._durations_us[operation]
+        available_sms = 112 if overlaps_communication else 132
+        return ComputeEstimate(
+            operation_flops=operation_flops,
+            duration_us=duration_us,
+            overlaps_communication=overlaps_communication,
+            available_sms=available_sms,
+            peak_flops_per_second=operation_flops / duration_us * 1e6,
+            source=f"test_fixed_operation:{operation}",
+        )
+
+    def manifest(self) -> dict[str, object]:
+        return {
+            "model": "test_fixed_operation_duration",
+            "communication_sms": self.communication_sms,
+            "total_sms": self.total_sms,
+            "durations_us": self._durations_us,
+        }
+
+
 class Suite:
     def __init__(self, run_dir: Path) -> None:
         self.run_dir = run_dir
@@ -281,8 +321,12 @@ def eplb_case(run_dir: Path) -> str:
         not any(task.payload_kind == "expert_weight_prefetch" for task in graph.tasks),
         "稳态 EPLB 不应生成 MoonEP invocation-level prefetch",
     )
-    require(result.metadata["server_forward_task_count"] > 0,
-            "EPLB 跨服务器 token flow 没有复用 DeepEP 目标端转发")
+    require(
+        result.metadata["hierarchical_transfer"]["task_count_by_leg"].get(
+            "dispatch_fabric", 0
+        ) > 0,
+        "EPLB 跨服务器 token flow 没有复用 DeepEP 分层传输",
+    )
 
     deepep_graph = TaskGraph("eplb_baseline_deepep", 32)
     deepep_result = DeepEPBuilder(
@@ -299,9 +343,10 @@ def eplb_case(run_dir: Path) -> str:
         "EPLB placement 没有降低该测试快照的最大 rank route count",
     )
     require(
-        result.metadata["unique_token_payload_count"]
-        == deepep_result.metadata["unique_token_payload_count"],
-        "EPLB 与 DeepEP 的 destination-rank 去重口径不一致",
+        result.metadata["route_count"]
+        >= result.metadata["unique_token_payload_count"]
+        >= result.metadata["unique_server_payload_count"],
+        "EPLB 分层去冗余计数关系错误",
     )
 
     emit_workload(
@@ -309,15 +354,15 @@ def eplb_case(run_dir: Path) -> str:
         run_dir / "generated" / "eplb_deepep_steady_state",
         metadata=result.metadata,
     )
-    return "热点 rank routes 从 16 降至 3；稳态无迁移，并复用 DeepEP 去重/目标端转发"
+    return "热点 rank routes 从 16 降至 3；稳态无迁移，并复用 DeepEP 分层去冗余"
 
 
 def deepep_destination_forward_case(run_dir: Path) -> str:
-    placement = Placement(32, 8, (9, 9))
+    placement = Placement(32, 8, (9, 9, 10))
     assignments = tuple(
         RoutingAssignment(0, token, slot, slot)
         for token in range(3)
-        for slot in range(2)
+        for slot in range(3)
     )
     invocation = MoEInvocation(
         "deepep_exact",
@@ -325,7 +370,7 @@ def deepep_destination_forward_case(run_dir: Path) -> str:
         (3,) + (0,) * 31,
         128,
         256,
-        2,
+        3,
         "fp8",
         "bf16",
         "bf16",
@@ -344,40 +389,61 @@ def deepep_destination_forward_case(run_dir: Path) -> str:
     combine = [
         task for task in tasks if task.payload_kind == "combine_partial"
     ]
-    require(len(dispatch) == 3, "3 tokens 应生成 3 个 dispatch chunks")
-    require(len(combine) == 3, "3 tokens 应生成 3 个 combine chunks")
+    legs = result.metadata["hierarchical_transfer"]["task_count_by_leg"]
+    require(legs["dispatch_fabric"] == 3, "每 token 应只有一条 dispatch RDMA")
+    require(legs["dispatch_local"] == 6, "dispatch 本地 fanout 数量错误")
+    require(legs["combine_local_reduce"] == 6, "combine 本地汇聚数量错误")
+    require(legs["combine_fabric"] == 3, "每 token 应只有一条 combine RDMA")
+    require(len(dispatch) == 9, "dispatch 分层 task 数量错误")
+    require(len(combine) == 9, "combine 分层 task 数量错误")
     require(
-        sum(task.transfer_bytes for task in dispatch) == 3 * 128,
-        "同一 token 在目标 rank 选择两个 expert 时 dispatch payload 被重复",
+        sum(
+            task.transfer_bytes
+            for task in dispatch
+            if task.metadata["hierarchical_leg"] == "dispatch_fabric"
+        ) == 3 * 128,
+        "跨机 dispatch 没有按目标服务器去冗余",
     )
     require(
-        sum(task.transfer_bytes for task in combine) == 3 * 128 * 2,
-        "combine partial 字节错误",
+        sum(
+            task.transfer_bytes
+            for task in combine
+            if task.metadata["hierarchical_leg"] == "combine_fabric"
+        ) == 3 * 128 * 2,
+        "跨机 combine 没有先在专家服务器内汇聚",
     )
     require(
         all(
             task.src_rank == 0
-            and task.dst_rank == 9
-            and task.route_spec == "server_forward src_relay:0 dst_relay:8"
+            and task.dst_rank == 8
+            and task.route_spec is None
             for task in dispatch
+            if task.metadata["hierarchical_leg"] == "dispatch_fabric"
         ),
-        "dispatch 没有使用真实端点和目标侧同 index relay",
+        "dispatch RDMA 没有到达同 index relay rank 8",
     )
     require(
         all(
-            task.src_rank == 9
+            task.src_rank == 8
             and task.dst_rank == 0
-            and task.route_spec == "server_forward src_relay:9 dst_relay:1"
+            and task.route_spec is None
             for task in combine
+            if task.metadata["hierarchical_leg"] == "combine_fabric"
         ),
-        "combine 没有使用反向目标侧转发",
+        "combine RDMA 没有从专家服务器 relay 返回 origin",
     )
-    expert = graph.task("deepep_exact.expert.rank9")
-    require(expert.metadata["real_token_routes"] == 6, "去重错误减少了 expert routes")
-    require(result.metadata["route_count"] == 6, "route_count 汇总错误")
-    require(result.metadata["unique_token_payload_count"] == 3, "payload 去重汇总错误")
+    require(
+        graph.task("deepep_exact.expert.rank9").metadata["real_token_routes"] == 6
+        and graph.task("deepep_exact.expert.rank10").metadata["real_token_routes"] == 3,
+        "去冗余错误减少了 expert route 计算",
+    )
+    require(result.metadata["route_count"] == 9, "route_count 汇总错误")
+    require(result.metadata["unique_token_payload_count"] == 6, "rank payload 汇总错误")
+    require(result.metadata["unique_server_payload_count"] == 3,
+            "server payload 汇总错误")
     require(result.metadata["deduplicated_route_count"] == 3, "去重 route 汇总错误")
-    require(result.metadata["server_forward_task_count"] == 6, "转发 task 汇总错误")
+    require(result.metadata["scaleout_deduplicated_route_count"] == 6,
+            "scale-out 去冗余汇总错误")
 
     emitted = emit_workload(
         graph,
@@ -386,11 +452,8 @@ def deepep_destination_forward_case(run_dir: Path) -> str:
     )
     require(emitted.dag_path.exists(), "DeepEP DAG 未生成")
     dag = emitted.dag_path.read_text(encoding="utf-8")
-    require(dag.count("server_forward src_relay:0 dst_relay:8") == 3,
-            "DAG dispatch route 数量错误")
-    require(dag.count("server_forward src_relay:9 dst_relay:1") == 3,
-            "DAG combine route 数量错误")
-    return "destination-rank 去重保留 6 expert routes；6 个跨服 task 均使用目标端转发"
+    require("server_forward" not in dag, "分层 task 不应再封装 server_forward")
+    return "9 expert routes -> 6 rank payloads -> 3 scale-out payloads；combine 先本地汇聚"
 
 
 def deepep_cli_case(run_dir: Path) -> str:
@@ -435,15 +498,17 @@ def deepep_cli_case(run_dir: Path) -> str:
     }
     require(payloads == {"dispatch_hidden", "combine_partial"},
             f"DeepEP 出现非核心 payload: {sorted(payloads)}")
+    hierarchical_legs = {
+        task["metadata"].get("hierarchical_leg")
+        for task in task_map["tasks"]
+        if task["kind"] == "transfer"
+    }
     require(
-        any(
-            task["route_spec"] and task["route_spec"].startswith("server_forward ")
-            for task in task_map["tasks"]
-            if task["kind"] == "transfer"
-        ),
-        "CLI 生成物没有目标端转发 route",
+        {"dispatch_fabric", "dispatch_local", "combine_local_reduce", "combine_fabric"}
+        <= hierarchical_legs,
+        "CLI 生成物缺少 DeepEP 分层传输 leg",
     )
-    return "CLI 生成 DeepEP 核心 workload，并输出 destination-side server_forward"
+    return "CLI 生成 DeepEP 核心 workload，并输出显式 RDMA/NVLink 分层 task"
 
 
 def algorithm_cli_case(run_dir: Path) -> str:
@@ -675,12 +740,17 @@ def moonep_scaleout_case(run_dir: Path) -> str:
         for task in graph.tasks
         if task.payload_kind in {"dispatch_hidden", "combine_partial"}
     ]
-    require(len(token_flows) == 32, "MoonEP token dispatch/combine flow 数量错误")
-    require(all(task.route_spec and task.route_spec.startswith("server_forward ")
-                for task in token_flows),
-            "MoonEP 跨服务器 token flow 没有复用 DeepEP transport")
-    require(result.metadata["server_forward_task_count"] == 32,
-            "MoonEP server_forward task 汇总错误")
+    leg_counts = result.metadata["hierarchical_transfer"]["task_count_by_leg"]
+    require(
+        len(token_flows) == sum(leg_counts.values()),
+        "MoonEP 分层 token flow 数量错误",
+    )
+    require(all(task.route_spec is None for task in token_flows),
+            "MoonEP 分层 token flow 错误封装为 server_forward")
+    require(leg_counts.get("dispatch_fabric", 0) > 0,
+            "MoonEP 缺少 DeepEP dispatch RDMA")
+    require(leg_counts.get("combine_fabric", 0) > 0,
+            "MoonEP 缺少 DeepEP combine RDMA")
     require(
         graph.task("moonep_scaleout.expert.rank8").duration_us
         > graph.task("moonep_scaleout.expert.rank16").duration_us,
@@ -692,9 +762,9 @@ def moonep_scaleout_case(run_dir: Path) -> str:
         run_dir / "generated" / "moonep_deepep_scaleout",
         metadata=result.metadata,
     )
-    require(emitted.dag_path.read_text(encoding="utf-8").count("server_forward") == 32,
-            "MoonEP DAG 的 DeepEP route 数量错误")
-    return "server1 每 rank 2 routes、server2 每 rank 1 route；14 个本地 replica flows、32 个 DeepEP token flows"
+    require("server_forward" not in emitted.dag_path.read_text(encoding="utf-8"),
+            "MoonEP DAG 错误保留 server_forward 封装")
+    return "server1 每 rank 2 routes、server2 每 rank 1 route；14 个本地 replica flows，并复用 DeepEP 分层传输"
 
 
 def model_pipeline_case(run_dir: Path) -> str:
@@ -741,7 +811,8 @@ def model_pipeline_case(run_dir: Path) -> str:
     dispatch_1 = next(
         task
         for task in result.graph.tasks
-        if task.key.startswith("mb1.moe.dispatch.src0.dst1")
+        if task.key.startswith("mb1.moe.dispatch")
+        and task.src_rank == 0
     )
     require(
         any(key.startswith("mb0.moe.dispatch") for key in dispatch_1.predecessors),
@@ -788,10 +859,19 @@ def model_pipeline_case(run_dir: Path) -> str:
     ]
     require(len(dispatch_phase) > 1, "Dispatch 1 没有多个并行 flow")
     dispatch_keys = {task.key for task in dispatch_phase}
-    require(
-        all(not (task.predecessors & dispatch_keys) for task in dispatch_phase),
-        "同一 Dispatch phase 内的 flow 被错误串行化",
-    )
+    for task in dispatch_phase:
+        intra_phase = task.predecessors & dispatch_keys
+        if task.metadata.get("hierarchical_leg") == "dispatch_local":
+            require(
+                all(
+                    result.graph.task(key).metadata.get("hierarchical_leg")
+                    == "dispatch_fabric"
+                    for key in intra_phase
+                ),
+                "dispatch local leg 存在非 fabric 的错误串行依赖",
+            )
+        else:
+            require(not intra_phase, "独立 dispatch flow 被错误串行化")
     emitted = emit_workload(
         result.graph,
         run_dir / "generated" / "two_microbatch_block",
@@ -811,7 +891,7 @@ def model_pipeline_case(run_dir: Path) -> str:
         == {"compute", "communication"},
         "task_map 没有明确两类 logical stream",
     )
-    return "每 GPU 一条 compute/comm stream；D0||A1、D1||E0、C0||E1，phase 内 flow 并行"
+    return "每 GPU 一条 compute/comm stream；D0||A1、D1||E0、C0||E1，独立 flow 并行"
 
 
 def relay_stream_participant_case() -> str:
@@ -840,15 +920,24 @@ def relay_stream_participant_case() -> str:
         task
         for task in result.graph.tasks
         if task.key.startswith("mb0.moe.dispatch")
-        and task.route_spec
-        and task.metadata.get("dst_relay") != task.dst_rank
+        and task.metadata.get("hierarchical_leg") == "dispatch_local"
+        and isinstance(task.metadata.get("relay_rank"), int)
+        and task.metadata.get("relay_rank") != task.dst_rank
     )
-    relay = dispatch_0.metadata["dst_relay"]
-    require(isinstance(relay, int), "server_forward 缺少 dst relay")
-    expert = result.graph.task(f"mb0.moe.expert.rank{relay}")
+    relay = dispatch_0.metadata["relay_rank"]
+    require(isinstance(relay, int), "dispatch local leg 缺少 relay rank")
+    require(
+        any(
+            result.graph.task(key).metadata.get("hierarchical_leg")
+            == "dispatch_fabric"
+            for key in dispatch_0.predecessors
+        ),
+        "dispatch local leg 没有等待对应 fabric leg",
+    )
+    expert = result.graph.task(f"mb0.moe.expert.rank{dispatch_0.dst_rank}")
     require(
         dispatch_0.key in expert.predecessors,
-        "relay GPU 的 Expert 没有等待其 Dispatch communication phase",
+        "目标 GPU 的 Expert 没有等待其 Dispatch local leg",
     )
     dispatch_1 = next(
         task
@@ -857,14 +946,14 @@ def relay_stream_participant_case() -> str:
         and (
             task.src_rank == relay
             or task.dst_rank == relay
-            or task.metadata.get("dst_relay") == relay
+            or task.metadata.get("relay_rank") == relay
         )
     )
     require(
         dispatch_0.key in dispatch_1.predecessors,
         "relay GPU 的 comm stream 没有串行两个 Dispatch phase",
     )
-    return f"dst relay GPU{relay} 被计入 compute/comm event 和 phase stream tail"
+    return f"relay GPU{relay} 的显式 fabric/local legs 被计入 communication stream"
 
 
 def multi_layer_group_schedule_case() -> str:
@@ -900,6 +989,11 @@ def multi_layer_group_schedule_case() -> str:
         "stream schedule 没有记录两层 lowering",
     )
     require(
+        result.metadata["stream_schedule"]["schedule_order"]
+        == "group_then_layer_wavefront",
+        "stream schedule 没有使用跨层 wavefront",
+    )
+    require(
         len(result.metadata["micro_batch_algorithms"]) == 8,
         "4 microbatch x 2 layer 应产生 8 次 MoE invocation",
     )
@@ -908,6 +1002,27 @@ def multi_layer_group_schedule_case() -> str:
     require(
         "mb0.layer0.moe.combine_reduce.rank0" in layer1_attention.predecessors,
         "第二层 Attention 没有等待同 microbatch 第一层输出",
+    )
+    require(
+        "mb1.layer0.moe.combine_reduce.rank0"
+        not in layer1_attention.predecessors,
+        "MB0 第二层 Attention 错误等待 MB1 第一层尾部",
+    )
+    rank0_compute = sorted(
+        (task for task in graph.tasks if task.rank == 0),
+        key=lambda task: task.metadata["stream_sequence"],
+    )
+    rank0_order = [task.key for task in rank0_compute]
+    wavefront = (
+        "mb0.layer0.moe.combine_reduce.rank0",
+        "mb0.layer1.attention.rank0",
+        "mb1.layer0.moe.combine_reduce.rank0",
+        "mb1.layer1.attention.rank0",
+    )
+    require(
+        [rank0_order.index(key) for key in wavefront]
+        == sorted(rank0_order.index(key) for key in wavefront),
+        "compute stream 跨层 wavefront 顺序错误",
     )
     next_group = graph.task("mb2.layer0.attention.rank0")
     previous_group_terminals = {
@@ -937,7 +1052,10 @@ def multi_layer_group_schedule_case() -> str:
         and "mb1.layer1.combine" in layer_phase_ids,
         "多层 communication phase ID 缺少 layer 坐标",
     )
-    return "2 层 x 4 microbatch 按 pair 分组；跨层依赖和组间全局 drain 正确"
+    return (
+        "2 层 x 4 microbatch 按 pair 分组；同 MB 跨层依赖、"
+        "MB0 wavefront 和组间全局 drain 正确"
+    )
 
 
 def build_simulator(run_dir: Path) -> None:
@@ -973,10 +1091,10 @@ def execute_htsim(
         "-topology", "mprail",
         "-mprail_planes", "1",
         "-mprail_gpus_per_server", "8",
-        "-mprail_l1_eps_per_plane", "8",
+        "-mprail_l1_eps_per_plane", "4",
         "-mprail_l0_l1_links_per_spine", "1",
         "-linkspeed", "400000",
-        "-local_linkspeed", "3200000",
+        "-local_linkspeed", "7200000",
         "-local_latency_ns", "50",
         "-hop_latency", "0.1",
         "-switch_latency", "0.02",
@@ -1144,9 +1262,130 @@ def htsim_two_stream_model_case(run_dir: Path) -> str:
     )
 
 
+def htsim_cross_layer_wavefront_case(run_dir: Path) -> str:
+    generated = run_dir / "generated" / "two_layer_wavefront"
+    model = ModelSpec(
+        name="two_layer_wavefront",
+        hidden=128,
+        ffn_hidden=256,
+        num_attention_heads=1,
+        num_kv_heads=1,
+        head_dim=128,
+        num_experts=16,
+        topk=2,
+        sequence_length=16,
+        num_layers=2,
+        micro_batches=2,
+    )
+    result = build_transformer_workload(
+        TransformerWorkloadConfig(
+            model=model,
+            placement=Placement(16, 8, tuple(range(16))),
+            tokens_per_rank=16,
+            algorithm="deepep",
+            chunk_tokens=16,
+        ),
+        cost_model=FixedOperationCostModel(),
+    )
+    emitted = emit_workload(result.graph, generated, metadata=result.metadata)
+    manifest = json.loads(emitted.manifest_path.read_text(encoding="utf-8"))
+    task_map = json.loads(emitted.task_map_path.read_text(encoding="utf-8"))
+    log = execute_htsim(
+        run_dir,
+        "htsim_cross_layer_wavefront",
+        emitted.matrix_path,
+        emitted.dag_path,
+    )
+    require(
+        f"DAG_SUMMARY tasks={manifest['task_count']} "
+        f"barriers={manifest['barrier_count']}" in log,
+        "跨层 wavefront DAG 未完整结束",
+    )
+    starts = {
+        int(task): float(time)
+        for task, time in re.findall(
+            r"^DAG_TASK_START task=(\d+).*time_us=([0-9.eE+-]+)$",
+            log,
+            re.MULTILINE,
+        )
+    }
+    dones = {
+        int(task): float(time)
+        for task, time in re.findall(
+            r"^DAG_TASK_DONE task=(\d+).*time_us=([0-9.eE+-]+)$",
+            log,
+            re.MULTILINE,
+        )
+    }
+    records = task_map["tasks"]
+    require(len(starts) == len(dones) == len(records), "跨层 task 时间戳不完整")
+
+    rank0_compute = sorted(
+        (record for record in records if record["rank"] == 0),
+        key=lambda record: record["metadata"]["stream_sequence"],
+    )
+    for previous, current in zip(rank0_compute, rank0_compute[1:]):
+        require(
+            dones[previous["task_id"]] <= starts[current["task_id"]],
+            f"GPU0 compute stream overlap: {previous['key']} / {current['key']}",
+        )
+
+    def touches_rank0(record: dict[str, object]) -> bool:
+        if record["src_rank"] == 0 or record["dst_rank"] == 0:
+            return True
+        route_spec = record.get("route_spec")
+        if not isinstance(route_spec, str):
+            return False
+        match = re.fullmatch(
+            r"server_forward src_relay:(\d+) dst_relay:(\d+)",
+            route_spec,
+        )
+        return match is not None and 0 in (int(match.group(1)), int(match.group(2)))
+
+    def phase_interval(phase_id: str) -> tuple[float, float]:
+        phase = [
+            record
+            for record in records
+            if record["metadata"].get("stream_phase_id") == phase_id
+            and touches_rank0(record)
+        ]
+        require(bool(phase), f"GPU0 缺少 phase {phase_id}")
+        return (
+            min(starts[record["task_id"]] for record in phase),
+            max(dones[record["task_id"]] for record in phase),
+        )
+
+    by_key = {record["key"]: record for record in records}
+    attention = by_key["mb0.layer1.attention.rank0"]
+    attention_interval = (
+        starts[attention["task_id"]],
+        dones[attention["task_id"]],
+    )
+    layer0_mb1_combine = phase_interval("mb1.layer0.combine")
+    overlap_us = max(
+        0.0,
+        min(attention_interval[1], layer0_mb1_combine[1])
+        - max(attention_interval[0], layer0_mb1_combine[0]),
+    )
+    require(
+        overlap_us > 0,
+        "没有实际出现 L1 MB0 Attention || L0 MB1 Combine",
+    )
+    layer1_mb0_dispatch = phase_interval("mb0.layer1.dispatch")
+    require(
+        layer0_mb1_combine[1] <= layer1_mb0_dispatch[0],
+        "单 communication stream 错误重叠了跨层通信 phase",
+    )
+    return (
+        "HTSim 实际观察到 L1 MB0 Attention || L0 MB1 Combine；"
+        f"overlap={overlap_us:.6g}us，compute/comm stream 各自串行"
+    )
+
+
 def htsim_deepep_case(run_dir: Path) -> str:
     generated = run_dir / "generated" / "deepep_destination_forward"
     manifest = json.loads((generated / "manifest.json").read_text(encoding="utf-8"))
+    metadata = manifest["metadata"]
     task_count = manifest["task_count"]
     barrier_count = manifest["barrier_count"]
     log = execute_htsim(
@@ -1159,26 +1398,20 @@ def htsim_deepep_case(run_dir: Path) -> str:
         f"DAG_SUMMARY tasks={task_count} barriers={barrier_count}" in log,
         "DeepEP 生成 DAG 未完整结束",
     )
-    require(
-        len(re.findall(r"^DAG_NETWORK_DONE", log, re.MULTILINE)) == 6,
-        "DeepEP 6 个逻辑 network task 没有全部完成",
-    )
-    begins = re.findall(r"^SERVER_FORWARD_BEGIN .* phases=(\d+)$", log, re.MULTILINE)
-    require(begins == ["2"] * 6, f"DeepEP task 不是两个 subflow: {begins}")
-    require("phase=src_local" not in log, "DeepEP 错误启动了 source-local phase")
-    require(
-        len(re.findall(r"^SERVER_FORWARD_PHASE_DONE .* phase=fabric ", log, re.MULTILINE))
-        == 6,
-        "DeepEP fabric subflow 完成数量错误",
+    network_tasks = sum(
+        metadata["hierarchical_transfer"]["task_count_by_leg"].values()
     )
     require(
-        len(re.findall(r"^SERVER_FORWARD_PHASE_DONE .* phase=dst_local ", log, re.MULTILINE))
-        == 6,
-        "DeepEP destination-local subflow 完成数量错误",
+        len(re.findall(r"^DAG_NETWORK_DONE", log, re.MULTILINE)) == network_tasks,
+        "DeepEP 分层 network task 没有全部完成",
     )
+    require("SERVER_FORWARD_BEGIN" not in log,
+            "DeepEP 显式分层 task 错误进入 server_forward 状态机")
+    require("scope=same_rail" in log, "DeepEP RDMA leg 没有进入 fabric")
+    require("scope=same_server" in log, "DeepEP NVLink leg 没有进入本地 FullMesh")
     return (
-        f"HTSim 完成 DeepEP 目标端转发全图：{task_count} tasks/"
-        f"{barrier_count} barriers，6 个逻辑 task 各执行 2 个 subflow"
+        f"HTSim 完成 DeepEP 分层全图：{task_count} tasks/"
+        f"{barrier_count} barriers，{network_tasks} 个显式 RDMA/NVLink task"
     )
 
 
@@ -1221,14 +1454,18 @@ def htsim_moonep_case(run_dir: Path) -> str:
         f"barriers={manifest['barrier_count']}" in log,
         "MoonEP 生成 DAG 未完整结束",
     )
-    require(len(re.findall(r"^SERVER_FORWARD_BEGIN", log, re.MULTILINE)) == 32,
-            "MoonEP 32 个跨服务器 token tasks 未全部进入 DeepEP transport")
-    require("phase=src_local" not in log,
-            "MoonEP/DeepEP 目标端转发错误启动 src_local")
-    require(len(re.findall(r"^DAG_NETWORK_DONE", log, re.MULTILINE)) == 46,
-            "MoonEP 14 prefetch + 32 token tasks 没有全部完成")
+    network_tasks = sum(
+        task["kind"] == "transfer"
+        for task in json.loads(
+            (generated / "task_map.json").read_text(encoding="utf-8")
+        )["tasks"]
+    )
+    require("SERVER_FORWARD_BEGIN" not in log,
+            "MoonEP 显式分层 task 错误进入 server_forward")
+    require(len(re.findall(r"^DAG_NETWORK_DONE", log, re.MULTILINE)) == network_tasks,
+            "MoonEP prefetch 与分层 token tasks 没有全部完成")
     require("scope=same_server" in log, "MoonEP 本地 expert prefetch 未走 FullMesh")
-    return "HTSim 完成 MoonEP EP32 DAG；14 个本地 prefetch 和 32 个 DeepEP token tasks 全部完成"
+    return f"HTSim 完成 MoonEP EP32 DAG；14 个本地 prefetch 和 {network_tasks - 14} 个分层 token tasks 全部完成"
 
 
 def htsim_eplb_case(run_dir: Path) -> str:
@@ -1254,16 +1491,12 @@ def htsim_eplb_case(run_dir: Path) -> str:
     )
     require(len(re.findall(r"^DAG_NETWORK_DONE", log, re.MULTILINE)) == network_tasks,
             "EPLB network tasks 没有全部完成")
-    require(
-        len(re.findall(r"^SERVER_FORWARD_BEGIN", log, re.MULTILINE))
-        == metadata["server_forward_task_count"],
-        "EPLB DeepEP server_forward 数量与 manifest 不一致",
-    )
+    require("SERVER_FORWARD_BEGIN" not in log,
+            "EPLB 显式分层 task 错误进入 server_forward")
     require("expert_weight_prefetch" not in log,
             "稳态 EPLB 运行时出现 weight prefetch")
     return (
-        f"HTSim 完成 EPLB 稳态 DAG：{network_tasks} 个 network tasks，"
-        f"{metadata['server_forward_task_count']} 个目标端转发"
+        f"HTSim 完成 EPLB 稳态 DAG：{network_tasks} 个分层 network tasks"
     )
 
 
@@ -1288,7 +1521,7 @@ def write_report(run_dir: Path, results: list[CaseResult]) -> None:
             "## 范围",
             "",
             "已验证字节计算、显式 chunk task、flow 完成依赖、barrier lowering、",
-            "NCCL direct/no-dedup、DeepEP 目标端转发、EPLB hierarchical placement/",
+            "NCCL direct/no-dedup、DeepEP 两级去冗余/分层传输、EPLB hierarchical placement/",
             "steady-state transport、MoonEP per-server replica/DeepEP scale-out 组合以及 HTSim 加载执行。",
             "逻辑双 stream 已降低为 DAG edges；不测试运行时 CUDA stream scheduler、",
             "单 flow 包进度事件、动态 SM、HBM 竞争或 kernel profiling。",
@@ -1332,6 +1565,10 @@ def main() -> int:
         suite.run(
             "htsim_two_microbatch_two_stream",
             lambda: htsim_two_stream_model_case(run_dir),
+        )
+        suite.run(
+            "htsim_cross_layer_wavefront",
+            lambda: htsim_cross_layer_wavefront_case(run_dir),
         )
         suite.run("htsim_deepep_destination_forward", lambda: htsim_deepep_case(run_dir))
         suite.run("htsim_nccl_rank_direct", lambda: htsim_nccl_case(run_dir))

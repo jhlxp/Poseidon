@@ -13,6 +13,7 @@ from .schema import (
     RoutingAssignment,
     ValidationError,
     dtype_bytes,
+    make_contiguous_expert_placement,
     make_uniform_assignments,
 )
 
@@ -31,5 +32,6 @@ __all__ = [
     "ValidationError",
     "dtype_bytes",
     "emit_workload",
+    "make_contiguous_expert_placement",
     "make_uniform_assignments",
 ]

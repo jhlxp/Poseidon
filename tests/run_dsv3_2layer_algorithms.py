@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +35,7 @@ from moe_dag import (  # noqa: E402
     ModelSpec,
     Placement,
     emit_workload,
+    make_contiguous_expert_placement,
 )
 from moe_dag.models import (  # noqa: E402
     TransformerWorkloadConfig,
@@ -149,10 +151,10 @@ def execute_htsim(case_dir: Path, workload_dir: Path, mode: RunMode) -> Path:
         "-topology", "mprail",
         "-mprail_planes", "1",
         "-mprail_gpus_per_server", "8",
-        "-mprail_l1_eps_per_plane", "8",
+        "-mprail_l1_eps_per_plane", "4",
         "-mprail_l0_l1_links_per_spine", "1",
         "-linkspeed", "400000",
-        "-local_linkspeed", "3200000",
+        "-local_linkspeed", "7200000",
         "-local_latency_ns", "50",
         "-hop_latency", "0.1",
         "-switch_latency", "0.02",
@@ -209,7 +211,7 @@ def run_visualizations(
         "--htsim-log", str(log_path),
         "--output-dir", str(timeline_dir),
         "--gpus-per-server", "8",
-        "--ranks", "0-7",
+        "--ranks", "0-31",
         "--title", f"{algorithm.upper()} / DSV3 2-layer / {mode.name}",
     ]
     timeline_result = subprocess.run(
@@ -288,16 +290,34 @@ def validate_case(
         ),
         "workload has no cross-server transfer",
     )
-    server_forward = [
-        record
+    server_forward = [record for record in transfers if record["route_spec"]]
+    hierarchical_legs = {
+        record["metadata"].get("hierarchical_leg")
         for record in transfers
-        if isinstance(record["route_spec"], str)
-        and record["route_spec"].startswith("server_forward ")
-    ]
+        if record["metadata"].get("hierarchical_leg")
+    }
     if algorithm == "nccl":
         require(not server_forward, "NCCL must not use server_forward")
+        require(not hierarchical_legs, "NCCL must use direct rank flows")
     else:
-        require(bool(server_forward), f"{algorithm} is missing server_forward")
+        require(not server_forward, f"{algorithm} must use explicit hierarchy legs")
+        require(
+            {
+                "dispatch_fabric",
+                "dispatch_local",
+                "combine_local_reduce",
+                "combine_fabric",
+            }
+            <= hierarchical_legs,
+            f"{algorithm} is missing hierarchical transfer legs",
+        )
+        for invocation in manifest["metadata"]["micro_batch_algorithms"]:
+            require(
+                invocation["route_count"]
+                > invocation["unique_token_payload_count"]
+                > invocation["unique_server_payload_count"],
+                f"{algorithm} did not exercise rank/server payload deduplication",
+            )
     if mode.name == "full":
         compute_cost = manifest["metadata"]["compute_cost"]
         require(
@@ -308,17 +328,71 @@ def validate_case(
             compute_cost["selected_source"] == "theoretical",
             "unexpected full compute source",
         )
-        if algorithm == "deepep":
-            require(manifest["task_count"] == 8448, "DeepEP full task count drift")
-            require(
-                manifest["transfer_task_count"] == 7936,
-                "DeepEP full transfer task count drift",
-            )
-            require(
-                sum(manifest["transfer_bytes_by_payload"].values())
-                == 87_375_740_928,
-                "DeepEP full logical transfer bytes drift",
-            )
+    starts = {
+        int(task): float(time)
+        for task, time in re.findall(
+            r"^DAG_TASK_START task=(\d+).*time_us=([0-9.eE+-]+)$",
+            log,
+            re.MULTILINE,
+        )
+    }
+    dones = {
+        int(task): float(time)
+        for task, time in re.findall(
+            r"^DAG_TASK_DONE task=(\d+).*time_us=([0-9.eE+-]+)$",
+            log,
+            re.MULTILINE,
+        )
+    }
+    by_key = {record["key"]: record for record in records}
+    attention = by_key["mb0.layer1.attention.rank0"]
+    require(
+        not any(
+            predecessor.startswith("mb1.layer0.")
+            for predecessor in attention["predecessors"]
+        ),
+        f"{algorithm} reintroduced a layer drain before MB0 layer1 Attention",
+    )
+
+    def touches_rank0(record: dict[str, object]) -> bool:
+        if record["src_rank"] == 0 or record["dst_rank"] == 0:
+            return True
+        route_spec = record.get("route_spec")
+        if not isinstance(route_spec, str):
+            return False
+        match = re.fullmatch(
+            r"server_forward src_relay:(\d+) dst_relay:(\d+)",
+            route_spec,
+        )
+        return match is not None and 0 in (
+            int(match.group(1)),
+            int(match.group(2)),
+        )
+
+    layer0_mb1_combine = [
+        record
+        for record in records
+        if record["metadata"].get("stream_phase_id") == "mb1.layer0.combine"
+        and touches_rank0(record)
+    ]
+    require(layer0_mb1_combine, f"{algorithm} has no GPU0 layer0 MB1 Combine")
+    combine_interval = (
+        min(starts[record["task_id"]] for record in layer0_mb1_combine),
+        max(dones[record["task_id"]] for record in layer0_mb1_combine),
+    )
+    attention_interval = (
+        starts[attention["task_id"]],
+        dones[attention["task_id"]],
+    )
+    cross_layer_overlap_us = max(
+        0.0,
+        min(combine_interval[1], attention_interval[1])
+        - max(combine_interval[0], attention_interval[0]),
+    )
+    require(
+        cross_layer_overlap_us > 0,
+        f"{algorithm} has no L1 MB0 Attention / L0 MB1 Combine overlap",
+    )
     timeline_summary = json.loads(
         (case_dir / "timeline" / "dag_timeline_summary.json").read_text(
             encoding="utf-8"
@@ -341,11 +415,12 @@ def validate_case(
         "logical_transfer_bytes": sum(
             manifest["transfer_bytes_by_payload"].values()
         ),
-        "server_forward_tasks": len(server_forward),
+        "hierarchical_legs": sorted(hierarchical_legs),
         "makespan_us": timeline_summary["makespan_us"],
         "overlap_us": timeline_summary[
             "selected_rank_compute_network_overlap_sum_us"
         ],
+        "cross_layer_overlap_us": cross_layer_overlap_us,
     }
 
 
@@ -369,7 +444,7 @@ def run_algorithm(root_dir: Path, algorithm: str, mode: RunMode) -> dict[str, ob
         placement = Placement(
             32,
             8,
-            tuple(expert % 32 for expert in range(model.num_experts)),
+            make_contiguous_expert_placement(model.num_experts, 32),
         )
         cost_model = (
             JsonComputeCostModel.from_path(mode.compute_config)
@@ -421,7 +496,8 @@ def write_report(
     run_dir: Path,
     mode: RunMode,
     results: list[dict[str, object]],
-    comparison_path: Path | None,
+    comparison_member: str | None,
+    visualization_zip: Path | None,
 ) -> None:
     passed = sum(item["status"] == "passed" for item in results)
     lines = [
@@ -432,17 +508,23 @@ def write_report(
         f"- chunk_tokens：{mode.chunk_tokens}",
         f"- link sample：{mode.link_sample_us} us",
         f"- 通过：{passed}/{len(results)}",
-        f"- 总览 HTML：`{comparison_path.name if comparison_path else '未生成'}`",
+        f"- ZIP 内总览 HTML：`{comparison_member or '未生成'}`",
+        f"- 可视化 ZIP：`{visualization_zip.name if visualization_zip else '未生成'}`",
         "",
-        "| algorithm | status | makespan us | tasks | transfer bytes | overlap us |",
-        "|---|---|---:|---:|---:|---:|",
+        "| algorithm | status | makespan us | tasks | transfer bytes | overlap us | cross-layer us |",
+        "|---|---|---:|---:|---:|---:|---:|",
     ]
     for item in results:
+        makespan = item.get("makespan_us")
+        overlap = item.get("overlap_us")
+        cross_layer = item.get("cross_layer_overlap_us")
         lines.append(
             f"| {item['algorithm']} | {item['status']} | "
-            f"{item.get('makespan_us', '-')} | {item.get('task_count', '-')} | "
+            f"{'-' if makespan is None else f'{float(makespan):.9g}'} | "
+            f"{item.get('task_count', '-')} | "
             f"{item.get('logical_transfer_bytes', '-')} | "
-            f"{item.get('overlap_us', '-')} |"
+            f"{'-' if overlap is None else f'{float(overlap):.9g}'} | "
+            f"{'-' if cross_layer is None else f'{float(cross_layer):.9g}'} |"
         )
     (run_dir / "测试报告.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     (run_dir / "summary.json").write_text(
@@ -451,8 +533,9 @@ def write_report(
                 "mode": asdict(mode),
                 "passed": passed,
                 "total": len(results),
-                "comparison_html": (
-                    str(comparison_path) if comparison_path else None
+                "comparison_html_in_zip": comparison_member,
+                "visualization_zip": (
+                    str(visualization_zip) if visualization_zip else None
                 ),
                 "algorithms": results,
             },
@@ -498,7 +581,7 @@ def main() -> int:
                     "gpus_per_server": 8,
                     "planes": 1,
                     "leaf": 8,
-                    "spine": 8,
+                    "spine": 4,
                     "rdma_gbps": 400,
                 },
             },
@@ -520,6 +603,7 @@ def main() -> int:
                 {"algorithm": algorithm, "status": "failed", "error": str(exc)}
                 for algorithm in algorithms
             ],
+            None,
             None,
         )
         print(f"build failed: {exc}")
@@ -550,9 +634,17 @@ def main() -> int:
 
     results = [by_algorithm[algorithm] for algorithm in algorithms]
     comparison_path: Path | None = None
+    comparison_member: str | None = None
+    visualization_zip: Path | None = None
     if all(item["status"] == "passed" for item in results):
         comparison_path = run_dir / "dsv3_algorithm_comparison.html"
-        command = [sys.executable, str(COMPARISON), "--output", str(comparison_path)]
+        visualization_zip = run_dir / "dsv3_visualization_bundle.zip"
+        command = [
+            sys.executable,
+            str(COMPARISON),
+            "--output", str(comparison_path),
+            "--zip-output", str(visualization_zip),
+        ]
         for algorithm in algorithms:
             command.extend(
                 [
@@ -578,8 +670,9 @@ def main() -> int:
         (run_dir / "comparison.log").write_text(
             completed.stdout, encoding="utf-8"
         )
-        if completed.returncode != 0:
+        if completed.returncode != 0 or not visualization_zip.is_file():
             comparison_path = None
+            visualization_zip = None
             results.append(
                 {
                     "algorithm": "comparison_html",
@@ -587,13 +680,57 @@ def main() -> int:
                     "error": completed.stdout.strip(),
                 }
             )
+        else:
+            try:
+                with zipfile.ZipFile(visualization_zip) as archive:
+                    require(archive.testzip() is None, "visualization ZIP is corrupt")
+                    members = archive.namelist()
+                    require(
+                        "dsv3_algorithm_comparison.html" in members,
+                        "visualization ZIP is missing the dashboard",
+                    )
+                    require(
+                        sum(name.endswith(".html") for name in members)
+                        == len(algorithms) + 1,
+                        "visualization ZIP has an unexpected HTML inventory",
+                    )
+                    require(
+                        not any(
+                            "/workload/" in name
+                            or "/simulation/" in name
+                            or "output_metrics" in name
+                            for name in members
+                        ),
+                        "visualization ZIP contains simulation artifacts",
+                    )
+            except (AssertionError, OSError, zipfile.BadZipFile) as exc:
+                comparison_path = None
+                visualization_zip = None
+                results.append(
+                    {
+                        "algorithm": "visualization_zip",
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
 
-    write_report(run_dir, mode, results, comparison_path)
+    if comparison_path is not None and visualization_zip is not None:
+        comparison_member = comparison_path.name
+        comparison_path.unlink()
+        for algorithm in algorithms:
+            (run_dir / "algorithms" / algorithm / "timeline" /
+             "dag_gpu_timeline.html").unlink()
+        require(
+            not any(run_dir.rglob("*.html")),
+            "successful run left loose HTML files outside the ZIP",
+        )
+
+    write_report(run_dir, mode, results, comparison_member, visualization_zip)
     passed = sum(item["status"] == "passed" for item in results)
     print(f"DSV3 algorithm tests: {passed}/{len(results)} passed ({mode.name})")
     print(f"log directory: {run_dir}")
-    if comparison_path:
-        print(f"comparison: {comparison_path}")
+    if visualization_zip:
+        print(f"visualization ZIP: {visualization_zip}")
     return 0 if passed == len(results) else 1
 
 

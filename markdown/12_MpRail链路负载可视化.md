@@ -32,6 +32,11 @@ aggregate_rank_bandwidth = plane_count * 400 Gbps
 专用测试为 `1 * 400 = 400 Gbps`；8-plane 实验为
 `8 * 400 = 3200 Gbps = 3.2 Tbps`。
 
+这只是 scale-out RDMA 容量。Server-local 使用另一套 H100 NVLink/NVSwitch
+资源，默认每 GPU 聚合带宽为 `900 GB/s = 7200 Gbps`。FullMesh 中的逻辑 pair
+link 和每 rank local injection 上限均为 7200 Gbps；local injection 不与
+400 Gbps RDMA NIC 共用，也不随 plane 数量相乘。
+
 每条蓝色、橙色或绿色曲线表示一条有向物理链路的 bucket throughput。红色虚线
 来自 `link_info.csv` 中该面板的真实 `rate_gbps`，不是脚本写死的 400 Gbps。
 因此 fabric 可以显示 100/200/400/800 Gbps，服务器内部 FullMesh 也可以显示独立的
@@ -204,7 +209,7 @@ HTSIM_LINK_LOAD_SAMPLE_US=1 \
   -topology mprail \
   -mprail_planes 1 \
   -linkspeed 400000 \
-  -local_linkspeed 3200000 \
+  -local_linkspeed 7200000 \
   -mtu 4150 \
   -q 32 \
   -sender_cc_only \
@@ -215,6 +220,10 @@ HTSIM_LINK_LOAD_SAMPLE_US=1 \
 这里没有显式写 `-ecn`，所以使用自动的 20%/80% BDP threshold，其中 MpRail queue
 实际采用 low threshold。若实验需要固定 ECN threshold，应同时记录
 `-ecn LOW_PACKETS HIGH_PACKETS`。
+
+`-linkspeed` 控制每个 fabric plane 的 RDMA NIC 和 L0/L1 链路；
+`-local_linkspeed` 控制独立的 server-local pair link 与每 rank local injection。
+两者不是同一发送资源。
 
 ## 4. 使用
 

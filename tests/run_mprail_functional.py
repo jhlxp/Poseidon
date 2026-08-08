@@ -90,10 +90,10 @@ class Suite:
             "-topology", "mprail",
             "-mprail_planes", "1",
             "-mprail_gpus_per_server", "8",
-            "-mprail_l1_eps_per_plane", "8",
+            "-mprail_l1_eps_per_plane", "4",
             "-mprail_l0_l1_links_per_spine", "1",
             "-linkspeed", "400000",
-            "-local_linkspeed", "3200000",
+            "-local_linkspeed", "7200000",
             "-local_latency_ns", "50",
             "-hop_latency", "0.1",
             "-switch_latency", "0.02",
@@ -150,9 +150,11 @@ def validate_same_server(log: str, returncode: int) -> str:
     require(link_lines, "没有创建服务器内部 FullMesh 链路")
     require(all("MPRAIL_L0" not in line and "MPRAIL_L1" not in line
                 for line in link_lines), "同服务器流量进入了 L0/L1")
-    require(any("speed_gbps=3200" in line for line in link_lines),
-            "服务器内部链路没有使用 3200Gbps 高速率")
-    return f"本地链路 {len(link_lines)} 条，速率 3200Gbps，L0/L1 链路 0 条"
+    require(any("speed_gbps=7200" in line for line in link_lines),
+            "服务器内部链路没有使用 7200Gbps H100 NVLink 速率")
+    require("MPRAIL_LOCAL_INJECTION independent=yes speed_gbps=7200" in log,
+            "服务器内部流量没有独立于 RDMA NIC")
+    return f"本地链路 {len(link_lines)} 条，速率 7200Gbps，L0/L1 链路 0 条"
 
 
 def validate_same_rail(log: str, returncode: int) -> str:
@@ -192,7 +194,7 @@ def validate_cross_rail(log: str, returncode: int) -> str:
         r"planes=(\d+) l0=(\d+) l1=(\d+)", log
     )
     require(topology is not None, "缺少拓扑计数日志")
-    require(tuple(map(int, topology.groups())) == (4, 8, 1, 8, 8),
+    require(tuple(map(int, topology.groups())) == (4, 8, 1, 8, 4),
             f"拓扑计数错误: {topology.groups()}")
     fabric_links = sum(
         ("MPRAIL_L0" in src and "MPRAIL_L1" in dst)
@@ -200,7 +202,7 @@ def validate_cross_rail(log: str, returncode: int) -> str:
         for src, dst in links
     )
     return (
-        "servers=4，rails=8，planes=1，L0=8，L1=8，"
+        "servers=4，rails=8，planes=1，L0=8，L1=4，"
         f"本次物化 L0/L1 有向链路 {fabric_links} 条"
     )
 
@@ -210,9 +212,9 @@ def validate_flow_routing_mode(log: str, returncode: int) -> str:
     require("routing_mode flow_ecmp" in log, "全局路由模式不是 flow_ecmp")
     require(re.search(r"routing=flow_ecmp plane=\d+", log) is not None,
             "flow ECMP 没有固定 preferred plane")
-    require("ecmp_spines=8 ecmp_bundles=1" in log,
+    require("ecmp_spines=4 ecmp_bundles=1" in log,
             "flow ECMP 下一跳维度错误")
-    return "UEC ECMP：固定 plane 0，L0/L1 使用 8 spines x 1 bundle ECMP"
+    return "UEC ECMP：固定 plane 0，L0/L1 使用 4 spines x 1 bundle ECMP"
 
 
 def validate_spray_routing_mode(log: str, returncode: int) -> str:
@@ -221,9 +223,9 @@ def validate_spray_routing_mode(log: str, returncode: int) -> str:
             "全局路由模式不是 packet_spray_ecmp")
     require("routing=packet_spray_ecmp plane=-1" in log,
             "packet spray 仍固定 preferred plane")
-    require("ecmp_spines=8 ecmp_bundles=1" in log,
+    require("ecmp_spines=4 ecmp_bundles=1" in log,
             "packet spray ECMP 下一跳维度错误")
-    return "UEC spray：单 plane 内逐包改变 pathid，使用 8 spines x 1 bundle ECMP"
+    return "UEC spray：单 plane 内逐包改变 pathid，使用 4 spines x 1 bundle ECMP"
 
 
 def parse_event_times(log: str, prefix: str) -> dict[int, float]:
@@ -289,6 +291,26 @@ def validate_independent_barriers(log: str, returncode: int) -> str:
     return "两个分支独立推进：Dispatch2=20us 启动，Expert1=40us 启动"
 
 
+def validate_local_fabric_independence(log: str, returncode: int) -> str:
+    assert_success(log, returncode)
+    starts = parse_event_times(log, "DAG_TASK_START")
+    dones = parse_event_times(log, "DAG_TASK_DONE")
+    require(starts[1] == starts[2] == 0,
+            "NVLink 与 RDMA flow 没有同时启动")
+    local_duration = dones[1] - starts[1]
+    fabric_duration = dones[2] - starts[2]
+    transfer_bytes = 16 * 1024 * 1024
+    local_gbps = transfer_bytes * 8 / local_duration / 1000
+    require(local_gbps > 1000,
+            f"本地有效吞吐仍疑似受 400Gbps RDMA NIC 限制: {local_gbps:.1f}Gbps")
+    require(local_duration < fabric_duration,
+            "7.2Tbps NVLink flow 没有早于 400Gbps RDMA flow 完成")
+    return (
+        f"NVLink/RDMA 并发启动；本地 {local_duration:.3f}us/"
+        f"{local_gbps:.1f}Gbps，fabric {fabric_duration:.3f}us"
+    )
+
+
 def expect_failure(marker: str, expected_code: int | None = None) -> Callable[[str, int], str]:
     def validator(log: str, returncode: int) -> str:
         require(returncode != 0, "非法输入意外成功")
@@ -326,8 +348,9 @@ def write_report(run_dir: Path, results: list[CaseResult], config: dict) -> None
         "",
         "## 拓扑规模",
         "",
-        "32 ranks，8 ranks/server，4 servers，1 plane，8 个 L0 Leaf，8 个 L1 Spine。",
+        "32 ranks，8 ranks/server，4 servers，1 plane，8 个 L0 Leaf，4 个 L1 Spine。",
         "每个 Leaf 挂四张同 local-index GPU；RDMA 与 L0/L1 链路均为 400Gbps。",
+        "Server-local FullMesh 与每 rank local injection 为独立的 7200Gbps 资源。",
         "",
         "## 测试结果",
         "",
@@ -366,10 +389,10 @@ def main() -> int:
         "planes": 1,
         "gpus_per_server": 8,
         "rail_mapping": "gpu_local_index",
-        "l1_eps_per_plane": 8,
+        "l1_eps_per_plane": 4,
         "l0_l1_links_per_spine": 1,
         "external_linkspeed_mbps": 400000,
-        "local_linkspeed_mbps": 3200000,
+        "local_linkspeed_mbps": 7200000,
     }
     suite = Suite(run_dir)
     try:
@@ -438,6 +461,16 @@ def main() -> int:
                 "4 3 | 0 0 | 0 5 | 1\n"        # Expert 1
                 "5 4 | 0 0 | 0 5 | 2\n"        # Dispatch 2
             ),
+        )
+        suite.run_case(
+            "local_fabric_independent_injection",
+            empty_matrix,
+            validate_local_fabric_independence,
+            dag=(
+                "1 0 | 0 1 | 16777216 0 | -\n"
+                "2 1 | 0 8 | 16777216 0 | -\n"
+            ),
+            end_us=5000,
         )
         suite.run_case(
             "reject_joint_task",

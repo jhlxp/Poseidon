@@ -1,82 +1,68 @@
 # 算法建模：DeepEP 核心路径
 
-## 1. 项目范围
+## 1. 建模范围
 
-本项目只建模 DeepEP 面向训练和 prefill 的核心通信行为：
-
-```text
-按 destination rank 去除重复 token payload
-  +
-跨服务器时先进入目标服务器的同 local-index GPU
-  +
-目标服务器内部转发到真实 destination rank
-```
-
-阅读 `/home/xuheng/DeepEP` 源码是为了确认上述数据移动本质，不在 HTSim 中复刻
-DeepEP 的 CUDA/RDMA kernel。首版明确不实现：
-
-- low-latency/decode 路径；
-- V1/V2、normal/hybrid/direct 等版本开关；
-- notify/layout、TMA、RDMA queue pair 和内存一致性细节；
-- packet/chunk 在单条 flow 内部的流水消费；
-- backward、profiling 和真实 kernel 性能。
-
-训练场景当前先使用与 prefill 相同的 forward dispatch/expert/combine 图。以后增加
-backward 时复用同一套去冗余和目标端转发策略，不重新定义传输协议。
-
-NCCL 是对照算法：它关闭 payload 去冗余，也不使用目标端转发，直接把每条 top-k
-route 发送到真实 destination rank。
-
-## 2. 核心一：默认去冗余
-
-### 2.1 原始 route 与 payload item
-
-router 的原始输出保留每条 top-k route：
+本项目只抽象 DeepEP 面向训练和 prefill 的核心数据移动：
 
 ```text
-(src_rank, token_id, topk_slot, expert_id, dst_rank)
+destination-rank 去冗余
+  -> destination-server 去冗余
+  -> 跨机 RDMA
+  -> 目标服务器 NVLink fanout
+  -> Expert FFN
+  -> 专家服务器 NVLink reduce/gather
+  -> 跨机 RDMA 返回
 ```
 
-DeepEP 的 hidden payload 去重 key 为：
+不复刻 CUDA kernel、notify/layout、TMA、QP、low-latency decode 或单 flow 内
+packet-progress 事件。`chunk_tokens` 通过多个完整 flow task 表达 chunk pipeline。
+
+NCCL 是 direct/no-dedup 对照：每条 top-k route 都保留独立 payload，直接发往真实
+execution rank，不进行 DeepEP 的服务器级合并。
+
+## 2. 两级去冗余
+
+Router 的原始 route 是：
 
 ```text
-(src_rank, token_id, dst_rank)
+(src_rank, token_id, topk_slot, expert_id, execution_rank)
 ```
 
-同一 token 的多个 expert 位于同一 destination rank 时，只发送一份 hidden；expert
-ID、top-k slot 和 weight 仍作为逻辑 metadata 保留，expert compute 的 route 数也
-不能减少。
-
-例如：
+第一层按 rank 去冗余：
 
 ```text
-token 7 -> expert 9  on rank 5
-token 7 -> expert 41 on rank 5
+rank payload key = (src_rank, token_id, execution_rank)
 ```
 
-DeepEP 产生一个发往 rank 5 的 payload item，NCCL 产生两个。
+同一 token 的多个专家落在同一 execution rank 时，hidden 只传一份，但 expert
+route、top-k slot 和 Expert FFN 计算量全部保留。
 
-### 2.2 共享 base
-
-去冗余不是 DeepEP builder 的私有代码。第一层 base 提供：
+第二层只作用于 scale-out RDMA：
 
 ```text
-TokenPayloadPolicy
-  deduplicate: bool = true
-  scope: none | destination_rank = destination_rank
+server payload key = (src_rank, token_id, execution_server)
 ```
 
-- 除 NCCL 外，算法默认 `deduplicate=true`。
-- NCCL 显式选择 `deduplicate=false, scope=none`。
-- planner 使用策略生成 payload item；emitter 只聚合、分 chunk 和输出 DAG。
-- flow 聚合不能再次改变 payload 数量。
+同一 token 在目标服务器内命中多个 rank 时，跨机只发送一份 hidden；目标服务器
+收到后再用 NVLink 向各个唯一 execution rank fanout。
 
-DeepEP 经过 rank-level 去重后，再按 `(src_rank, dst_rank)` 聚合，并由
-`chunk_tokens` 拆成多个逻辑 network task。
+Manifest 同时记录：
 
-## 3. 核心二：目标端转发
+```text
+route_count
+unique_token_payload_count       # rank payload
+unique_server_payload_count      # scale-out payload
+deduplicated_route_count         # route - rank payload
+scaleout_deduplicated_route_count# route - server payload
+```
 
-### 3.1 Relay 选择
+因此必须满足：
+
+```text
+route_count >= unique_token_payload_count >= unique_server_payload_count
+```
+
+## 3. Relay 与 Rail
 
 设每台服务器有 `G` 张 GPU：
 
@@ -85,207 +71,161 @@ server(rank) = rank // G
 local(rank)  = rank % G
 ```
 
-对于跨服务器逻辑传输 `src_rank -> dst_rank`，DeepEP 选择目标服务器中与 source
-GPU local index 相同的 relay：
+源 rank 向目标服务器发送时，选择目标服务器中相同 local index 的 relay：
 
 ```text
-dst_relay = server(dst_rank) * G + local(src_rank)
+relay = execution_server * G + local(src_rank)
 ```
 
-因此 fabric flow 始终是：
+因此 `src_rank -> relay` 始终位于同一 rail。在 MpRail 中它不经过 Spine；这正是
+DeepEP 利用同 index NIC、再在目标服务器内部转发的抽象。
 
-```text
-src_rank -> dst_relay
-```
+DeepEP 不再把两段通信封装为 `server_forward` route。RDMA 和 NVLink 都是显式
+DAG transfer task，具有各自的 barrier、端点、字节和完成事件。这样一个 RDMA
+task 可以成为多个 local fanout task 的共同前驱。
 
-在 MpRail 中二者 local index 相同，也就是同 rail，fabric flow 不需要经过 Spine。
-随后由目标服务器的高速 FullMesh 完成：
-
-```text
-dst_relay -> dst_rank
-```
-
-### 3.2 一个 DAG task，两个串行 flow
-
-DAG 中仍只生成一个逻辑 network task，端点写真实 source 和 destination rank：
-
-```text
-task_id barrier_id | src_rank dst_rank | transfer_bytes 0 | predecessors |
-server_forward src_relay:<src_rank> dst_relay:<dst_relay>
-```
-
-关键约束是：
-
-```text
-src_relay == src_rank
-```
-
-现有 `server_forward` 状态机会因此跳过 `src_local`，只执行：
-
-```text
-Phase 1 fabric:    src_rank -> dst_relay
-等待整个 flow 完成
-
-Phase 2 dst_local: dst_relay -> dst_rank
-等待整个 flow 完成
-```
-
-如果 `dst_relay == dst_rank`，第二阶段也跳过，此时只有 fabric flow。DAG task 的
-完成回调在最后一个实际 flow 完成后触发，所以 Expert/Combine 后继自然等待目标端
-转发结束。
-
-这不是把两个 flow 展开成两个 DAG task；两个 subflow 由 HTSim 的
-`server_forward` 状态机管理，属于同一个逻辑 task 和同一个完成 barrier。
-
-### 3.3 示例
-
-在 `G=8` 的 EP32 专用拓扑中：
-
-```text
-逻辑传输：0 -> 9
-dst_relay = 8
-DAG route：server_forward src_relay:0 dst_relay:8
-实际 flow 1：0 -> 8   # fabric，同 rail 0
-实际 flow 2：8 -> 9   # 目标服务器内部 FullMesh
-```
-
-另一个例子：
-
-```text
-逻辑传输：2 -> 13
-dst_relay = 10
-DAG route：server_forward src_relay:2 dst_relay:10
-实际 flow 1：2 -> 10  # fabric，同 rail 2
-实际 flow 2：10 -> 13 # 目标服务器内部 FullMesh
-```
-
-同服务器的 `src_rank -> dst_rank` 不使用 `server_forward`，直接生成普通本地
-network task；`src_rank == dst_rank` 时不生成 network task。
+`server_forward` 仍是 MpRail 的通用源路由能力，文档见
+[10_MpRail源路由与服务器转发.md](10_MpRail源路由与服务器转发.md)，但不是当前
+DeepEP/EPLB/MoonEP builder 的 lowering 方式。
 
 ## 4. Dispatch
 
-对每条 router assignment 先得到真实 expert home rank，再应用默认去冗余：
+跨服务器 Dispatch 对每个 `(src_rank, token_id, execution_server)` 生成一份
+server payload：
 
 ```text
-dst_rank = placement.expert_rank(expert_id)
-payloads[(src_rank, dst_rank)] = unique (src_rank, token_id)
+dispatch_fabric:
+src_rank -> same-index relay
+bytes = server_payload_count * H * bytes(dispatch_dtype)
 ```
 
-每个 chunk 的字节数：
+fabric task 完成后，对该 chunk 中每个唯一 execution rank 生成本地 fanout：
 
 ```text
-dispatch_bytes = unique_token_count * H * bytes(dispatch_dtype)
+dispatch_local:
+relay -> execution_rank
+bytes = rank_payload_count * H * bytes(dispatch_dtype)
+predecessor = corresponding dispatch_fabric task
 ```
 
-- 同服务器：普通 local flow。
-- 跨服务器：一个带 destination-side `server_forward` route 的逻辑 task。
-- Expert rank 等待发往自己的全部 dispatch task 完成。
-- 原始 route count 仍用于 Expert FFN FLOP，不使用去重后的 payload count。
+若 execution rank 就是 relay，不创建自环 local task，fabric task 直接作为该 rank
+的 arrival。若 origin 与 execution rank 在同一服务器，只创建普通
+`dispatch_local`；若二者相同，则不创建 network task。
+
+Expert FFN 只等待送达本 rank 的 dispatch task。Expert FLOP 仍按原始 route count
+计算，不按去冗余后的 payload 数计算。
 
 ## 5. Combine
 
-同一 token 在同一 execution rank 上的多个 expert output 先在该 rank 形成一个返回
-payload，再沿反方向返回 origin rank：
+Combine 与 Dispatch 不是简单反向复用。DeepEP 的 multiple reduction 语义先在专家
+服务器内汇聚，再跨机返回 origin：
 
 ```text
-logical src = expert execution rank
-logical dst = original source rank
+combine_local_reduce:
+execution_rank -> relay matching local(origin_rank)
+bytes = rank_payload_count * H * bytes(combine_dtype)
+
+combine_fabric:
+relay -> origin_rank
+bytes = server_payload_count * H * bytes(combine_dtype)
+predecessors = all local partials in the corresponding server chunk
 ```
 
-Combine 同样应用 destination-rank 去冗余，并使用目标端转发：
+若 execution rank 就是 relay，`combine_fabric` 直接等待该 rank 的 Expert FFN。
+若专家与 origin 在同一服务器，只创建本地 combine；同 rank 结果由最终 reduce 直接
+消费，不创建自环 transfer。
+
+origin rank 的 `combine_reduce` 等待所有远端 server payload、本地 partial 和本地
+Expert FFN 完成。
+
+## 6. 完整例子
+
+EP32、`G=8`，token 来自 rank 0，三个 expert route 分别落在 rank 9、9、10：
 
 ```text
-dst_relay = server(origin_rank) * G + local(execution_rank)
-server_forward src_relay:<execution_rank> dst_relay:<dst_relay>
+原始 expert routes: 3
+rank payloads:       2   # rank 9、rank 10
+server payloads:     1   # 都在 server 1
+
+Dispatch:
+0 -> 8       one RDMA payload
+8 -> 9       one NVLink payload, carrying two expert routes as metadata
+8 -> 10      one NVLink payload
+
+Combine:
+9 -> 8       one NVLink partial
+10 -> 8      one NVLink partial
+8 -> 0       one reduced RDMA payload
 ```
 
-每个 chunk 的字节数：
+这个例子保留 3 条 Expert FFN routes，但每个方向只有 1 份跨机 payload。
+
+## 7. DAG 与 overlap
 
 ```text
-combine_bytes = unique_token_count * H * bytes(combine_dtype)
+Attention -> Router -> dispatch_fabric -> dispatch_local -> Expert FFN
+          -> other independent microbatch compute can overlap
+Expert FFN -> combine_local_reduce -> combine_fabric -> Combine Reduce
 ```
 
-origin rank 的 `combine_reduce` 等待所有返回 task 以及本地 expert 结果完成。
+- 每个 transfer task 默认一个独立 barrier。
+- 同一 fabric chunk 的 local fanout 必须等待该 fabric task。
+- 不同源、服务器或 chunk 的独立 flow 可以并发。
+- 每个 chunk 在完整 flow FCT 后释放后继。
+- communication stream 内 phase 顺序保持串行，compute stream 可与通信重叠。
+- Compute 仍为固定 `compute_us`；重叠阶段静态预留 20/132 SM。
 
-## 6. DAG 与 overlap
+## 8. 专家布局与测试路由
+
+标准 DSV3 EP32 使用连续 expert placement，符合每 rank 持有一段 expert index 的
+口径：
 
 ```text
-Attention
-  -> Router
-  -> DeepEP dispatch task/chunk
-  -> destination-rank Expert FFN
-  -> DeepEP combine task/chunk
-  -> origin-rank Combine Reduce
+execution_rank = floor(expert_id * num_ranks / num_experts)
 ```
 
-- 每个逻辑 task 默认使用独立 barrier。
-- `chunk_tokens` 只把聚合消息拆成多个完整 flow task。
-- Expert 只等待发往自身的 dispatch chunks，不等待其他 rank。
-- Combine Reduce 只等待返回自身的 combine chunks，不使用全局 collective barrier。
-- 不监听单条 flow 的第 N 个 packet；每个 chunk 在完整 flow 完成后释放依赖。
-- 通信可以与没有依赖冲突的其他 microbatch compute task 重叠。
+测试 router 使用固定种子 0 的 expert permutation，并按 TopK 分组循环。这样总
+expert route 数严格均衡，同时真实产生同 rank、同服务器命中。旧的
+`expert_id % num_ranks` 加连续 TopK 会让 8 个 expert 永远落到 8 个不同 rank，无法
+验证去冗余，已不再使用。
 
-计算仍使用 H100 理论 `compute_us` 占位；通信重叠阶段固定预留 20 SM。这是本项目
-成本模型，不是对 DeepEP kernel occupancy 的复刻。
-
-## 7. 配置与 Manifest
-
-主算法名统一为：
-
-```text
---algorithm deepep
-```
-
-核心配置：
+## 9. 配置与 Manifest
 
 ```yaml
 algorithm: deepep
 workload_scope: training_prefill_forward
 token_payload_policy:
   deduplicate: true
-  scope: destination_rank
+  scope: destination_rank_then_server
 forwarding:
-  mode: destination
+  mode: hierarchical_scaleout_scaleup
   relay_coordinate: source_local_index
-  completion: full_message
-chunk_tokens: 32
-dispatch_dtype: fp8
-combine_dtype: bf16
+  dispatch: fabric_then_local_fanout
+  combine: local_reduce_then_fabric
 ```
 
-不提供 hybrid/direct/low-latency 子模式；direct/no-dedup 对照由 NCCL builder
-表达。
-
-报告至少记录：
+`hierarchical_transfer` 按四类 leg 分别记录 task、payload 和字节：
 
 ```text
-route_count
-unique_token_payload_count
-deduplicated_route_count
-logical_transfer_task_count
-server_forward_task_count
-dispatch_bytes
-combine_bytes
+dispatch_fabric
+dispatch_local
+combine_local_reduce
+combine_fabric
 ```
 
-## 8. 验收标准
+## 10. 验收标准
 
-1. 同 token 的两个 expert 位于同一 dst rank 时，DeepEP 只计算一份 payload 字节，
-   但 Expert FFN 仍计算两个 routes。
-2. 同 token 的 experts 位于不同 dst ranks 时，每个 dst rank 各保留一份 payload。
-3. 跨服务器 `0 -> 9` 的 DAG task 写真实端点 `0 9`，route 必须是
-   `server_forward src_relay:0 dst_relay:8`。
-4. HTSim 日志中该 task 严格执行 `fabric 0 -> 8`、`dst_local 8 -> 9`，且逻辑
-   task 只在第二个 flow 完成后释放 barrier。
-5. 跨服务器同 index 目标，例如 `0 -> 8`，只执行 fabric flow。
-6. 同服务器目标只走 FullMesh，不进入 fabric。
-7. dispatch 使用 dispatch dtype，combine 使用 combine dtype。
-8. NCCL 与 DeepEP 使用相同 assignments 和 placement 时，NCCL payload 字节不少于
-   DeepEP，并且 NCCL 不出现 `server_forward`。
+1. 同 token、同 execution rank 的多个 expert routes 只保留一份 rank payload。
+2. 同 token、同 execution server 的多个 rank payload 只保留一份 RDMA payload。
+3. Expert FFN route count 不因通信去冗余而减少。
+4. Dispatch fabric 到达同 index relay，local fanout 显式依赖 fabric。
+5. Combine 先等待专家服务器内 local partial，再由 relay 发一份 RDMA 回 origin。
+6. 同服务器 leg 只走 7200 Gbps FullMesh；fabric leg 受 400 Gbps RDMA 限制。
+7. DeepEP DAG 不含 `server_forward` route；四类 hierarchy leg 可在 task map 恢复。
+8. NCCL 不含 hierarchy leg，并保留每条 top-k route 的 payload multiplicity。
+9. EP32 smoke/full 中 `route > rank payload > server payload`，HTSim 完成全部 task。
 
-## 9. 代码依据与边界
-
-核心行为的理解来自 `/home/xuheng/DeepEP` 中训练/prefill 数据路径；源码用于确认
-同 local-index RDMA 与目标端 NVLink forwarding 的设计目的。本文定义的是本项目
-可验证的 workload 模型，不声明与某个 DeepEP commit 的 kernel 时序或字节布局完全
-一致。
+源码依据是 `/home/xuheng/DeepEP/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh`
+中的 scaleout destination 去重和 scaleup forwarding，以及
+`deep_ep/buffers/elastic.py` 中默认开启的 multiple reduction。本文抽象数据移动
+本质，不声明与某个 kernel 的指令级时序完全一致。

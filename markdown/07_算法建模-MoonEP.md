@@ -7,7 +7,7 @@ MoonEP 官方实现的动态冗余 expert 和 perfect balance 作用于单个 NV
 执行，再与 DeepEP 的跨服务器 transport 组合：
 
 ```text
-scale-out:  DeepEP destination-side forwarding
+scale-out:  DeepEP hierarchical RDMA/NVLink transport
 scale-up:   per-server MoonEP dynamic expert replication and balancing
 ```
 
@@ -111,8 +111,8 @@ payload_kind = expert_weight_prefetch
 expert_weight_bytes = 3 * H * H_ff * bytes(weight_dtype)
 ```
 
-由于 replica 与 home 位于同一服务器，该 flow 只走高速 FullMesh，不使用 RDMA、
-Spine 或 `server_forward`。
+由于 replica 与 home 位于同一服务器，该 flow 只走高速 FullMesh，不使用 RDMA
+或 Spine。
 
 Weight prefetch 与 token dispatch 都可以在 planning 完成后启动；Expert FFN 同时
 等待该 rank 的 prefetch 和 dispatch 到达。因此 DAG 可以表达两者 overlap，而不
@@ -129,20 +129,9 @@ dedup key = (src_rank, token_id, execution_rank)
 同一个 token 的多个 expert route 若最终落在同一 execution rank，只发送一份
 hidden payload；逻辑 expert route metadata 和 Expert FFN route count仍全部保留。
 
-传输规则复用 DeepEP：
-
-- 同服务器：普通 local flow；
-- 跨服务器：真实逻辑端点为 `src_rank -> execution_rank`；
-- route 使用目标服务器同 local-index relay：
-
-```text
-server_forward
-  src_relay:<src_rank>
-  dst_relay:<execution_server 中与 src_rank 同 local-index 的 rank>
-```
-
-HTSim 因 `src_relay == src_rank` 跳过 source-local phase，实际执行 fabric flow 和
-可选 destination-local flow。
+传输规则复用 DeepEP 分层 transport：跨服务器先按 execution server 合并 hidden，
+由 `src_rank` 向同 index relay 发送一份 `dispatch_fabric`，再显式生成
+`dispatch_local` fanout。同服务器只生成 local flow。
 
 ## 6. Expert Compute
 
@@ -180,9 +169,10 @@ logical src = execution_rank
 logical dst = original source rank
 ```
 
-payload 同样按 `(origin token, execution_rank)` 去重。跨服务器 combine 使用 DeepEP
-destination-side `server_forward`；同服务器使用普通 local flow。origin rank 的
-Combine Reduce 等待全部 remote combine task 和本地 expert结果。
+payload 同样先按 `(origin token, execution_rank)` 去重，再按 execution server 合并。
+跨服务器 combine 先把 execution rank partial 通过 `combine_local_reduce` 汇聚到
+与 origin 同 local-index 的 relay，再由一个 `combine_fabric` 返回 origin。origin
+rank 的 Combine Reduce 等待全部 remote server payload 和本地 expert 结果。
 
 planner 不在 combine 阶段重新运行，replica placement 也不能改变。
 
@@ -210,7 +200,7 @@ Router
 
 ```yaml
 algorithm: moonep
-scale_out_transport: deepep_destination_forward
+scale_out_transport: deepep_hierarchical
 replica_scope: home_server
 planner: deterministic_per_server_capacity_balancer_v2
 replicas_per_rank: 2
@@ -218,7 +208,7 @@ token_padding: 128
 chunk_tokens: 32
 token_payload_policy:
   deduplicate: true
-  scope: destination_rank
+  scope: destination_rank_then_server
 ```
 
 manifest 至少记录：
@@ -230,7 +220,9 @@ real_routes_by_rank
 padded_routes_by_rank
 replicas: expert_id, home_rank, execution_rank
 expert_weight_prefetch_bytes
-server_forward_task_count
+hierarchical_transfer
+unique_server_payload_count
+scaleout_deduplicated_route_count
 dispatch/combine bytes
 ```
 
@@ -240,7 +232,7 @@ dispatch/combine bytes
 2. expert weight prefetch 只生成 local flow，且字节等于完整 expert 权重。
 3. 每台服务器独立达到 floor/ceil 均衡，不要求不同服务器的 rank route 数相等。
 4. token dispatch/combine 的 logical dst 是最终 execution/origin rank。
-5. 所有跨服务器 token flow 使用 DeepEP destination-side `server_forward`。
+5. 所有跨服务器 token flow 使用 DeepEP 显式 fabric/local hierarchy legs。
 6. 同 token、同 execution rank 的多 expert routes 只产生一份 payload。
 7. Expert FFN route count 不受 payload 去冗余影响。
 8. EP32 测试中可同时观察服务器内权重复制和跨服务器 token flow。

@@ -44,13 +44,15 @@ rail_id = rank % gpus_per_server
 rail 与 plane 是正交维度。plane 表示一套完整、独立的 scale-out fabric：
 
 ```text
-每个 plane: 8 L0 Leaf <-> 8 L1 Spine
+一般形式: rail_count 个 L0 Leaf <-> l1_eps_per_plane 个 L1 Spine
+统一 EP32 测试: 每个 plane 8 L0 Leaf <-> 4 L1 Spine
 plane 之间: 无交换机链路、无共享 Queue/Pipe
 每个 rank: 每个 plane 一个独立 400 Gbps fabric port
 ```
 
-因此 `plane_count=8` 表示 8 个并行 scale-out 网络，共 64 台 L0 和 64 台
-L1；单 rank 聚合带宽为 `8 * 400 = 3200 Gbps`。
+按统一测试的每 plane 8 L0/4 L1 配置，`plane_count=8` 表示 8 个并行 scale-out
+网络，共 64 台 L0 和 32 台 L1；单 rank 聚合带宽为
+`8 * 400 = 3200 Gbps`。
 
 ## 3. 物理结构
 
@@ -107,6 +109,15 @@ src GPU -> server-local FullMesh -> dst GPU
 ```
 
 不进入 L0/L1。链路速率和延迟单独配置，默认使用远高于单 plane 链路的速率。
+
+H100 SXM 的建模口径是每 GPU `900 GB/s = 7200 Gbps` 双向聚合
+NVLink/NVSwitch 带宽。MpRail 用一条 7200 Gbps 的逻辑 FullMesh pair link 表达
+任意 GPU 对之间的可达性，同时为每个 rank 配置一个共享的 7200 Gbps local
+injection 资源。因此一个 GPU 同时向多个本地 peer 发送时，总注入带宽仍以
+7200 Gbps 为上限，不会按 7 个 peer 放大七倍。
+
+local injection 与每 plane 400 Gbps 的 RDMA NIC 相互独立。本地转发不会占用
+Host-L0 端口，RDMA 和 NVLink flow 可以同时推进。
 
 ### 4.2 不同服务器、同 rail
 
@@ -168,9 +179,11 @@ gpus_per_server = 8
 rail_count = 8
 plane_count = 1
 L0_count = 8
-L1_count = 8
+L1_count = 4
 endpoint_link_speed = 400 Gb/s
 aggregate_rank_bandwidth = 400 Gb/s
+L0_downlink_bandwidth = 4 * 400 = 1.6 Tb/s
+L0_uplink_bandwidth = 4 * 400 = 1.6 Tb/s
 ```
 
 一般情况下：
@@ -222,7 +235,8 @@ L0 aggregate uplink bandwidth >= L0 aggregate GPU downlink bandwidth
 
 - 所有正整数拓扑参数必须大于 0。
 - rank 数可以不填满最后一台服务器。
-- `local_linkspeed` 独立于 plane 链路速率。
+- `local_linkspeed` 同时定义 server-local pair link 和每 rank local injection
+  上限，默认 7200 Gbps，独立于 plane/RDMA 链路速率。
 - flow-level ECMP 使用稳定 flow hash 选择 preferred plane。
 - packet spray 复用 UEC 多端口 NIC 调度，不增加 MpRail 私有 spray 算法。
 - plane 之间物理独立；packet 只能在源 NIC 选择 plane，交换机不能跨 plane 转发。

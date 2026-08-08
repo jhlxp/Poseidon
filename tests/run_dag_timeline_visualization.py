@@ -3,16 +3,20 @@
 
 from __future__ import annotations
 
+import base64
 import csv
 from dataclasses import asdict, dataclass
 from datetime import datetime
+import gzip
 import json
 import math
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 from typing import Callable
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -264,10 +268,43 @@ def artifacts_case(output_dir: Path) -> str:
     html = (output_dir / "dag_gpu_timeline.html").read_text(encoding="utf-8")
     require("GPU 00" in html and "Network TX" in html and "Network RX" in html,
             "HTML 缺少 GPU 三 lane")
-    require("Task 2: mb0.dispatch.src0.dst1" in html,
-            "HTML tooltip 缺少 network task")
-    require("Bytes: 1000000" in html and "Actual duration: 6 us" in html,
-            "HTML tooltip 缺少字节或 FCT")
+    require(html.count("<title>") == 1 and "Predecessors:" not in html,
+            "SVG 仍在重复内联 tooltip 或 predecessor 文本")
+    require("data-task-id='2'" in html and "class=\"hover-tooltip\"" in html,
+            "SVG bar 没有使用 task_id 动态 tooltip")
+    columns_match = re.search(
+        r'<script type="application/json" id="task-columns">(.*?)</script>',
+        html,
+        re.DOTALL,
+    )
+    tasks_match = re.search(
+        r'<script type="application/json" id="task-data">(.*?)</script>',
+        html,
+        re.DOTALL,
+    )
+    require(columns_match is not None and tasks_match is not None,
+            "HTML 缺少单份 task data")
+    columns = json.loads(columns_match.group(1))
+    task_rows = json.loads(tasks_match.group(1))
+    index = {name: position for position, name in enumerate(columns)}
+    tasks = {row[index["task_id"]]: row for row in task_rows}
+    require(tasks[2][index["key"]] == "mb0.dispatch.src0.dst1",
+            "task data 缺少 network task")
+    require(tasks[2][index["transfer_bytes"]] == 1_000_000,
+            "task data 字节数错误")
+    require(tasks[2][index["actual_duration_us"]] == 6.0,
+            "task data FCT 错误")
+    predecessor_match = re.search(
+        r'<script type="text/plain" id="predecessor-data">(.*?)</script>',
+        html,
+        re.DOTALL,
+    )
+    require(predecessor_match is not None, "HTML 缺少压缩 predecessor data")
+    predecessor_payload = json.loads(
+        gzip.decompress(base64.b64decode(predecessor_match.group(1))).decode("utf-8")
+    )
+    require([4, [1]] in predecessor_payload,
+            "压缩 predecessor 没有恢复 task 4 -> task 1")
     require(
         'class="zoom-slider"' in html
         and 'class="scale-readout"' in html
@@ -278,6 +315,8 @@ def artifacts_case(output_dir: Path) -> str:
         '<details class="details"><summary>Task details (4)</summary>' in html,
         "Task details 没有使用三角折叠控件",
     )
+    require("renderTaskTable" in html and "DecompressionStream" in html,
+            "Task details 或 predecessor 没有按需解码")
 
     with (output_dir / "dag_rank_overlap_summary.csv").open(
         newline="", encoding="utf-8"
@@ -305,7 +344,7 @@ def artifacts_case(output_dir: Path) -> str:
             "task CSV logical throughput 错误")
     require(not (output_dir / "dag_gpu_timeline.png").exists(),
             "DAG timeline 不应再生成 PNG")
-    return "HTML hover、task CSV、rank overlap 和总览正确，未生成 PNG"
+    return "task 数据单份保存；tooltip/表格按需渲染；predecessor gzip 可恢复"
 
 
 def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
@@ -328,7 +367,13 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
         case_dirs.append((algorithm, case_dir))
 
     output = run_dir / "comparison.html"
-    command = [sys.executable, str(COMPARISON), "--output", str(output)]
+    zip_output = run_dir / "visualization_bundle.zip"
+    command = [
+        sys.executable,
+        str(COMPARISON),
+        "--output", str(output),
+        "--zip-output", str(zip_output),
+    ]
     for algorithm, case_dir in case_dirs:
         command.extend(("--case", f"{algorithm}={case_dir}"))
     completed = subprocess.run(
@@ -348,7 +393,20 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
             "算法分区没有引用各自链路负载图")
     require("Expand all" in html and "Collapse all" in html,
             "总览缺少全局展开/收起按钮")
-    return "算法分区、iframe timeline、链路负载图和全局折叠按钮正确"
+    require(zip_output.is_file(), "没有生成可视化 ZIP")
+    with zipfile.ZipFile(zip_output) as archive:
+        require(archive.testzip() is None, "可视化 ZIP 损坏")
+        members = set(archive.namelist())
+    require("comparison.html" in members, "ZIP 缺少总览 HTML")
+    require(
+        "comparison_inputs/nccl/timeline/dag_gpu_timeline.html" in members
+        and "comparison_inputs/deepep/link_load/mprail_link_load_by_layer.png"
+        in members,
+        "ZIP 缺少 timeline 或链路负载图",
+    )
+    require(not any("workload" in name or "simulation" in name for name in members),
+            "ZIP 不应包含 workload 或 simulation 产物")
+    return "算法折叠总览正确；ZIP 只包含 timeline 和链路负载可视化"
 
 
 class Suite:

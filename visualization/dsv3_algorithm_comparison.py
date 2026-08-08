@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build one collapsible HTML dashboard for multiple DSV3 algorithm runs."""
+"""Build a DSV3 comparison dashboard and optional visualization-only ZIP."""
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ import argparse
 from html import escape
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import zipfile
 
 
 def parse_case(value: str) -> tuple[str, Path]:
@@ -29,6 +30,11 @@ def parse_args() -> argparse.Namespace:
         help="Algorithm case directory as ALGORITHM=CASE_DIR; repeat per algorithm.",
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--zip-output",
+        type=Path,
+        help="Optional ZIP containing only the dashboard and visualization assets.",
+    )
     parser.add_argument("--title", default="DSV3 EP32 Algorithm Comparison")
     return parser.parse_args()
 
@@ -54,6 +60,19 @@ def load_case(algorithm: str, case_dir: Path, output: Path) -> dict[str, object]
         if not path.is_file():
             raise FileNotFoundError(f"{algorithm}: missing artifact {path}")
     summary = json.loads(timeline_summary.read_text(encoding="utf-8"))
+    bundle_files: list[tuple[Path, str]] = []
+    for directory in (timeline_dir, case_dir / "link_load"):
+        for artifact in sorted(directory.iterdir()):
+            if not artifact.is_file():
+                continue
+            archive_name = relative_url(artifact, output)
+            archive_path = PurePosixPath(archive_name)
+            if archive_path.is_absolute() or ".." in archive_path.parts:
+                raise ValueError(
+                    f"{algorithm}: visualization artifact is outside dashboard root: "
+                    f"{artifact}"
+                )
+            bundle_files.append((artifact, archive_name))
     return {
         "algorithm": algorithm,
         "timeline_url": relative_url(timeline_html, output),
@@ -67,6 +86,7 @@ def load_case(algorithm: str, case_dir: Path, output: Path) -> dict[str, object]
         "overlap_us": float(
             summary["selected_rank_compute_network_overlap_sum_us"]
         ),
+        "bundle_files": bundle_files,
     }
 
 
@@ -139,6 +159,35 @@ document.getElementById('collapse').addEventListener('click', () => document.que
     path.write_text(document, encoding="utf-8")
 
 
+def write_visualization_zip(
+    path: Path,
+    dashboard: Path,
+    cases: list[dict[str, object]],
+) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    members: dict[str, Path] = {}
+    for case in cases:
+        for artifact, archive_name in case["bundle_files"]:
+            previous = members.get(archive_name)
+            if previous is not None and previous != artifact:
+                raise ValueError(f"duplicate ZIP member: {archive_name}")
+            members[archive_name] = artifact
+    with zipfile.ZipFile(
+        path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+    ) as archive:
+        archive.write(dashboard, dashboard.name)
+        for archive_name, artifact in sorted(members.items()):
+            archive.write(artifact, archive_name)
+    with zipfile.ZipFile(path) as archive:
+        broken = archive.testzip()
+        if broken is not None:
+            raise RuntimeError(f"corrupt ZIP member: {broken}")
+    return len(members) + 1
+
+
 def main() -> int:
     args = parse_args()
     output = args.output.resolve()
@@ -151,6 +200,10 @@ def main() -> int:
         cases.append(load_case(algorithm, case_dir.resolve(), output))
     write_dashboard(output, args.title, cases)
     print(f"wrote {output}")
+    if args.zip_output is not None:
+        zip_output = args.zip_output.resolve()
+        member_count = write_visualization_zip(zip_output, output, cases)
+        print(f"wrote {zip_output} ({member_count} files)")
     return 0
 
 

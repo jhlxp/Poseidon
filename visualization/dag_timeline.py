@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 from dataclasses import asdict, dataclass
+import gzip
 from html import escape
 import json
 import math
@@ -390,38 +392,85 @@ def _format_bytes(value: int) -> str:
     raise AssertionError("unreachable")
 
 
-def _event_tooltip(event: TaskEvent, lane: str) -> str:
-    task = event.task
-    fields = [
-        f"Task {task.task_id}: {task.key}",
-        f"Lane: {lane}",
-        f"Time: {event.start_us:.9g} - {event.end_us:.9g} us",
-        f"Actual duration: {event.actual_duration_us:.9g} us",
-        f"Barrier: {task.barrier_id}",
-    ]
-    if task.kind == "compute":
-        fields.extend(
+TASK_DATA_COLUMNS = (
+    "task_id",
+    "barrier_id",
+    "key",
+    "kind",
+    "rank",
+    "src_rank",
+    "dst_rank",
+    "start_us",
+    "end_us",
+    "actual_duration_us",
+    "declared_compute_us",
+    "transfer_bytes",
+    "logical_throughput_gbps",
+    "operation",
+    "payload_kind",
+    "communication_phase_id",
+    "route_spec",
+    "predecessor_count",
+    "overlaps_communication",
+)
+
+
+def _json_for_html(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).replace("</", "<\\/")
+
+
+def _task_data(events: tuple[TaskEvent, ...]) -> list[list[object]]:
+    records: list[list[object]] = []
+    for event in events:
+        task = event.task
+        records.append(
             [
-                f"Operation: {task.operation or 'compute'}",
-                f"Declared compute: {task.declared_duration_us:.9g} us",
-                f"Overlap schedule: {task.overlaps_communication}",
+                task.task_id,
+                task.barrier_id,
+                task.key,
+                "c" if task.kind == "compute" else "n",
+                task.rank,
+                task.src_rank,
+                task.dst_rank,
+                event.start_us,
+                event.end_us,
+                event.actual_duration_us,
+                task.declared_duration_us,
+                task.transfer_bytes,
+                event.logical_throughput_gbps,
+                task.operation,
+                task.payload_kind,
+                task.communication_phase_id,
+                task.route_spec,
+                len(task.predecessors),
+                task.overlaps_communication,
             ]
         )
-    else:
-        throughput = event.logical_throughput_gbps
-        fields.extend(
-            [
-                f"Endpoints: GPU {task.src_rank} -> GPU {task.dst_rank}",
-                f"Payload: {task.payload_kind or 'transfer'}",
-                f"Bytes: {task.transfer_bytes} ({_format_bytes(task.transfer_bytes)})",
-                f"Logical throughput: {throughput:.6g} Gbps" if throughput is not None else "",
-                f"Route: {task.route_spec or 'dynamic'}",
-            ]
-        )
-    fields.append(
-        "Predecessors: " + (", ".join(task.predecessors) if task.predecessors else "none")
+    return records
+
+
+def _compressed_predecessors(events: tuple[TaskEvent, ...]) -> str:
+    task_id_by_key = {event.task.key: event.task.task_id for event in events}
+    payload: list[list[object]] = []
+    for event in events:
+        predecessors = event.task.predecessors
+        if not predecessors:
+            continue
+        references = [
+            task_id_by_key.get(predecessor, predecessor)
+            for predecessor in predecessors
+        ]
+        payload.append([event.task.task_id, references])
+    compressed = gzip.compress(
+        _json_for_html(payload).encode("utf-8"),
+        compresslevel=9,
+        mtime=0,
     )
-    return "\n".join(field for field in fields if field)
+    return base64.b64encode(compressed).decode("ascii")
 
 
 def _lane_events(
@@ -536,31 +585,6 @@ def write_rank_summary(path: Path, summaries: tuple[RankSummary, ...]) -> None:
             writer.writerow(asdict(summary))
 
 
-def _html_task_rows(events: tuple[TaskEvent, ...]) -> str:
-    rows = []
-    for event in events:
-        task = event.task
-        endpoint = (
-            f"GPU {task.rank}"
-            if task.kind == "compute"
-            else f"GPU {task.src_rank} -> GPU {task.dst_rank}"
-        )
-        category = task.operation if task.kind == "compute" else task.payload_kind
-        throughput = event.logical_throughput_gbps
-        rows.append(
-            "<tr>"
-            f"<td>{task.task_id}</td><td>{escape(task.kind)}</td>"
-            f"<td class='key'>{escape(task.key)}</td><td>{escape(endpoint)}</td>"
-            f"<td>{escape(category or '')}</td>"
-            f"<td>{event.start_us:.9g}</td><td>{event.end_us:.9g}</td>"
-            f"<td>{event.actual_duration_us:.9g}</td>"
-            f"<td>{task.transfer_bytes or ''}</td>"
-            f"<td>{'' if throughput is None else f'{throughput:.6g}'}</td>"
-            "</tr>"
-        )
-    return "".join(rows)
-
-
 def write_html(
     path: Path,
     events: tuple[TaskEvent, ...],
@@ -576,6 +600,7 @@ def write_html(
     row_height = 23
     top_height = 35
     rows = [(rank, lane) for rank in selected_ranks for lane in LANES]
+    lane_codes = {lane: index for index, lane in enumerate(LANES)}
     svg_height = top_height + len(rows) * row_height + 18
     x_scale = timeline_width / max(makespan, 1e-12)
     svg_parts = [
@@ -595,14 +620,12 @@ def write_html(
         for event in _lane_events(events, rank, lane):
             x = event.start_us * x_scale
             width = max(event.actual_duration_us * x_scale, 1.2)
-            tooltip = escape(_event_tooltip(event, lane))
             svg_parts.append(
-                f"<rect class='task' data-start-us='{event.start_us:.12g}' "
-                f"data-duration-us='{event.actual_duration_us:.12g}' "
+                f"<rect class='task' data-task-id='{event.task.task_id}' "
+                f"data-lane='{lane_codes[lane]}' "
                 f"x='{x:.3f}' y='{y + 3}' width='{width:.3f}' "
                 f"height='{row_height - 6}' rx='1.5' fill='{_task_color(event.task)}' "
-                "fill-opacity='0.86' stroke='#FFFFFF' stroke-width='0.35'>"
-                f"<title>{tooltip}</title></rect>"
+                "fill-opacity='0.86' stroke='#FFFFFF' stroke-width='0.35'/>"
             )
         if lane == "Network RX":
             svg_parts.append(
@@ -649,6 +672,9 @@ def write_html(
         f"<span><i style='background:{color}'></i>{escape(label)}</span>"
         for label, color in legend_items
     )
+    task_data_json = _json_for_html(_task_data(events))
+    task_columns_json = _json_for_html(TASK_DATA_COLUMNS)
+    predecessor_payload = _compressed_predecessors(events)
 
     document = f"""<!doctype html>
 <html lang="en">
@@ -683,6 +709,23 @@ h1 {{ margin: 0 0 5px; font-size: 22px; font-weight: 650; }}
 .lane-label span {{ color: #697582; font-size: 10px; }}
 .viewport {{ overflow: auto; }}
 .task:hover {{ fill-opacity: 1; stroke: #111827; stroke-width: 1; }}
+.task.selected {{ fill-opacity: 1; stroke: #111827; stroke-width: 1.4; }}
+.hover-tooltip {{ position: fixed; z-index: 20; max-width: 440px; padding: 8px 10px; border: 1px solid #9DA8B5; background: #FFFFFF; box-shadow: 0 4px 14px rgba(23, 33, 43, 0.16); pointer-events: none; font-size: 11px; line-height: 1.45; }}
+.hover-tooltip strong {{ display: block; margin-bottom: 4px; overflow-wrap: anywhere; }}
+.hover-tooltip span {{ display: block; color: #4F5D6B; }}
+.task-inspector {{ margin: 0 16px 16px; padding: 12px 14px; border: 1px solid #C9D1DA; background: #FFFFFF; }}
+.inspector-head {{ display: flex; align-items: flex-start; gap: 10px; }}
+.inspector-head strong {{ overflow-wrap: anywhere; }}
+.inspector-head button {{ margin-left: auto; width: 28px; height: 28px; border: 1px solid #B8C1CC; background: #FFFFFF; cursor: pointer; }}
+.inspector-grid {{ display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 8px 16px; margin-top: 10px; font-size: 11px; }}
+.inspector-grid div {{ min-width: 0; }}
+.inspector-grid span {{ display: block; color: #697582; font-size: 10px; text-transform: uppercase; }}
+.inspector-grid strong {{ display: block; margin-top: 2px; overflow-wrap: anywhere; }}
+.predecessor-details {{ margin-top: 10px; border-top: 1px solid #D7DDE5; }}
+.predecessor-details summary {{ padding: 9px 0 0; cursor: pointer; font-size: 12px; font-weight: 650; }}
+.predecessor-list {{ max-height: 260px; overflow: auto; margin-top: 8px; font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }}
+.predecessor-list ol {{ margin: 0; padding-left: 26px; }}
+.predecessor-list li {{ overflow-wrap: anywhere; }}
 .details {{ margin: 16px; background: #FFFFFF; border: 1px solid #C9D1DA; }}
 .details summary {{ padding: 12px 14px; cursor: pointer; font-size: 15px; font-weight: 650; }}
 .details-scroll {{ overflow: auto; max-height: 520px; border-top: 1px solid #D7DDE5; }}
@@ -690,7 +733,7 @@ table {{ width: 100%; border-collapse: collapse; font-size: 11px; }}
 th {{ position: sticky; top: 0; background: #EEF2F6; text-align: left; z-index: 1; }}
 th, td {{ padding: 6px 8px; border-bottom: 1px solid #E4E8ED; white-space: nowrap; }}
 td.key {{ max-width: 420px; overflow: hidden; text-overflow: ellipsis; }}
-@media (max-width: 900px) {{ .cards {{ grid-template-columns: repeat(2, 1fr); }} .timeline-shell {{ grid-template-columns: 130px minmax(0, 1fr); }} }}
+@media (max-width: 900px) {{ .cards {{ grid-template-columns: repeat(2, 1fr); }} .timeline-shell {{ grid-template-columns: 130px minmax(0, 1fr); }} .inspector-grid {{ grid-template-columns: repeat(2, minmax(120px, 1fr)); }} }}
 </style>
 </head>
 <body>
@@ -700,7 +743,12 @@ td.key {{ max-width: 420px; overflow: hidden; text-overflow: ellipsis; }}
 <div class="timeline-toolbar"><button type="button" class="zoom-out" title="Zoom out">−</button><input class="zoom-slider" type="range" min="0" max="8" step="0.25" value="0" aria-label="Timeline zoom"><button type="button" class="zoom-in" title="Zoom in">+</button><button type="button" class="fit" title="Fit complete timeline">Fit</button><output class="scale-readout"></output></div>
 <section class="timeline-shell"><div class="labels">{''.join(labels)}</div><div class="viewport">{''.join(svg_parts)}</div></section>
 </div>
-<details class="details"><summary>Task details ({len(events)})</summary><div class="details-scroll"><table><thead><tr><th>ID</th><th>Kind</th><th>Task</th><th>GPU endpoint</th><th>Category</th><th>Start us</th><th>End us</th><th>FCT us</th><th>Bytes</th><th>Logical Gbps</th></tr></thead><tbody>{_html_task_rows(events)}</tbody></table></div></details>
+<div class="hover-tooltip" hidden></div>
+<section class="task-inspector" hidden><div class="inspector-head"><strong></strong><button type="button" title="Close task inspector">X</button></div><div class="inspector-grid"></div><details class="predecessor-details"><summary></summary><div class="predecessor-list"></div></details></section>
+<details class="details"><summary>Task details ({len(events)})</summary><div class="details-scroll"><table><thead><tr><th>ID</th><th>Kind</th><th>Task</th><th>GPU endpoint</th><th>Category</th><th>Start us</th><th>End us</th><th>FCT us</th><th>Bytes</th><th>Logical Gbps</th></tr></thead><tbody></tbody></table></div></details>
+<script type="application/json" id="task-columns">{task_columns_json}</script>
+<script type="application/json" id="task-data">{task_data_json}</script>
+<script type="text/plain" id="predecessor-data">{predecessor_payload}</script>
 <script>
 (() => {{
   const panel = document.querySelector('.timeline-panel');
@@ -711,7 +759,145 @@ td.key {{ max-width: 420px; overflow: hidden; text-overflow: ellipsis; }}
   const makespan = Number(panel.dataset.makespanUs);
   const svgHeight = Number(panel.dataset.svgHeight);
   const topHeight = Number(panel.dataset.topHeight);
+  const columns = JSON.parse(document.getElementById('task-columns').textContent);
+  const I = Object.fromEntries(columns.map((name, index) => [name, index]));
+  const taskRows = JSON.parse(document.getElementById('task-data').textContent);
+  const tasks = new Map(taskRows.map(row => [row[I.task_id], row]));
+  const laneNames = ['Compute', 'Network TX', 'Network RX'];
+  const hoverTooltip = document.querySelector('.hover-tooltip');
+  const inspector = document.querySelector('.task-inspector');
+  const inspectorTitle = inspector.querySelector('.inspector-head strong');
+  const inspectorGrid = inspector.querySelector('.inspector-grid');
+  const predecessorDetails = inspector.querySelector('.predecessor-details');
+  const predecessorSummary = predecessorDetails.querySelector('summary');
+  const predecessorList = predecessorDetails.querySelector('.predecessor-list');
+  const taskDetails = document.querySelector('.details');
   let scale = 1;
+  let selectedBar = null;
+  let predecessorMapPromise = null;
+
+  function escapeHtml(value) {{
+    return String(value ?? '').replace(/[&<>"']/g, character => ({{
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }})[character]);
+  }}
+
+  function number(value) {{
+    return value === null ? '' : String(Number(Number(value).toPrecision(7)));
+  }}
+
+  function kind(row) {{
+    return row[I.kind] === 'c' ? 'compute' : 'transfer';
+  }}
+
+  function endpoint(row) {{
+    return row[I.kind] === 'c'
+      ? `GPU ${{row[I.rank]}}`
+      : `GPU ${{row[I.src_rank]}} -> GPU ${{row[I.dst_rank]}}`;
+  }}
+
+  function category(row) {{
+    return row[I.kind] === 'c' ? row[I.operation] : row[I.payload_kind];
+  }}
+
+  function formatBytes(value) {{
+    let amount = Number(value);
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    let unit = 0;
+    while (amount >= 1024 && unit < units.length - 1) {{ amount /= 1024; unit += 1; }}
+    return `${{Number(amount.toPrecision(6))}} ${{units[unit]}}`;
+  }}
+
+  function summaryHtml(row, lane) {{
+    const lines = [
+      `<strong>Task ${{row[I.task_id]}}: ${{escapeHtml(row[I.key])}}</strong>`,
+      `<span>${{escapeHtml(lane)}} · ${{number(row[I.start_us])}}-${{number(row[I.end_us])}} us · FCT ${{number(row[I.actual_duration_us])}} us</span>`,
+      `<span>${{escapeHtml(endpoint(row))}} · ${{escapeHtml(category(row) || kind(row))}} · predecessors ${{row[I.predecessor_count]}}</span>`,
+    ];
+    if (row[I.kind] === 'n') lines.push(`<span>${{formatBytes(row[I.transfer_bytes])}} · ${{number(row[I.logical_throughput_gbps])}} Gbps</span>`);
+    return lines.join('');
+  }}
+
+  function inspectorFields(row, lane) {{
+    const fields = [
+      ['Lane', lane],
+      ['Kind', kind(row)],
+      ['Endpoint', endpoint(row)],
+      ['Category', category(row) || ''],
+      ['Start', `${{number(row[I.start_us])}} us`],
+      ['End', `${{number(row[I.end_us])}} us`],
+      ['FCT', `${{number(row[I.actual_duration_us])}} us`],
+      ['Barrier', row[I.barrier_id]],
+    ];
+    if (row[I.kind] === 'c') {{
+      fields.push(['Declared compute', `${{number(row[I.declared_compute_us])}} us`]);
+      fields.push(['Communication overlap', row[I.overlaps_communication]]);
+    }} else {{
+      fields.push(['Bytes', `${{row[I.transfer_bytes]}} (${{formatBytes(row[I.transfer_bytes])}})`]);
+      fields.push(['Logical throughput', `${{number(row[I.logical_throughput_gbps])}} Gbps`]);
+      fields.push(['Route', row[I.route_spec] || 'dynamic']);
+      fields.push(['Phase', row[I.communication_phase_id] || '']);
+    }}
+    return fields.map(([label, value]) => `<div><span>${{escapeHtml(label)}}</span><strong>${{escapeHtml(value)}}</strong></div>`).join('');
+  }}
+
+  async function loadPredecessorMap() {{
+    if (predecessorMapPromise) return predecessorMapPromise;
+    predecessorMapPromise = (async () => {{
+      if (!('DecompressionStream' in window)) throw new Error('Browser does not support gzip decompression');
+      const encoded = document.getElementById('predecessor-data').textContent.trim();
+      const binary = atob(encoded);
+      const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+      const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+      const payload = await new Response(stream).json();
+      return new Map(payload);
+    }})();
+    return predecessorMapPromise;
+  }}
+
+  async function renderPredecessors(taskId) {{
+    const expected = String(taskId);
+    predecessorList.textContent = 'Loading...';
+    try {{
+      const predecessorMap = await loadPredecessorMap();
+      if (inspector.dataset.taskId !== expected) return;
+      const references = predecessorMap.get(taskId) || [];
+      if (!references.length) {{ predecessorList.textContent = 'None'; return; }}
+      const names = references.map(reference =>
+        typeof reference === 'number' && tasks.has(reference)
+          ? tasks.get(reference)[I.key]
+          : String(reference)
+      );
+      predecessorList.innerHTML = `<ol>${{names.map(name => `<li>${{escapeHtml(name)}}</li>`).join('')}}</ol>`;
+    }} catch (error) {{
+      predecessorList.textContent = String(error);
+    }}
+  }}
+
+  function selectTask(bar) {{
+    if (selectedBar) selectedBar.classList.remove('selected');
+    selectedBar = bar;
+    selectedBar.classList.add('selected');
+    const row = tasks.get(Number(bar.dataset.taskId));
+    const lane = laneNames[Number(bar.dataset.lane)];
+    inspector.dataset.taskId = String(row[I.task_id]);
+    inspectorTitle.textContent = `Task ${{row[I.task_id]}}: ${{row[I.key]}}`;
+    inspectorGrid.innerHTML = inspectorFields(row, lane);
+    predecessorSummary.textContent = `Predecessors (${{row[I.predecessor_count]}})`;
+    predecessorDetails.open = false;
+    predecessorList.textContent = '';
+    inspector.hidden = false;
+  }}
+
+  function renderTaskTable() {{
+    if (taskDetails.dataset.rendered) return;
+    taskDetails.dataset.rendered = 'true';
+    taskDetails.querySelector('tbody').innerHTML = taskRows.map(row => `
+      <tr><td>${{row[I.task_id]}}</td><td>${{kind(row)}}</td><td class="key">${{escapeHtml(row[I.key])}}</td>
+      <td>${{escapeHtml(endpoint(row))}}</td><td>${{escapeHtml(category(row) || '')}}</td>
+      <td>${{number(row[I.start_us])}}</td><td>${{number(row[I.end_us])}}</td><td>${{number(row[I.actual_duration_us])}}</td>
+      <td>${{row[I.transfer_bytes] || ''}}</td><td>${{number(row[I.logical_throughput_gbps])}}</td></tr>`).join('');
+  }}
 
   function niceStep(raw) {{
     const power = Math.pow(10, Math.floor(Math.log10(Math.max(raw, 1e-12))));
@@ -742,10 +928,9 @@ td.key {{ max-width: 420px; overflow: hidden; text-overflow: ellipsis; }}
     svg.querySelectorAll('.row-background').forEach(item => item.setAttribute('width', String(width)));
     svg.querySelectorAll('.row-separator').forEach(item => item.setAttribute('x2', String(width)));
     svg.querySelectorAll('.task').forEach(item => {{
-      const start = Number(item.dataset.startUs);
-      const duration = Number(item.dataset.durationUs);
-      item.setAttribute('x', String(start * scale));
-      item.setAttribute('width', String(Math.max(duration * scale, 1.2)));
+      const row = tasks.get(Number(item.dataset.taskId));
+      item.setAttribute('x', String(row[I.start_us] * scale));
+      item.setAttribute('width', String(Math.max(row[I.actual_duration_us] * scale, 1.2)));
     }});
     drawRuler(width);
     readout.value = `100 px = ${{(100 / scale).toPrecision(6)}} us · visible ${{(viewport.clientWidth / scale).toPrecision(6)}} us · total ${{makespan.toPrecision(7)}} us`;
@@ -776,6 +961,33 @@ td.key {{ max-width: 420px; overflow: hidden; text-overflow: ellipsis; }}
     slider.value = String(Math.max(Number(slider.min), Math.min(Number(slider.max), Number(slider.value) + delta)));
     applyZoom(Number(slider.value));
   }}, {{ passive: false }});
+  svg.addEventListener('pointermove', event => {{
+    const bar = event.target.closest && event.target.closest('.task');
+    if (!bar) {{ hoverTooltip.hidden = true; return; }}
+    const row = tasks.get(Number(bar.dataset.taskId));
+    hoverTooltip.innerHTML = summaryHtml(row, laneNames[Number(bar.dataset.lane)]);
+    hoverTooltip.hidden = false;
+    const margin = 12;
+    const bounds = hoverTooltip.getBoundingClientRect();
+    hoverTooltip.style.left = `${{Math.min(event.clientX + margin, window.innerWidth - bounds.width - margin)}}px`;
+    hoverTooltip.style.top = `${{Math.min(event.clientY + margin, window.innerHeight - bounds.height - margin)}}px`;
+  }});
+  svg.addEventListener('pointerleave', () => {{ hoverTooltip.hidden = true; }});
+  svg.addEventListener('click', event => {{
+    const bar = event.target.closest && event.target.closest('.task');
+    if (bar) selectTask(bar);
+  }});
+  inspector.querySelector('.inspector-head button').addEventListener('click', () => {{
+    inspector.hidden = true;
+    if (selectedBar) selectedBar.classList.remove('selected');
+    selectedBar = null;
+  }});
+  predecessorDetails.addEventListener('toggle', () => {{
+    if (predecessorDetails.open) renderPredecessors(Number(inspector.dataset.taskId));
+  }});
+  taskDetails.addEventListener('toggle', () => {{
+    if (taskDetails.open) renderTaskTable();
+  }});
   new ResizeObserver(() => applyZoom(Number(slider.value), Number(slider.value) > 0)).observe(viewport);
   applyZoom(0, false);
 }})();

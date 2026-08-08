@@ -209,9 +209,11 @@ Attention 1
 - network task 提供 `src_rank`、`dst_rank`、`transfer_bytes` 和 task/flow ID。
 - `-load_balancing_algo ecmp` 下，MpRail 根据 flow ID 固定 source plane，UEC 固定 `pathid`，因此一个 network task 使用一条 flow-level ECMP 路径。
 - `-load_balancing_algo oblivious` 下，UEC 逐包改变 `pathid`，NIC 可在多个 plane port 间调度，并在各 plane 内使用多个 Spine ECMP 路径。
-- 专用测试配置 `plane=1` 时，两种策略都只进入 plane 0，但仍可验证单 plane 内的 8-Spine ECMP。
+- `ecmp_rr` 使用交换机本地逐包轮询；专用测试配置 `plane=1` 时，flow ECMP、
+  oblivious spray 和 ecmp_rr 都只进入 plane 0，但仍可验证单 plane 内的
+  4-Spine 负载均衡。
 - L0/L1 在 packet 所属 plane 内，根据 `(flow_id, pathid, switch_salt)` 对 L1-EPS 和 bundle 执行 ECMP。
-- 同一 barrier 的多个 network task 在两种模式下都可以并发执行并产生网络竞争。
+- 同一 barrier 的多个 network task 在三种路由策略下都可以并发执行并产生网络竞争。
 - compute task 不进入网络拓扑。
 
 MpRail 的网络竞争由 Queue 和 UEC 决定。network task 和没有依赖冲突的 compute task 可以在事件时间线上同时推进；barrier 在二者都完成后释放，因此已经能够表达通信与计算 overlap。

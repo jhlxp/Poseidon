@@ -201,16 +201,16 @@ SERVER_FORWARD_PHASE_DONE flow=3 phase=dst_local time_us=...
 SERVER_FORWARD_DONE flow=3 time_us=...
 ```
 
-### 4.5 DeepEP 的目标端转发特例
+### 4.5 与 DeepEP 分层 builder 的关系
 
-DeepEP 只使用 destination-side forwarding：
+`server_forward` 可以表达历史上的 destination-side coarse 模型：
 
 ```text
 src_relay = logical src_rank
 dst_relay = 目标服务器中与 src_rank 相同 local index 的 rank
 ```
 
-因此 source-local phase 永远跳过。对于逻辑 task `0 -> 9`、每服务器 8 张 GPU：
+此时 source-local phase 跳过。对于逻辑 task `0 -> 9`、每服务器 8 张 GPU：
 
 ```text
 route server_forward src_relay:0 dst_relay:8
@@ -221,7 +221,12 @@ route server_forward src_relay:0 dst_relay:8
 
 两个 flow 严格串行，但仍属于一个 DAG network task。task 只有在 `dst_local`
 完成后才通知 barrier；若逻辑目标就是 relay，例如 `0 -> 8`，则只执行 fabric
-flow。DeepEP 不使用三阶段模型中的 source-local flow。
+flow。
+
+当前 DeepEP/EPLB/MoonEP builder 不使用这个 coarse 封装。它们显式生成
+`dispatch_fabric -> dispatch_local` 和
+`combine_local_reduce -> combine_fabric`，以支持一份 RDMA payload 被多个目标
+rank 共享。`server_forward` 继续作为 CM/DAG 的通用源路由功能独立测试。
 
 ## 5. 错误处理
 
@@ -243,7 +248,7 @@ route 语法错误或拓扑坐标不合法时，程序必须在事件循环开�
 - `explicit` 的实际链路严格等于输入坐标，且不受三种全局路由策略影响。
 - 显式正向与自动反向路径使用成对的 plane、spine 和 bundle。
 - `server_forward` 三阶段严格串行，跳过规则正确。
-- DeepEP 目标端转发固定跳过 source-local，并正确执行一或两个实际 flow。
+- destination-side coarse 用例固定跳过 source-local，并正确执行一或两个实际 flow。
 - CM 与 DAG 都支持两种 route 模式。
 - DAG task 只在最终本地 phase 完成后通知 barrier。
 - 非法输入在仿真开始前确定性失败。
