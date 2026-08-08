@@ -79,6 +79,10 @@ sequence length、hidden shape 和 kernel 定义有关，因此配置不是跨�
 | `combine_final_reduce` | `source_token_with_topk8` | 当前 source rank 的输入 tokens |
 | `per_server_planning_proxy` | `server_routed_expert_token` | 当前 server 内需要规划的 expert routes |
 
+`per_server_planning_proxy` 仅供 MoonEP 的 GPU 理论占位 task 使用，不是通用 CPU
+planner 时间。ProbeEP 不读取该配置项，也不生成对应 task；ProbeEP planner 和 route
+lowering 均为离线 workload 生成步骤，不进入 compute profile、DAG 或 makespan。
+
 `expert_ffn` 的一个 routed expert token 是一条 token-to-expert route。DSV3
 `topk=8` 时，一个 source token 会产生 8 个 routed expert tokens。NCCL 和 DeepEP
 按原始 expert placement 聚合；EPLB 按 physical expert placement 聚合；MoonEP

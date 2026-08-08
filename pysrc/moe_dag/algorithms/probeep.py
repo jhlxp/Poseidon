@@ -197,7 +197,7 @@ class ProbeNICController:
 
 @dataclass(frozen=True)
 class ProbeEPConfig:
-    replicas_per_rank: int
+    expert_slots_per_rank: int
     token_padding: int = 128
     chunk_tokens: int = 128
     route_chunk_tokens: int = 128
@@ -208,8 +208,8 @@ class ProbeEPConfig:
     nic_controller: ProbeNICControllerConfig = ProbeNICControllerConfig()
 
     def __post_init__(self) -> None:
-        if self.replicas_per_rank < 0:
-            raise ValidationError("replicas_per_rank must be non-negative")
+        if self.expert_slots_per_rank <= 0:
+            raise ValidationError("expert_slots_per_rank must be positive")
         if self.token_padding <= 0:
             raise ValidationError("token_padding must be positive")
         if self.chunk_tokens <= 0:
@@ -331,6 +331,7 @@ class ProbeEPPlan:
     final_padded_routes_by_rank: dict[int, int]
     baseline_compute_us_by_rank: dict[int, float]
     final_compute_us_by_rank: dict[int, float]
+    final_temporary_experts_by_rank: dict[int, tuple[int, ...]]
     nic_budget_before: tuple[int, ...]
     assigned_migration_tx_bytes: tuple[int, ...]
     assigned_migration_rx_bytes: tuple[int, ...]
@@ -369,6 +370,13 @@ class ProbeEPBuilder:
 
     def plan(self, invocation: MoEInvocation) -> ProbeEPPlan:
         placement = invocation.placement
+        home_slots = self._home_expert_slots(placement)
+        if max(home_slots, default=0) > self.config.expert_slots_per_rank:
+            raise ValidationError(
+                "ProbeEP expert slot capacity is smaller than the static home "
+                f"placement: slots={self.config.expert_slots_per_rank}, "
+                f"max_home={max(home_slots)}"
+            )
         controller = self._ensure_controller(placement.num_ranks)
         assignments = invocation.assignments
         assignments_by_key = {
@@ -459,6 +467,9 @@ class ProbeEPBuilder:
             final_padded_routes_by_rank=final_padded,
             baseline_compute_us_by_rank=baseline_compute,
             final_compute_us_by_rank=final_compute,
+            final_temporary_experts_by_rank=(
+                final_intra.temporary_experts_by_rank
+            ),
             nic_budget_before=controller.budgets,
             assigned_migration_tx_bytes=tuple(assigned_tx),
             assigned_migration_rx_bytes=tuple(assigned_rx),
@@ -793,7 +804,24 @@ class ProbeEPBuilder:
                 ],
                 "route_chunk_tokens": self.config.route_chunk_tokens,
                 "weight_chunk_bytes": self.config.weight_chunk_bytes,
-                "replicas_per_rank": self.config.replicas_per_rank,
+                "expert_slots_per_rank": self.config.expert_slots_per_rank,
+                "home_expert_slots_by_rank": self._home_expert_slots(
+                    placement
+                ),
+                "temporary_expert_slots_by_rank": {
+                    rank: len(experts)
+                    for rank, experts in (
+                        plan.final_temporary_experts_by_rank.items()
+                    )
+                },
+                "total_expert_slots_used_by_rank": {
+                    rank: home_slots + len(
+                        plan.final_temporary_experts_by_rank[rank]
+                    )
+                    for rank, home_slots in enumerate(
+                        self._home_expert_slots(placement)
+                    )
+                },
                 "token_padding": self.config.token_padding,
                 "scale_out_transport": "deepep_hierarchical",
                 "token_payload_policy": {
@@ -1085,6 +1113,7 @@ class ProbeEPBuilder:
         route_server: dict[RouteKey, int],
     ) -> _IntraServerPlan:
         placement = invocation.placement
+        home_slots = self._home_expert_slots(placement)
         routes_by_server_expert: dict[
             tuple[int, int], list[RouteKey]
         ] = defaultdict(list)
@@ -1130,7 +1159,8 @@ class ProbeEPBuilder:
                         rank
                         for rank in ranks
                         if remaining[rank] > 0
-                        and len(temporary[rank]) < self.config.replicas_per_rank
+                        and home_slots[rank] + len(temporary[rank])
+                        < self.config.expert_slots_per_rank
                     ]
                     if not available_anchors:
                         raise ValidationError(
@@ -1152,13 +1182,15 @@ class ProbeEPBuilder:
                         for rank in ranks
                         if rank not in candidates
                         and remaining[rank] > 0
-                        and len(temporary[rank]) < self.config.replicas_per_rank
+                        and home_slots[rank] + len(temporary[rank])
+                        < self.config.expert_slots_per_rank
                     ]
                     if not available:
                         raise ValidationError(
                             "ProbeEP intra-server planner cannot balance expert "
                             f"{expert} on server {server} with "
-                            f"replicas_per_rank={self.config.replicas_per_rank}"
+                            "expert_slots_per_rank="
+                            f"{self.config.expert_slots_per_rank}"
                         )
                     rank = min(
                         available, key=lambda item: (-remaining[item], item)
@@ -1253,6 +1285,13 @@ class ProbeEPBuilder:
                 "ProbeEP controller rank count differs from placement"
             )
         return self._controller
+
+    @staticmethod
+    def _home_expert_slots(placement: Placement) -> tuple[int, ...]:
+        slots = [0] * placement.num_ranks
+        for rank in placement.expert_to_rank:
+            slots[rank] += 1
+        return tuple(slots)
 
     @staticmethod
     def _server_route_counts(

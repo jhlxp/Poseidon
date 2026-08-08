@@ -103,9 +103,12 @@ def build_inputs(input_dir: Path) -> tuple[Path, Path, Path]:
         "num_ranks": 2,
         "task_count": 5,
         "barrier_count": 5,
-        "compute_task_count": 4,
-        "transfer_task_count": 1,
-        "transfer_bytes_by_payload": {"dispatch_hidden": 1_000_000},
+        "compute_task_count": 3,
+        "transfer_task_count": 2,
+        "transfer_bytes_by_payload": {
+            "dispatch_hidden": 1_000_000,
+            "expert_weight_rdma": 2_000_000,
+        },
         "metadata": {},
     }
     tasks = [
@@ -125,6 +128,7 @@ def build_inputs(input_dir: Path) -> tuple[Path, Path, Path]:
             dst_rank=1,
             transfer_bytes=1_000_000,
             payload_kind="dispatch_hidden",
+            predecessors=("mb0.probeep.weight.rdma",),
         ),
         task_record(
             3,
@@ -145,12 +149,12 @@ def build_inputs(input_dir: Path) -> tuple[Path, Path, Path]:
         ),
         task_record(
             5,
-            "mb0.probeep.cpu_planner",
-            "compute",
-            rank=0,
-            duration_us=1.0,
-            operation="probeep_planner",
-            logical_resource="cpu",
+            "mb0.probeep.weight.rdma",
+            "transfer",
+            src_rank=1,
+            dst_rank=0,
+            transfer_bytes=2_000_000,
+            payload_kind="expert_weight_rdma",
         ),
     ]
     manifest_path = workload_dir / "manifest.json"
@@ -169,14 +173,14 @@ def build_inputs(input_dir: Path) -> tuple[Path, Path, Path]:
             [
                 "DAG_TASK_START task=1 barrier=0 src_rank=0 dst_rank=0 transfer_bytes=0 compute_us=10 time_us=0",
                 "DAG_TASK_START task=3 barrier=2 src_rank=1 dst_rank=1 transfer_bytes=0 compute_us=4 time_us=0",
-                "DAG_TASK_START task=2 barrier=1 src_rank=0 dst_rank=1 transfer_bytes=1000000 compute_us=0 time_us=2",
+                "DAG_TASK_START task=5 barrier=4 src_rank=1 dst_rank=0 transfer_bytes=2000000 compute_us=0 time_us=2",
                 "DAG_TASK_DONE task=3 barrier=2 time_us=4",
-                "DAG_TASK_DONE task=2 barrier=1 time_us=8",
+                "DAG_TASK_DONE task=5 barrier=4 time_us=4",
+                "DAG_TASK_START task=2 barrier=1 src_rank=0 dst_rank=1 transfer_bytes=1000000 compute_us=0 time_us=4",
                 "DAG_TASK_DONE task=1 barrier=0 time_us=10",
+                "DAG_TASK_DONE task=2 barrier=1 time_us=10",
                 "DAG_TASK_START task=4 barrier=3 src_rank=0 dst_rank=0 transfer_bytes=0 compute_us=5 time_us=10",
                 "DAG_TASK_DONE task=4 barrier=3 time_us=15",
-                "DAG_TASK_START task=5 barrier=4 src_rank=0 dst_rank=0 transfer_bytes=0 compute_us=1 time_us=0.5",
-                "DAG_TASK_DONE task=5 barrier=4 time_us=1.5",
                 "DAG_SUMMARY tasks=5 barriers=5 makespan_us=15",
             ]
         )
@@ -197,15 +201,17 @@ def parser_overlap_case(task_map_path: Path, log_path: Path) -> str:
         "logical throughput 计算错误",
     )
     require(summaries[0].compute_active_us == 15.0, "GPU0 compute union 应为 15us")
-    require(summaries[0].network_active_us == 6.0, "GPU0 network union 应为 6us")
-    require(summaries[0].compute_network_overlap_us == 6.0,
-            "GPU0 compute/network overlap 应为 6us")
+    require(summaries[0].network_active_us == 8.0, "GPU0 network union 应为 8us")
+    require(summaries[0].compute_network_overlap_us == 8.0,
+            "GPU0 compute/network overlap 应为 8us")
     require(summaries[1].compute_network_overlap_us == 2.0,
             "GPU1 compute/network overlap 应为 2us")
     require(summaries[0].tx_bytes == 1_000_000, "GPU0 TX bytes 错误")
     require(summaries[1].rx_bytes == 1_000_000, "GPU1 RX bytes 错误")
-    require(summaries[0].compute_tasks == 2, "CPU planner 不应计入 GPU compute")
-    return "5 task join 完整；CPU planner 与 GPU compute 分离；GPU0/GPU1 overlap=6us/2us"
+    require(summaries[0].compute_tasks == 2, "GPU0 compute task 计数错误")
+    require(summaries[0].rx_bytes == 2_000_000,
+            "GPU0 expert weight RX bytes 错误")
+    return "5 task join 完整；weight 先于 dispatch；GPU0/GPU1 overlap=8us/2us"
 
 
 def invalid_log_case(task_map_path: Path, log_path: Path, input_dir: Path) -> str:
@@ -281,15 +287,32 @@ def cli_case(
     require(completed.returncode == 0, f"可视化 CLI 返回码 {completed.returncode}")
     require("parsed 5 tasks across 2 ranks; makespan 15 us" in completed.stdout,
             "CLI 汇总不正确")
-    return "CLI 成功生成 CPU planner 与 2 GPU Compute/TX/RX timeline"
+    return "CLI 成功把 expert weight 与 token 通信画入 2 GPU TX/RX timeline"
 
 
 def artifacts_case(output_dir: Path) -> str:
     html = (output_dir / "dag_gpu_timeline.html").read_text(encoding="utf-8")
     require("GPU 00" in html and "Network TX" in html and "Network RX" in html,
             "HTML 缺少 GPU 三 lane")
-    require("Host CPU" in html and "CPU Planner" in html,
-            "HTML 缺少独立 CPU planner lane")
+    require("Expert weights" not in html and "Expert Transfer" not in html,
+            "HTML 不应生成独立 expert transfer lane/card")
+    require("Expert weight" in html, "HTML legend 缺少 expert weight 类别")
+    require(html.count("data-task-id='5'") == 2,
+            "expert weight 应只出现在对应 source TX 和 destination RX")
+    weight_bars = re.findall(
+        r"data-task-id='5'[^>]+fill='(#[0-9A-F]{6})'", html
+    )
+    require(weight_bars == ["#0891B2", "#0891B2"],
+            "expert weight TX/RX 没有使用统一独立颜色")
+    legend = re.search(r'<div class="legend">(.*?)</div>', html, re.DOTALL)
+    require(legend is not None, "HTML 缺少颜色图例")
+    legend_colors = re.findall(
+        r"<i style='background:(#[0-9A-F]{6})'", legend.group(1)
+    )
+    require(len(legend_colors) == 7 and len(set(legend_colors)) == 7,
+            f"主类别必须使用七种不同颜色: {legend_colors}")
+    require("Host CPU" not in html and "CPU Planner" not in html,
+            "HTML 仍包含 CPU planner")
     require(html.count("<title>") == 1 and "Predecessors:" not in html,
             "SVG 仍在重复内联 tooltip 或 predecessor 文本")
     require("data-task-id='2'" in html and "class=\"hover-tooltip\"" in html,
@@ -344,7 +367,7 @@ def artifacts_case(output_dir: Path) -> str:
         newline="", encoding="utf-8"
     ) as handle:
         summaries = {int(row["rank"]): row for row in csv.DictReader(handle)}
-    require(summaries[0]["compute_network_overlap_us"] == "6.0",
+    require(summaries[0]["compute_network_overlap_us"] == "8.0",
             "rank summary overlap 错误")
     require(summaries[1]["rx_bytes"] == "1000000", "rank summary RX bytes 错误")
 
@@ -352,13 +375,19 @@ def artifacts_case(output_dir: Path) -> str:
         (output_dir / "dag_timeline_summary.json").read_text(encoding="utf-8")
     )
     require(overview["makespan_us"] == 15.0, "overview makespan 错误")
-    require(overview["compute_task_count"] == 3,
-            "overview 不应将 CPU planner 计入 GPU compute")
-    require(overview["cpu_planner_task_count"] == 1,
-            "overview 缺少 CPU planner 计数")
-    require(overview["logical_transfer_bytes"] == 1_000_000,
+    require(overview["compute_task_count"] == 3, "overview compute 计数错误")
+    require(overview["expert_weight_task_count"] == 1,
+            "overview 缺少 expert weight 计数")
+    require(overview["expert_weight_bytes"] == 2_000_000,
+            "overview expert weight 字节错误")
+    require(overview["expert_weight_active_us"] == 2.0,
+            "overview expert weight active 时间错误")
+    require(math.isclose(
+        overview["expert_weight_fraction_of_makespan"], 2.0 / 15.0
+    ), "overview expert weight makespan 占比错误")
+    require(overview["logical_transfer_bytes"] == 3_000_000,
             "overview logical bytes 错误")
-    require(overview["selected_rank_compute_network_overlap_sum_us"] == 8.0,
+    require(overview["selected_rank_compute_network_overlap_sum_us"] == 10.0,
             "overview aggregate overlap 错误")
 
     with (output_dir / "dag_task_timeline.csv").open(
@@ -375,7 +404,7 @@ def artifacts_case(output_dir: Path) -> str:
 
 def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
     case_dirs: list[tuple[str, Path]] = []
-    for algorithm in ("nccl", "deepep"):
+    for algorithm in ("nccl", "probeep"):
         case_dir = run_dir / "comparison_inputs" / algorithm
         case_timeline = case_dir / "timeline"
         case_gate = case_dir / "gate_load"
@@ -400,6 +429,53 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
         (case_link / "mprail_endpoint_load_summary.csv").write_text(
             "rank,tx_bytes\n0,1\n", encoding="utf-8"
         )
+        if algorithm == "probeep":
+            workload = case_dir / "workload"
+            workload.mkdir()
+            (workload / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "micro_batch_algorithms": [
+                                {
+                                    "layer": 0,
+                                    "micro_batch": 0,
+                                    "sample_id": 0,
+                                    "planned_migration_intents": [
+                                        {
+                                            "expert_id": 7,
+                                            "destination_server": 1,
+                                            "moved_route_count": 16,
+                                        }
+                                    ],
+                                    "admitted_migration_intents": [
+                                        {
+                                            "expert_id": 7,
+                                            "destination_server": 1,
+                                            "moved_route_count": 16,
+                                        }
+                                    ],
+                                    "deferred_migration_intents": [],
+                                    "remote_replicas": [
+                                        {
+                                            "expert_id": 7,
+                                            "destination_server": 1,
+                                        }
+                                    ],
+                                    "remote_weight_rdma_bytes": 88_080_384,
+                                    "expert_slots_per_rank": 40,
+                                    "total_expert_slots_used_by_rank": {
+                                        "0": 39,
+                                        "1": 12,
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                    indent=2,
+                ) + "\n",
+                encoding="utf-8",
+            )
         case_dirs.append((algorithm, case_dir))
 
     output = run_dir / "comparison.html"
@@ -440,7 +516,7 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
         "comparison_inputs/nccl/timeline/dag_gpu_timeline.html" in members
         and "comparison_inputs/nccl/gate_load/gate_load_profile.html" in members
         and "comparison_inputs/nccl/algorithm_dashboard.html" in members
-        and "comparison_inputs/deepep/link_load/mprail_link_load_by_layer.png"
+        and "comparison_inputs/probeep/link_load/mprail_link_load_by_layer.png"
         in members,
         "ZIP 缺少 Gate、timeline 或链路负载图",
     )
@@ -457,6 +533,19 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
         and "dag_gpu_timeline.html" in nccl_dashboard
         and "mprail_link_load_by_layer.png" in nccl_dashboard,
         "单算法 dashboard 没有囊括 Gate、timeline 和链路负载",
+    )
+    probeep_dashboard = (
+        run_dir
+        / "comparison_inputs"
+        / "probeep"
+        / "algorithm_dashboard.html"
+    ).read_text(encoding="utf-8")
+    require(
+        "Cross-server expert migration" in probeep_dashboard
+        and "1 cross-server expert moves" in probeep_dashboard
+        and "84 MiB" in probeep_dashboard
+        and "39/40 peak slots" in probeep_dashboard,
+        "ProbeEP dashboard 缺少跨机 expert 数和权重字节",
     )
     return "单算法完整 dashboard 和多算法总 dashboard 均正确打包"
 
@@ -477,8 +566,8 @@ def write_report(run_dir: Path, results: list[CaseResult]) -> None:
     lines = [
         "# DAG 执行时间线可视化测试报告",
         "",
-        "本测试构造两个 GPU、三个 compute task 和一个 network task。network 在",
-        "GPU0 compute 的 2-8us 区间内执行，同时与 GPU1 compute 的 2-4us 区间重叠。",
+        "本测试构造两个 GPU、三个 compute task、一个 dispatch task 和一个 expert weight task。",
+        "expert weight 在 2-4us 传输，dispatch 随后在 4-10us 传输，二者均画入真实 TX/RX。",
         "测试验证日志 join、实际 FCT、logical throughput、每卡 overlap、HTML",
         "hover、逐 task CSV、逐 rank CSV 和总览 JSON。",
         "",

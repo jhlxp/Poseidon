@@ -485,6 +485,7 @@ GateProvider -> GateSample
 生成合并 ZIP。Gate 分布错误时，应先检查 pure-Python 的采样与守恒报告，不应用
 网络结果反向猜测问题。偏斜 Gate 也可能超过 MoonEP 配置的临时副本容量；runner
 不会静默放宽算法约束，可通过 `--moonep-replicas-per-rank` 显式给出容量。当前
-raw layer 0/1 的 2-token smoke、seed 17 需要 10 才能完成严格 rank 均衡；该数值
-只属于这个 smoke。相同 layer/seed 的 4096tpr quota 在当前 planner 中需要 14；
-两者都是显式容量实验参数，不应推广为其他分布的默认值。
+raw layer 0/1 的 2-token smoke、seed 17 下，MoonEP 需要显式给足临时 replica 容量；
+相同 layer/seed 的 4096tpr MoonEP quota 曾使用 14 temporary replicas/rank。ProbeEP
+采用不同口径：`expert_slots_per_rank=40` 是 8 home + 最多 32 temporary 的总容量。
+当前 ProbeEP 实验假设显存充足，不用人为 slot cap 限制迁移。

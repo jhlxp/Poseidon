@@ -909,7 +909,7 @@ def probeep_cross_server_case(run_dir: Path) -> str:
     result = ProbeEPBuilder(
         LinearTokenCostModel(),
         ProbeEPConfig(
-            replicas_per_rank=2,
+            expert_slots_per_rank=3,
             token_padding=1,
             chunk_tokens=8,
             route_chunk_tokens=8,
@@ -1101,6 +1101,7 @@ def probeep_sample_sequence_case() -> str:
             algorithm="probeep",
             chunk_tokens=2,
             replicas_per_rank=2,
+            probeep_expert_slots_per_rank=3,
             token_padding=1,
         ),
         cost_model=FixedOperationCostModel(),

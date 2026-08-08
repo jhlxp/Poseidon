@@ -27,22 +27,32 @@ _SERVER_FORWARD_RE = re.compile(
 )
 
 COMPUTE_COLORS = {
-    "cpu_planner": "#5B6472",
-    "attention": "#3568C0",
-    "router_projection": "#C58B19",
-    "expert_ffn": "#2E7D4F",
-    "combine_reduce": "#7756A8",
+    "attention": "#2563EB",
+    "router_projection": "#C89400",
+    "per_server_planning_proxy": "#C89400",
+    "expert_ffn": "#16A34A",
+    "combine_reduce": "#7C3AED",
+    "combine_final_reduce": "#7C3AED",
     "compute": "#64748B",
 }
 NETWORK_COLORS = {
-    "dispatch_hidden": "#D97706",
-    "combine_partial": "#C24156",
-    "expert_weight_prefetch": "#008C95",
-    "transfer": "#3979A8",
+    "dispatch_hidden": "#EA580C",
+    "combine_partial": "#DC2626",
+    "expert_weight_prefetch": "#0891B2",
+    "expert_weight_scatter": "#0891B2",
+    "expert_weight_rdma": "#0891B2",
+    "expert_weight_gather": "#0891B2",
+    "transfer": "#64748B",
 }
 LANES = ("Compute", "Network TX", "Network RX")
-CPU_LANE = "CPU Planner"
-DISPLAY_LANES = (CPU_LANE, *LANES)
+EXPERT_WEIGHT_PAYLOADS = frozenset(
+    {
+        "expert_weight_prefetch",
+        "expert_weight_scatter",
+        "expert_weight_rdma",
+        "expert_weight_gather",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -338,11 +348,7 @@ def _intersection_duration(
 def summarize_ranks(events: tuple[TaskEvent, ...], num_ranks: int) -> tuple[RankSummary, ...]:
     summaries: list[RankSummary] = []
     for rank in range(num_ranks):
-        compute = [
-            event
-            for event in events
-            if event.task.rank == rank and not _is_cpu_task(event.task)
-        ]
+        compute = [event for event in events if event.task.rank == rank]
         tx = [event for event in events if rank in _network_tx_ranks(event.task)]
         rx = [event for event in events if rank in _network_rx_ranks(event.task)]
         network_by_id = {event.task.task_id: event for event in (*tx, *rx)}
@@ -385,8 +391,6 @@ def summarize_ranks(events: tuple[TaskEvent, ...], num_ranks: int) -> tuple[Rank
 
 def _task_color(task: TaskDefinition) -> str:
     if task.kind == "compute":
-        if _is_cpu_task(task):
-            return COMPUTE_COLORS["cpu_planner"]
         return COMPUTE_COLORS.get(task.operation or "compute", COMPUTE_COLORS["compute"])
     return NETWORK_COLORS.get(
         task.payload_kind or "transfer", NETWORK_COLORS["transfer"]
@@ -421,7 +425,6 @@ TASK_DATA_COLUMNS = (
     "route_spec",
     "predecessor_count",
     "overlaps_communication",
-    "logical_resource",
 )
 
 
@@ -458,7 +461,6 @@ def _task_data(events: tuple[TaskEvent, ...]) -> list[list[object]]:
                 task.route_spec,
                 len(task.predecessors),
                 task.overlaps_communication,
-                task.metadata.get("logical_resource", "gpu"),
             ]
         )
     return records
@@ -485,25 +487,15 @@ def _compressed_predecessors(events: tuple[TaskEvent, ...]) -> str:
 
 
 def _lane_events(
-    events: tuple[TaskEvent, ...], rank: int | None, lane: str
+    events: tuple[TaskEvent, ...], rank: int, lane: str
 ) -> list[TaskEvent]:
-    if lane == CPU_LANE:
-        return [event for event in events if _is_cpu_task(event.task)]
     if lane == "Compute":
-        return [
-            event
-            for event in events
-            if event.task.rank == rank and not _is_cpu_task(event.task)
-        ]
+        return [event for event in events if event.task.rank == rank]
     if lane == "Network TX":
         return [event for event in events if rank in _network_tx_ranks(event.task)]
     if lane == "Network RX":
         return [event for event in events if rank in _network_rx_ranks(event.task)]
     raise ValueError(f"unknown lane: {lane}")
-
-
-def _is_cpu_task(task: TaskDefinition) -> bool:
-    return task.kind == "compute" and task.metadata.get("logical_resource") == "cpu"
 
 
 def _network_tx_ranks(task: TaskDefinition) -> set[int]:
@@ -560,7 +552,6 @@ def write_task_csv(path: Path, events: tuple[TaskEvent, ...]) -> None:
         "predecessors",
         "predecessor_barrier_ids",
         "overlaps_communication",
-        "logical_resource",
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -594,7 +585,6 @@ def write_task_csv(path: Path, events: tuple[TaskEvent, ...]) -> None:
                         str(item) for item in task.predecessor_barrier_ids
                     ),
                     "overlaps_communication": task.overlaps_communication,
-                    "logical_resource": task.metadata.get("logical_resource", "gpu"),
                 }
             )
 
@@ -622,12 +612,8 @@ def write_html(
     timeline_width = 1400.0
     row_height = 23
     top_height = 35
-    has_cpu_tasks = any(_is_cpu_task(event.task) for event in events)
-    rows: list[tuple[int | None, str]] = []
-    if has_cpu_tasks:
-        rows.append((None, CPU_LANE))
-    rows.extend((rank, lane) for rank in selected_ranks for lane in LANES)
-    lane_codes = {lane: index for index, lane in enumerate(DISPLAY_LANES)}
+    rows = [(rank, lane) for rank in selected_ranks for lane in LANES]
+    lane_codes = {lane: index for index, lane in enumerate(LANES)}
     svg_height = top_height + len(rows) * row_height + 18
     x_scale = timeline_width / max(makespan, 1e-12)
     svg_parts = [
@@ -664,36 +650,23 @@ def write_html(
 
     labels = [f"<div class='label-spacer'></div>"]
     for rank, lane in rows:
-        if rank is None:
-            labels.append(
-                "<div class='lane-label cpu-lane'><strong>Host CPU</strong>"
-                f"<span>{escape(lane)}</span></div>"
-            )
-        else:
-            labels.append(
-                f"<div class='lane-label server-{rank // gpus_per_server % 2}'>"
-                f"<strong>GPU {rank:02d}</strong><span>{escape(lane)}</span></div>"
-            )
+        labels.append(
+            f"<div class='lane-label server-{rank // gpus_per_server % 2}'>"
+            f"<strong>GPU {rank:02d}</strong><span>{escape(lane)}</span></div>"
+        )
 
-    selected = [summaries[rank] for rank in selected_ranks]
-    overlap_total = sum(item.compute_network_overlap_us for item in selected)
     transfer_bytes = sum(
         event.task.transfer_bytes for event in events if event.task.kind == "transfer"
     )
-    cpu_count = sum(_is_cpu_task(event.task) for event in events)
-    compute_count = sum(
-        event.task.kind == "compute" and not _is_cpu_task(event.task)
-        for event in events
-    )
+    compute_count = sum(event.task.kind == "compute" for event in events)
     transfer_count = sum(event.task.kind == "transfer" for event in events)
     cards = (
         ("Makespan", f"{makespan:.6g} us"),
         (
             "Tasks",
-            f"{len(events)} ({compute_count} GPU / {cpu_count} CPU / {transfer_count} network)",
+            f"{len(events)} ({compute_count} compute / {transfer_count} network)",
         ),
         ("Logical bytes", _format_bytes(transfer_bytes)),
-        ("GPU overlap sum", f"{overlap_total:.6g} us"),
     )
     card_html = "".join(
         f"<div class='card'><span>{escape(label)}</span><strong>{escape(value)}</strong></div>"
@@ -704,10 +677,9 @@ def write_html(
         ("Router", COMPUTE_COLORS["router_projection"]),
         ("Expert", COMPUTE_COLORS["expert_ffn"]),
         ("Reduce", COMPUTE_COLORS["combine_reduce"]),
-        ("CPU planner", COMPUTE_COLORS["cpu_planner"]),
         ("Dispatch", NETWORK_COLORS["dispatch_hidden"]),
         ("Combine", NETWORK_COLORS["combine_partial"]),
-        ("Weight prefetch", NETWORK_COLORS["expert_weight_prefetch"]),
+        ("Expert weight", NETWORK_COLORS["expert_weight_rdma"]),
     ]
     legend_html = "".join(
         f"<span><i style='background:{color}'></i>{escape(label)}</span>"
@@ -729,7 +701,7 @@ body {{ margin: 0; background: #F6F8FA; color: #17212B; }}
 header {{ padding: 20px 24px 14px; background: #FFFFFF; border-bottom: 1px solid #D7DDE5; }}
 h1 {{ margin: 0 0 5px; font-size: 22px; font-weight: 650; }}
 .sub {{ color: #5E6B78; font-size: 13px; }}
-.cards {{ display: grid; grid-template-columns: repeat(4, minmax(180px, 1fr)); gap: 10px; margin-top: 16px; }}
+.cards {{ display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 10px; margin-top: 16px; }}
 .card {{ border: 1px solid #D7DDE5; border-radius: 6px; padding: 10px 12px; background: #FBFCFD; }}
 .card span {{ display: block; color: #66727F; font-size: 11px; text-transform: uppercase; }}
 .card strong {{ display: block; margin-top: 4px; font-size: 15px; }}
@@ -746,7 +718,6 @@ h1 {{ margin: 0 0 5px; font-size: 22px; font-weight: 650; }}
 .label-spacer {{ height: {top_height}px; border-bottom: 1px solid #D7DDE5; }}
 .lane-label {{ height: {row_height}px; box-sizing: border-box; padding: 3px 8px; display: flex; align-items: baseline; justify-content: space-between; border-bottom: 1px solid #E6EAF0; font-size: 11px; }}
 .lane-label.server-1 {{ background: #F1F4F7; }}
-.lane-label.cpu-lane {{ background: #E9EDF2; }}
 .lane-label strong {{ font-size: 11px; }}
 .lane-label span {{ color: #697582; font-size: 10px; }}
 .viewport {{ overflow: auto; }}
@@ -805,7 +776,7 @@ td.key {{ max-width: 420px; overflow: hidden; text-overflow: ellipsis; }}
   const I = Object.fromEntries(columns.map((name, index) => [name, index]));
   const taskRows = JSON.parse(document.getElementById('task-data').textContent);
   const tasks = new Map(taskRows.map(row => [row[I.task_id], row]));
-  const laneNames = {_json_for_html(DISPLAY_LANES)};
+  const laneNames = {_json_for_html(LANES)};
   const hoverTooltip = document.querySelector('.hover-tooltip');
   const inspector = document.querySelector('.task-inspector');
   const inspectorTitle = inspector.querySelector('.inspector-head strong');
@@ -833,7 +804,6 @@ td.key {{ max-width: 420px; overflow: hidden; text-overflow: ellipsis; }}
   }}
 
   function endpoint(row) {{
-    if (row[I.logical_resource] === 'cpu') return 'Host CPU';
     return row[I.kind] === 'c'
       ? `GPU ${{row[I.rank]}}`
       : `GPU ${{row[I.src_rank]}} -> GPU ${{row[I.dst_rank]}}`;
@@ -1050,12 +1020,12 @@ def write_overview_json(
     workload_dir: Path,
     log_path: Path,
 ) -> None:
-    compute_events = [
+    compute_events = [event for event in events if event.task.kind == "compute"]
+    expert_weight_events = [
         event
         for event in events
-        if event.task.kind == "compute" and not _is_cpu_task(event.task)
+        if event.task.payload_kind in EXPERT_WEIGHT_PAYLOADS
     ]
-    cpu_events = [event for event in events if _is_cpu_task(event.task)]
     network_events = [event for event in events if event.task.kind == "transfer"]
     payload_bytes: dict[str, int] = {}
     for event in network_events:
@@ -1075,9 +1045,26 @@ def write_overview_json(
         "makespan_us": max(event.end_us for event in events),
         "task_count": len(events),
         "compute_task_count": len(compute_events),
-        "cpu_planner_task_count": len(cpu_events),
-        "cpu_planner_time_sum_us": sum(
-            event.actual_duration_us for event in cpu_events
+        "expert_weight_task_count": len(expert_weight_events),
+        "expert_weight_bytes": sum(
+            event.task.transfer_bytes for event in expert_weight_events
+        ),
+        "expert_weight_active_us": _interval_duration(
+            _merge_intervals(
+                (event.start_us, event.end_us)
+                for event in expert_weight_events
+            )
+        ),
+        "expert_weight_fraction_of_makespan": (
+            _interval_duration(
+                _merge_intervals(
+                    (event.start_us, event.end_us)
+                    for event in expert_weight_events
+                )
+            )
+            / max(event.end_us for event in events)
+            if expert_weight_events
+            else 0.0
         ),
         "network_task_count": len(network_events),
         "logical_transfer_bytes": sum(

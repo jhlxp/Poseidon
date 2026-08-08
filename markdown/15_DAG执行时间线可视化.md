@@ -105,9 +105,42 @@ overlap        = intersection(compute_active, network_active)
 动态 SM、HBM 或通信 kernel 资源调度。当前 compute 仍是固定时长事件，通信重叠时
 可使用生成器约定的 20 SM 静态预留。
 
-ProbeEP planner 是离线决策，不生成 task，因此 ProbeEP timeline 只有 GPU
-`Compute / Network TX / Network RX`，不显示 CPU planner lane。Python route lowering
-耗时也不计入 makespan 或 overlap。
+ProbeEP planner 是离线决策，不生成 task，因此 ProbeEP timeline 只有每张 GPU 的
+`Compute / Network TX / Network RX`，不显示 CPU planner lane，也不增加全局
+`Expert Transfer` 或 `Expert weights` lane。`expert_weight_scatter/rdma/gather/prefetch`
+和 token 通信一样，按真实 source/destination/relay 直接画入对应 GPU 的 TX/RX 行。
+权重使用独立的青色，hover/Inspector 继续显示具体 payload、endpoint、bytes 和 FCT；
+Python route lowering 耗时不计入 makespan。
+
+每 rank 的 communication stream 顺序固定为：
+
+```text
+expert weight prefetch/scatter/RDMA/gather -> token dispatch -> token combine
+```
+
+因此同一 rank 先完成本轮需要的权重传输，再启动 token dispatch。不同 rank 的通信仍
+允许并行，不增加全局 weight barrier。这样 timeline 直接呈现每张 NIC 的实际顺序，
+也不会把同一 weight task 在全局 lane 和 TX/RX lane 重复画两次。
+
+主类别固定使用七种不同色相，不使用同色系深浅表达不同语义：
+
+| 类别 | 颜色 |
+|---|---|
+| Attention | 蓝 `#2563EB` |
+| Router/placement proxy | 金 `#C89400` |
+| Expert FFN | 绿 `#16A34A` |
+| Reduce | 紫 `#7C3AED` |
+| Token Dispatch | 橙 `#EA580C` |
+| Token Combine | 红 `#DC2626` |
+| Expert Weight | 青 `#0891B2` |
+
+`scatter/rdma/gather/prefetch` 四种 expert-weight leg 使用同一青色，因为它们都属于
+权重通信；具体 leg 仍由 hover/Inspector 中的 `payload_kind` 区分。
+
+ProbeEP 单算法 Dashboard 另有 `Cross-server expert migration` 表，逐 layer/microbatch
+展示 planned、admitted、deferred remote experts、moved routes 和 RDMA weight bytes；
+同时报告每个 sample 的 peak-used/total expert slots。总 Dashboard 的算法摘要显示
+admitted expert 总数和权重总量。
 
 ## 4. 输出
 
@@ -126,7 +159,7 @@ ProbeEP planner 是离线决策，不生成 task，因此 ProbeEP timeline 只�
 | `dag_gpu_timeline.html` | 自包含交互时间线；Fit/缩放、hover 摘要、点击 Inspector 和按需展开依赖 |
 | `dag_task_timeline.csv` | 每个 task 的 start/end/FCT/bytes/logical throughput |
 | `dag_rank_overlap_summary.csv` | 每 GPU compute/network active、overlap、TX/RX 字节 |
-| `dag_timeline_summary.json` | makespan、task 数、payload 字节和统计语义 |
+| `dag_timeline_summary.json` | makespan、task 数、逐 payload 字节/FCT、expert-weight 汇总和统计语义 |
 
 HTML 下方的 `Task details` 默认收起，只在首次展开时生成逐 task
 明细表。大量 task 在同一 network lane 并发时，bar 可能视觉重合；hover、

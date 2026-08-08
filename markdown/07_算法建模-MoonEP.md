@@ -196,6 +196,10 @@ Router
 - combine chunk 只等待对应 execution rank 的 Expert FFN；
 - 每个 transfer chunk 默认独立 barrier。
 
+这里的 `per_server_planning_proxy` 是 MoonEP 现有的 GPU compute 占位 task，会进入
+每张 GPU 的 compute stream；它没有 `logical_resource=cpu`，不是 CPU planner lane。
+ProbeEP 不复用这条 task，其 migration planning 完全位于离线 workload 生成阶段。
+
 ## 9. 配置与 Manifest
 
 ```yaml

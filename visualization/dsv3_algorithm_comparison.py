@@ -65,6 +65,70 @@ def load_case(algorithm: str, case_dir: Path, output: Path) -> dict[str, object]
         if not path.is_file():
             raise FileNotFoundError(f"{algorithm}: missing artifact {path}")
     summary = json.loads(timeline_summary.read_text(encoding="utf-8"))
+    migration_rows: list[dict[str, int]] = []
+    manifest_path = case_dir / "workload" / "manifest.json"
+    if algorithm == "probeep" and manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        invocations = manifest.get("metadata", {}).get(
+            "micro_batch_algorithms", []
+        )
+        for invocation in invocations:
+            planned = invocation.get("planned_migration_intents", [])
+            admitted = invocation.get("admitted_migration_intents", [])
+            deferred = invocation.get("deferred_migration_intents", [])
+            remote_replicas = invocation.get("remote_replicas", [])
+            total_slots = invocation.get("total_expert_slots_used_by_rank", {})
+            if not total_slots:
+                home_slots = invocation.get("home_expert_slots_by_rank", [])
+                temporary_counts: dict[int, int] = {}
+                instances = invocation.get("expert_load_profile", {}).get(
+                    "after", {}
+                ).get("instances", [])
+                for instance in instances:
+                    if instance.get("kind") == "master":
+                        continue
+                    rank = int(instance["rank"])
+                    temporary_counts[rank] = temporary_counts.get(rank, 0) + 1
+                total_slots = {
+                    str(rank): int(count) + temporary_counts.get(rank, 0)
+                    for rank, count in enumerate(home_slots)
+                }
+            migration_rows.append(
+                {
+                    "layer": int(invocation["layer"]),
+                    "micro_batch": int(invocation["micro_batch"]),
+                    "sample_id": int(invocation["sample_id"]),
+                    "planned_experts": len(
+                        {
+                            (item["expert_id"], item["destination_server"])
+                            for item in planned
+                        }
+                    ),
+                    "admitted_experts": len(remote_replicas),
+                    "deferred_experts": len(
+                        {
+                            (item["expert_id"], item["destination_server"])
+                            for item in deferred
+                        }
+                    ),
+                    "moved_routes": sum(
+                        int(item["moved_route_count"]) for item in admitted
+                    ),
+                    "weight_bytes": int(
+                        invocation.get("remote_weight_rdma_bytes", 0)
+                    ),
+                    "peak_slots_used": max(
+                        (
+                            int(value)
+                            for value in total_slots.values()
+                        ),
+                        default=0,
+                    ),
+                    "slot_capacity": int(
+                        invocation.get("expert_slots_per_rank", 0)
+                    ),
+                }
+            )
     bundle_files: list[tuple[Path, str]] = []
     for directory in (timeline_dir, gate_dir, case_dir / "link_load"):
         for artifact in sorted(directory.iterdir()):
@@ -100,6 +164,19 @@ def load_case(algorithm: str, case_dir: Path, output: Path) -> dict[str, object]
         "overlap_us": float(
             summary["selected_rank_compute_network_overlap_sum_us"]
         ),
+        "migration_rows": migration_rows,
+        "admitted_experts_total": sum(
+            row["admitted_experts"] for row in migration_rows
+        ),
+        "expert_weight_bytes_total": sum(
+            row["weight_bytes"] for row in migration_rows
+        ),
+        "peak_expert_slots_used": max(
+            (row["peak_slots_used"] for row in migration_rows), default=0
+        ),
+        "expert_slot_capacity": max(
+            (row["slot_capacity"] for row in migration_rows), default=0
+        ),
         "bundle_files": bundle_files,
     }
 
@@ -127,6 +204,30 @@ def write_algorithm_dashboard(
     endpoint_summary_url = relative_url(
         Path(case["endpoint_summary_path"]), path
     )
+    migration_rows = list(case["migration_rows"])
+    migration_metric = ""
+    migration_module = ""
+    if migration_rows:
+        migration_metric = (
+            f"<span>{case['admitted_experts_total']} cross-server expert moves</span>"
+            f"<span>{escape(format_bytes(int(case['expert_weight_bytes_total'])))} RDMA weights</span>"
+            f"<span>{case['peak_expert_slots_used']}/{case['expert_slot_capacity']} peak slots</span>"
+        )
+        table_rows = "".join(
+            "<tr>"
+            f"<td>{row['sample_id']}</td>"
+            f"<td>{row['layer']}</td>"
+            f"<td>{row['micro_batch']}</td>"
+            f"<td>{row['planned_experts']}</td>"
+            f"<td>{row['admitted_experts']}</td>"
+            f"<td>{row['deferred_experts']}</td>"
+            f"<td>{row['moved_routes']}</td>"
+            f"<td>{escape(format_bytes(row['weight_bytes']))}</td>"
+            f"<td>{row['peak_slots_used']}/{row['slot_capacity']}</td>"
+            "</tr>"
+            for row in migration_rows
+        )
+        migration_module = f"""<details class="module" open><summary>Cross-server expert migration</summary><div class="module-body migration-content"><table><thead><tr><th>Sample</th><th>Layer</th><th>MB</th><th>Planned experts</th><th>Admitted experts</th><th>Deferred experts</th><th>Moved routes</th><th>RDMA weights</th><th>Peak slots</th></tr></thead><tbody>{table_rows}</tbody></table></div></details>"""
     document = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -153,16 +254,22 @@ iframe {{ display: block; width: 100%; border: 0; background: #FFFFFF; }}
 .link-content img {{ display: block; width: 100%; height: auto; }}
 .downloads {{ display: flex; flex-wrap: wrap; gap: 16px; padding: 10px 12px; border-top: 1px solid #E0E5EA; font-size: 12px; }}
 .downloads a {{ color: #1D5E9E; }}
+.migration-content {{ overflow: auto; padding: 10px 12px; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+th, td {{ padding: 7px 9px; border-bottom: 1px solid #E1E6EB; text-align: right; white-space: nowrap; }}
+th:first-child, td:first-child {{ text-align: left; }}
+th {{ background: #EEF2F5; color: #485563; }}
 @media (max-width: 760px) {{ .metrics {{ width: 100%; margin-left: 0; }} .gate-frame {{ height: 860px; }} .timeline-frame {{ height: 780px; }} }}
 </style>
 </head>
 <body>
 <header>
 <h1>{escape(algorithm.upper())} / {escape(title)}</h1>
-<div class="metrics"><span>{case['makespan_us']:.7g} us</span><span>{case['task_count']} tasks</span><span>{escape(format_bytes(int(case['logical_transfer_bytes'])))}</span><span>{case['overlap_us']:.7g} us GPU overlap sum</span></div>
+<div class="metrics"><span>{case['makespan_us']:.7g} us</span><span>{case['task_count']} tasks</span><span>{escape(format_bytes(int(case['logical_transfer_bytes'])))}</span><span>{case['overlap_us']:.7g} us GPU overlap sum</span>{migration_metric}</div>
 <div class="actions"><button type="button" id="expand">Expand all</button><button type="button" id="collapse">Collapse all</button></div>
 </header>
 <main>
+{migration_module}
 <details class="module" open><summary>Gate / expert load before and after</summary><div class="module-body"><iframe class="gate-frame" src="{escape(gate_url)}" title="{escape(algorithm)} Gate load"></iframe><div class="downloads"><a href="{escape(gate_csv_url)}">Expert load CSV</a></div></div></details>
 <details class="module" open><summary>DAG GPU timeline</summary><div class="module-body"><iframe class="timeline-frame" src="{escape(timeline_url)}" title="{escape(algorithm)} timeline"></iframe></div></details>
 <details class="module" open><summary>MpRail link load</summary><div class="module-body link-content"><img src="{escape(link_image_url)}" alt="{escape(algorithm)} MpRail link load"><div class="downloads"><a href="{escape(link_summary_url)}">Link summary CSV</a><a href="{escape(endpoint_summary_url)}">Endpoint summary CSV</a></div></div></details>
@@ -183,9 +290,15 @@ def write_dashboard(path: Path, title: str, cases: list[dict[str, object]]) -> N
     for index, case in enumerate(cases):
         algorithm = str(case["algorithm"])
         open_attribute = " open" if index == 0 else ""
+        migration_summary = ""
+        if case["migration_rows"]:
+            migration_summary = (
+                f"<span>{case['admitted_experts_total']} migrated experts</span>"
+                f"<span>{escape(format_bytes(int(case['expert_weight_bytes_total'])))} RDMA weights</span>"
+            )
         sections.append(
             f"""<details class="algorithm"{open_attribute}>
-<summary><strong>{escape(algorithm.upper())}</strong><span>{case['makespan_us']:.7g} us</span><span>{case['task_count']} tasks</span><span>{escape(format_bytes(int(case['logical_transfer_bytes'])))}</span><span>{case['overlap_us']:.7g} us GPU overlap sum</span></summary>
+<summary><strong>{escape(algorithm.upper())}</strong><span>{case['makespan_us']:.7g} us</span><span>{case['task_count']} tasks</span><span>{escape(format_bytes(int(case['logical_transfer_bytes'])))}</span><span>{case['overlap_us']:.7g} us GPU overlap sum</span>{migration_summary}</summary>
 <div class="algorithm-body">
 <div class="standalone-link"><a href="{escape(str(case['algorithm_dashboard_url']))}" target="_blank">Open {escape(algorithm.upper())} dashboard</a></div>
 <iframe class="algorithm-frame" src="{escape(str(case['algorithm_dashboard_url']))}" title="{escape(algorithm)} complete dashboard" loading="lazy"></iframe>

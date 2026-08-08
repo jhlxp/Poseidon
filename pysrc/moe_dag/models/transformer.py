@@ -39,6 +39,7 @@ class TransformerWorkloadConfig:
     probeep_route_chunk_tokens: int = 0
     probeep_weight_chunk_bytes: int = 4 * 1024 * 1024
     probeep_max_remote_replicas: int = 64
+    probeep_expert_slots_per_rank: int = 40
     probeep_initial_nic_budget_bytes: int = 16 * 1024 * 1024
     probeep_min_nic_budget_bytes: int = 0
     probeep_max_nic_budget_bytes: int = 128 * 1024 * 1024
@@ -72,6 +73,10 @@ class TransformerWorkloadConfig:
         if self.probeep_max_remote_replicas < 0:
             raise ValidationError(
                 "probeep_max_remote_replicas must be non-negative"
+            )
+        if self.probeep_expert_slots_per_rank <= 0:
+            raise ValidationError(
+                "probeep_expert_slots_per_rank must be positive"
             )
         if self.eplb_num_physical_experts < 0:
             raise ValidationError("eplb_num_physical_experts must be non-negative")
@@ -150,7 +155,9 @@ def build_transformer_workload(
         algorithm_builder = ProbeEPBuilder(
             cost,
             ProbeEPConfig(
-                replicas_per_rank=config.replicas_per_rank,
+                expert_slots_per_rank=(
+                    config.probeep_expert_slots_per_rank
+                ),
                 token_padding=config.token_padding,
                 chunk_tokens=config.chunk_tokens,
                 route_chunk_tokens=(
@@ -311,6 +318,9 @@ def build_transformer_workload(
             ),
             "weight_chunk_bytes": config.probeep_weight_chunk_bytes,
             "max_remote_replicas": config.probeep_max_remote_replicas,
+            "expert_slots_per_rank": (
+                config.probeep_expert_slots_per_rank
+            ),
             "initial_nic_budget_bytes": (
                 config.probeep_initial_nic_budget_bytes
             ),

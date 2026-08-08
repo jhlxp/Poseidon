@@ -73,6 +73,12 @@ def parse_args() -> argparse.Namespace:
         default=64,
     )
     parser.add_argument(
+        "--probeep-expert-slots-per-rank",
+        type=int,
+        default=40,
+        help="Total home plus temporary expert slots available on each rank.",
+    )
+    parser.add_argument(
         "--probeep-initial-nic-budget-bytes",
         type=int,
         default=16 * 1024 * 1024,
@@ -247,6 +253,9 @@ def main() -> int:
                 probeep_weight_chunk_bytes=args.probeep_weight_chunk_bytes,
                 probeep_max_remote_replicas=(
                     args.probeep_max_remote_replicas
+                ),
+                probeep_expert_slots_per_rank=(
+                    args.probeep_expert_slots_per_rank
                 ),
                 probeep_initial_nic_budget_bytes=(
                     args.probeep_initial_nic_budget_bytes

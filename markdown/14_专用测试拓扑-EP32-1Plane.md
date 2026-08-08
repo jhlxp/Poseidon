@@ -146,7 +146,9 @@ layer 1。这里是测试内逻辑编号，不是官方模型的物理层号。
 | 功能回归 | 2 tokens/rank/microbatch，chunk 32 |
 | 完整测试 | 4096 tokens/rank/microbatch，chunk 4096 |
 | 完整测试 compute config | `pysrc/compute_profiles/H100_DSV3_EP32_compute_4096tpr.json` |
-| ProbeEP planner | 不进入 DAG；论文单独分析复杂度/实现开销 |
+| ProbeEP migration planning | 离线生成决策，不进入 DAG；论文单独分析复杂度/实现开销 |
+| ProbeEP CPU runtime task | 0；`cpu_task_count=0`、`cpu_streams_global=0` |
+| ProbeEP expert slots | 40/rank 总槽位 = 8 home + 最多 32 temporary |
 
 这里的 `4096` 是**每个 rank、每个 microbatch 的本地 token 数**，不是 32 rank
 合计值。32 rank 时，每个 microbatch 的全局 token 数为：
@@ -276,6 +278,7 @@ python3 tests/run_dsv3_2layer_algorithms.py --full --workers 4
 python3 tests/run_dsv3_2layer_algorithms.py \
   --gate-provider raw_receive_cdf --gate-layer-map 0,1 \
   --gate-seed 17 --moonep-replicas-per-rank 10 \
+  --probeep-expert-slots-per-rank 40 \
   --simulation-end-us 20000
 ```
 
@@ -327,6 +330,9 @@ timeline 和链路负载产物，不包含 workload 和 simulation 大文件。�
 偏斜分布在默认值 2 下无法满足 planner 的严格 rank 均衡时会明确失败，不会静默
 改变 Gate。通过 `--moonep-replicas-per-rank` 显式配置实验容量，并在 `配置.json`
 中记录。
+ProbeEP 不复用 MoonEP 的临时 replica 参数。它使用总容量
+`expert_slots_per_rank=40`，包含每 rank 原有的 8 个 home experts；当前测试假设显存
+足够，因此只保证容量不成为人为瓶颈。
 大量 MoonEP 权重预取也可能超过默认 smoke 的 `end=2000 us`；
 `--simulation-end-us` 只延长仿真截止时间，不改变 token 数或 workload。
 
@@ -348,7 +354,9 @@ algorithms/<algorithm>/algorithm_dashboard.html
 2. smoke 必须报告 `tokens_per_rank=2`、`chunk_tokens=32`；full 必须报告
    `tokens_per_rank=4096`、`chunk_tokens=4096`。
 3. stream manifest 必须报告每 rank 一条 compute、一条 communication stream。
-   ProbeEP 必须报告 `cpu_task_count=0`、`cpu_streams_global=0`。
+   ProbeEP 必须报告 `planner_runtime_model=not_in_dag`、
+   `route_lowering_runtime_model=offline_not_in_dag`、`cpu_task_count=0` 和
+   `cpu_streams_global=0`。
 4. `mb0.layer1.attention.rank0` 必须等待 `mb0.layer0` 的同 rank
    Combine/Reduce，且不得等待 `mb1.layer0` 的 Combine/Reduce。
 5. workload 必须包含跨服务器和跨 rail transfer；NCCL 不得出现 hierarchy leg，

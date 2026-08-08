@@ -227,6 +227,13 @@ ProbeEP planner 只在离线 workload 生成阶段确定 placement、migration i
 chunk rail，不生成 `.dag` task。Python 对 expanded routes 的处理时间不属于被仿真
 系统的 compute，也不会出现在 GPU/CPU timeline 或 makespan 中。
 
+这里需要区分“框架支持”和“当前 workload 使用”。通用 two-stream scheduler 仍保留
+`logical_resource=cpu` 的解析与计数能力，便于其他算法将来显式建模 host task；当前
+NCCL、DeepEP、EPLB、MoonEP 和 ProbeEP 均不生成 CPU task。尤其对 ProbeEP，算法
+planner、expanded-route lowering 和 Python wall-clock 都是离线生成过程，manifest
+必须为 `cpu_task_count=0`、`cpu_streams_global=0`。Expert 权重迁移是实际 network
+task，进入 communication stream 和 makespan，不能记作 CPU planner 时间。
+
 两条 stream 的数量是固定契约。`micro_batches=N` 时，相邻两个 microbatch 构成
 double-buffer group，前一组的完整 workload drain 后下一组才启动；组间不 overlap，
 奇数尾项单独成组。当前 builder 的完整范围是一个 forward MoE block；完整 DSV3

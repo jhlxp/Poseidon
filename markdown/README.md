@@ -118,7 +118,10 @@ python3 visualization/dag_timeline.py \
 ```
 
 输出每 GPU `Compute / Network TX / Network RX` 的 HTML 时间线，以及逐 task
-FCT/bytes 和逐 GPU overlap 汇总。ProbeEP 的离线 planner 不进入 timeline。完整口径见
+FCT/bytes 和逐 GPU overlap 汇总。ProbeEP 的离线 planner 不进入 timeline；专家权重
+NVLink/RDMA task 直接画入对应 GPU 的 `Network TX/RX`，用独立颜色区别于 token
+dispatch/combine，不建立额外全局 lane。当前 ProbeEP 的 CPU task/stream 计数均为 0。
+完整口径见
 [15_DAG执行时间线可视化.md](15_DAG执行时间线可视化.md)。
 
 Gate 分布和算法执行前后专家负载可单独生成：

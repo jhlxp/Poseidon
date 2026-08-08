@@ -38,8 +38,9 @@ Dispatch -> Expert FFN -> Combine
 ```
 
 Router/Gate 产生本次 sample 的 expert route histogram，迁移决策直接读取 histogram。
-每次决策使用“此时已经完成的最新 sample”更新 NIC 窗口，和 congestion window 的
-反馈时序一致。本文只建模决策结果，不把 planner 实现开销放进运行时 DAG。
+目标闭环中，每次决策使用“此时已经完成的最新 sample”更新 NIC 窗口，和
+congestion window 的反馈时序一致。当前实现只把决策结果降低为静态 DAG，不把
+planner 的 Python/CUDA/C++ 实现开销放进运行时 DAG。
 
 对于两个 microbatch 和 `L` 个 MoE layer：
 
@@ -90,6 +91,28 @@ Weight Migration       Token Dispatch
 - Router 完成后直接释放已经确定的 Weight Migration 与 Token Dispatch；
 - manifest 标记 `planner_runtime_model=not_in_dag`；
 - planner 的真实实现和运行开销由论文中的独立 CUDA/C++ 实现与复杂度实验给出。
+
+这里的 `planner` 是算法层的迁移决策逻辑，不表示 DAG 中存在一条 CPU 执行流。当前
+实现边界如下：
+
+| 工作 | 发生位置 | 生成 DAG task | 计入 HTSim makespan |
+|---|---|---:|---:|
+| Gate/Router | GPU compute stream | 是 | 是 |
+| migration planning | Python 离线 workload 生成 | 否 | 否 |
+| route lowering/稳定序列化 | Python 离线 workload 生成 | 否 | 否 |
+| expert weight scatter/RDMA/gather | HTSim communication stream | 是 | 是 |
+| Dispatch/Expert FFN/Combine | GPU compute/communication streams | 是 | 是 |
+
+因此当前 ProbeEP 的运行时计数必须始终满足：
+
+```text
+cpu_task_count = 0
+cpu_streams_global = 0
+```
+
+代码中的通用 two-stream scheduler 仍能识别 `logical_resource=cpu`，这是框架兼容
+能力；ProbeEP builder 不生成这种 task，该分支不会参与当前 workload、timeline 或
+makespan。
 
 Python 生成器仍必须把最终 placement 展开到具体 route，才能生成逐 flow DAG。对
 4096tpr/EP32 来说，这一步会访问 1048576 条 route；它属于离线仿真输入 lowering，
@@ -387,7 +410,9 @@ builder 不能读取 sample `t` 的真实 FCT 再改写同一 DAG 中 sample `t+
 ```
 
 在闭环 driver 完成前，静态 2-layer DAG 不应把 analytical proxy 声称为真实网络
-probe 结果。
+probe 结果。这个限制不影响当前 DAG 对已接纳 weight migration、token communication
+和 Expert FFN overlap 的仿真；它只表示后一个 sample 尚不能读取本次 HTSim 运行中
+前一个 sample 的实测 FCT 并在线改写自身决策。
 
 ## 12. 复杂度
 
@@ -419,6 +444,7 @@ compute_planner:
   local_second: true
   route_chunk_tokens: 4096
   token_padding: 128
+  expert_slots_per_rank: 40
 
 nic_controller:
   feedback_source: external_sample_feedback
@@ -439,6 +465,11 @@ weight_transport:
 token_transport: deepep_hierarchical
 ```
 
+`expert_slots_per_rank` 是每个 rank 的总 expert 权重槽位，包含静态 home experts 和
+临时 local/remote replicas，不是“最多迁移多少个 expert”。DSV3 EP32 每 rank 固有
+8 个 home experts；测试配置 40 个总槽位，相当于最多再容纳 32 个临时 experts。
+当前研究假设显存足够，因此测试直接给足容量，不把 slot cap 当作算法瓶颈。
+
 ## 14. Manifest
 
 每个 sample 至少记录：
@@ -450,6 +481,7 @@ server_load_before/planned/admitted
 rank_load_before/after
 planned/admitted/deferred migration intents
 remote replica seed/local replicas
+expert_slots_per_rank, home_expert_slots_by_rank
 weight chunks and rail assignments
 predicted token TX/RX bytes by rank
 budget_before/budget_after
@@ -471,11 +503,13 @@ admission 和 DAG。Python 生成器 wall-clock 不进入 manifest 性能口径�
 5. chunk scheduler 同时检查 source TX 和 destination RX budget。
 6. 轻载 NIC 获得更多 chunks；相同输入和 state 的分配确定性。
 7. remote seed 之外的同服务器 replicas 只通过 NVLink 获取权重。
-8. ProbeEP DAG 不包含 CPU planner task，timeline 不出现 CPU planner lane。
-9. `Nmax` 超过 deadband 时 bottleneck budget 乘 0.9；计算仍为瓶颈时窗口缓慢恢复。
-10. 无迁移任务的 sample 不把 budget 错误降到 0。
-11. 2-layer 测试验证 4 个 sample 状态，但不声称收敛。
-12. 58-layer 闭环实验必须分别展示前 N 次和收敛后区间。
+8. ProbeEP DAG 不包含 CPU planner task，manifest 必须报告 `cpu_task_count=0` 和
+   `cpu_streams_global=0`，timeline 不出现 CPU planner lane。
+9. expert slot 容量按 home + temporary 总数校验；显存充足测试不得因人为小容量失败。
+10. `Nmax` 超过 deadband 时 bottleneck budget 乘 0.9；计算仍为瓶颈时窗口缓慢恢复。
+11. 无迁移任务的 sample 不把 budget 错误降到 0。
+12. 2-layer 测试验证 4 个 sample 状态，但不声称收敛。
+13. 58-layer 闭环实验必须分别展示前 N 次和收敛后区间。
 
 ## 16. 当前不做
 

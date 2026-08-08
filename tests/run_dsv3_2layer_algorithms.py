@@ -161,6 +161,12 @@ def parse_args() -> argparse.Namespace:
         default=4 * 1024 * 1024,
     )
     parser.add_argument(
+        "--probeep-expert-slots-per-rank",
+        type=int,
+        default=40,
+        help="Total home plus temporary expert slots per rank.",
+    )
+    parser.add_argument(
         "--simulation-end-us",
         type=int,
         help="Override the mode's HTSim end time without changing token count.",
@@ -574,6 +580,7 @@ def run_algorithm(
     moonep_replicas_per_rank: int,
     probeep_max_remote_replicas: int,
     probeep_weight_chunk_bytes: int,
+    probeep_expert_slots_per_rank: int,
 ) -> dict[str, object]:
     case_dir = root_dir / "algorithms" / algorithm
     case_dir.mkdir(parents=True)
@@ -613,6 +620,7 @@ def run_algorithm(
                 probeep_route_chunk_tokens=mode.chunk_tokens,
                 probeep_weight_chunk_bytes=probeep_weight_chunk_bytes,
                 probeep_max_remote_replicas=probeep_max_remote_replicas,
+                probeep_expert_slots_per_rank=probeep_expert_slots_per_rank,
                 gate_provider=create_gate_provider(
                     gate.provider,
                     seed=gate.seed,
@@ -722,6 +730,8 @@ def main() -> int:
         raise SystemExit("--probeep-max-remote-replicas must be non-negative")
     if args.probeep_weight_chunk_bytes <= 0:
         raise SystemExit("--probeep-weight-chunk-bytes must be positive")
+    if args.probeep_expert_slots_per_rank <= 0:
+        raise SystemExit("--probeep-expert-slots-per-rank must be positive")
     algorithms = tuple(
         value.strip() for value in args.algorithms.split(",") if value.strip()
     )
@@ -776,6 +786,9 @@ def main() -> int:
                     args.probeep_max_remote_replicas
                 ),
                 "probeep_weight_chunk_bytes": args.probeep_weight_chunk_bytes,
+                "probeep_expert_slots_per_rank": (
+                    args.probeep_expert_slots_per_rank
+                ),
                 "topology": {
                     "ranks": 32,
                     "servers": 4,
@@ -830,6 +843,7 @@ def main() -> int:
                 args.moonep_replicas_per_rank,
                 args.probeep_max_remote_replicas,
                 args.probeep_weight_chunk_bytes,
+                args.probeep_expert_slots_per_rank,
             ): algorithm
             for algorithm in algorithms
         }
