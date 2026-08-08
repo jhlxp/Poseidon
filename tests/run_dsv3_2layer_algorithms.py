@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -23,12 +24,14 @@ BUILD_DIR = SIM_DIR / "build-mprail"
 BINARY = BUILD_DIR / "datacenter" / "htsim_uec"
 TIMELINE = ROOT / "visualization" / "dag_timeline.py"
 LINK_LOAD = ROOT / "visualization" / "mprail_link_load.py"
+GATE_LOAD = ROOT / "visualization" / "gate_load_profile.py"
 COMPARISON = ROOT / "visualization" / "dsv3_algorithm_comparison.py"
 COMPUTE_CONFIG = (
     PYSRC / "compute_profiles" / "H100_DSV3_EP32_compute_4096tpr.json"
 )
 ALGORITHMS = ("nccl", "deepep", "eplb", "moonep")
 sys.path.insert(0, str(PYSRC))
+sys.path.insert(0, str(ROOT))
 
 from moe_dag import (  # noqa: E402
     JsonComputeCostModel,
@@ -41,6 +44,15 @@ from moe_dag.models import (  # noqa: E402
     TransformerWorkloadConfig,
     build_transformer_workload,
 )
+from workload.gate import GATE_PROVIDER_NAMES, create_gate_provider  # noqa: E402
+
+
+DEFAULT_RAW_PLACEMENT = (
+    ROOT
+    / "workload"
+    / "raw_data"
+    / "ET_4+4_32_9_gsm8k_r1_2k_2k_0417_al_0.json"
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +64,19 @@ class RunMode:
     simulation_end_us: int
     timeout_seconds: int
     compute_config: Path | None
+
+
+@dataclass(frozen=True)
+class GateRun:
+    provider: str
+    seed: int
+    rank_alpha: float | None
+    local_alpha: float
+    target_rank_imbalance: float
+    fast_skew: float
+    raw_placement_json: Path
+    raw_csv_pattern: str
+    layer_map: tuple[int, ...] | None
 
 
 def mode_config(full: bool) -> RunMode:
@@ -98,6 +123,37 @@ def parse_args() -> argparse.Namespace:
         "--algorithms",
         default=",".join(ALGORITHMS),
         help="Comma-separated subset of nccl,deepep,eplb,moonep.",
+    )
+    parser.add_argument(
+        "--gate-provider",
+        choices=GATE_PROVIDER_NAMES,
+        default="balanced_permuted",
+    )
+    parser.add_argument("--gate-seed", type=int, default=0)
+    parser.add_argument("--gate-rank-alpha", type=float)
+    parser.add_argument("--gate-local-alpha", type=float, default=4.0)
+    parser.add_argument(
+        "--gate-target-rank-imbalance", type=float, default=2.0
+    )
+    parser.add_argument("--gate-fast-skew", type=float, default=0.8)
+    parser.add_argument(
+        "--gate-raw-placement-json", type=Path, default=DEFAULT_RAW_PLACEMENT
+    )
+    parser.add_argument("--gate-raw-csv-pattern", default="decode_{rank}.csv")
+    parser.add_argument(
+        "--gate-layer-map",
+        help="Comma-separated raw layers; needs two entries for this test.",
+    )
+    parser.add_argument(
+        "--moonep-replicas-per-rank",
+        type=int,
+        default=2,
+        help="MoonEP temporary replica capacity; skewed Gate inputs may need more than 2.",
+    )
+    parser.add_argument(
+        "--simulation-end-us",
+        type=int,
+        help="Override the mode's HTSim end time without changing token count.",
     )
     return parser.parse_args()
 
@@ -159,7 +215,7 @@ def execute_htsim(case_dir: Path, workload_dir: Path, mode: RunMode) -> Path:
         "-hop_latency", "0.1",
         "-switch_latency", "0.02",
         "-mtu", "4150",
-        "-q", "32",
+        "-q", "128",
         "-end", str(mode.simulation_end_us),
         "-strat", "ecmp_host",
         "-sender_cc_only",
@@ -251,6 +307,28 @@ def run_visualizations(
     )
     require(link_result.returncode == 0, "link-load visualization failed")
 
+    gate_dir = case_dir / "gate_load"
+    gate_command = [
+        sys.executable,
+        str(GATE_LOAD),
+        "--workload-dir", str(workload_dir),
+        "--output-dir", str(gate_dir),
+        "--title", f"{algorithm.upper()} / Gate load / {mode.name}",
+    ]
+    gate_result = subprocess.run(
+        gate_command,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    (case_dir / "gate_load.log").write_text(
+        gate_result.stdout, encoding="utf-8"
+    )
+    require(gate_result.returncode == 0, "Gate-load visualization failed")
+
 
 def validate_case(
     case_dir: Path,
@@ -279,6 +357,15 @@ def validate_case(
         f"DAG_SUMMARY tasks={manifest['task_count']} "
         f"barriers={manifest['barrier_count']}" in log,
         "HTSim did not complete the DAG",
+    )
+    require(
+        "queue_size_bytes 531200" in log,
+        "standard DSV3 run did not use the 128-packet queue",
+    )
+    require(
+        "MPRAIL_ECN enabled=yes threshold_bytes=16600 "
+        "queue_size_bytes=531200" in log,
+        "standard DSV3 run has unexpected ECN/queue settings",
     )
     records = task_map["tasks"]
     transfers = [record for record in records if record["kind"] == "transfer"]
@@ -328,6 +415,33 @@ def validate_case(
             compute_cost["selected_source"] == "theoretical",
             "unexpected full compute source",
         )
+        require(
+            compute_cost["model"] == "json_linear_per_token_v2",
+            "full run did not use the per-token compute schema",
+        )
+        for record in records:
+            if record["kind"] != "compute":
+                continue
+            metadata = record["metadata"]
+            token_count = metadata.get("compute_token_count")
+            us_per_token = metadata.get("compute_us_per_token")
+            require(
+                isinstance(token_count, int) and token_count > 0,
+                f"compute task {record['key']} has no token_count",
+            )
+            require(
+                isinstance(us_per_token, (int, float)) and us_per_token > 0,
+                f"compute task {record['key']} has no per-token cost",
+            )
+            require(
+                math.isclose(
+                    record["duration_us"],
+                    token_count * us_per_token,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                ),
+                f"compute task {record['key']} duration is not token-scaled",
+            )
     starts = {
         int(task): float(time)
         for task, time in re.findall(
@@ -406,6 +520,16 @@ def validate_case(
         (case_dir / "link_load" / "mprail_link_load_by_layer.png").is_file(),
         "link-load image is missing",
     )
+    gate_summary = json.loads(
+        (case_dir / "gate_load" / "gate_load_profile_summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    require(len(gate_summary["records"]) == 4, "Gate profile record count mismatch")
+    gate_digests = [
+        record["gate"]["assignment_digest_sha256"]
+        for record in gate_summary["records"]
+    ]
     return {
         "algorithm": algorithm,
         "status": "passed",
@@ -421,10 +545,18 @@ def validate_case(
             "selected_rank_compute_network_overlap_sum_us"
         ],
         "cross_layer_overlap_us": cross_layer_overlap_us,
+        "gate_provider": manifest["metadata"]["routing_provider"]["name"],
+        "gate_assignment_digests": gate_digests,
     }
 
 
-def run_algorithm(root_dir: Path, algorithm: str, mode: RunMode) -> dict[str, object]:
+def run_algorithm(
+    root_dir: Path,
+    algorithm: str,
+    mode: RunMode,
+    gate: GateRun,
+    moonep_replicas_per_rank: int,
+) -> dict[str, object]:
     case_dir = root_dir / "algorithms" / algorithm
     case_dir.mkdir(parents=True)
     try:
@@ -458,8 +590,19 @@ def run_algorithm(root_dir: Path, algorithm: str, mode: RunMode) -> dict[str, ob
                 tokens_per_rank=mode.tokens_per_rank,
                 algorithm=algorithm,
                 chunk_tokens=mode.chunk_tokens,
-                replicas_per_rank=2,
+                replicas_per_rank=moonep_replicas_per_rank,
                 token_padding=128,
+                gate_provider=create_gate_provider(
+                    gate.provider,
+                    seed=gate.seed,
+                    rank_alpha=gate.rank_alpha,
+                    local_alpha=gate.local_alpha,
+                    target_rank_imbalance=gate.target_rank_imbalance,
+                    fast_skew=gate.fast_skew,
+                    raw_placement_json=gate.raw_placement_json,
+                    raw_csv_pattern=gate.raw_csv_pattern,
+                    layer_map=gate.layer_map,
+                ),
                 dispatch_dtype="fp8",
                 combine_dtype="bf16",
                 weight_dtype="bf16",
@@ -552,6 +695,8 @@ def main() -> int:
     args = parse_args()
     if args.workers <= 0:
         raise SystemExit("--workers must be positive")
+    if args.moonep_replicas_per_rank < 0:
+        raise SystemExit("--moonep-replicas-per-rank must be non-negative")
     algorithms = tuple(
         value.strip() for value in args.algorithms.split(",") if value.strip()
     )
@@ -562,6 +707,31 @@ def main() -> int:
         raise SystemExit(f"unsupported algorithms: {sorted(unsupported)}")
 
     mode = mode_config(args.full)
+    if args.simulation_end_us is not None:
+        if args.simulation_end_us <= 0:
+            raise SystemExit("--simulation-end-us must be positive")
+        mode = replace(mode, simulation_end_us=args.simulation_end_us)
+    layer_map = None
+    if args.gate_layer_map:
+        try:
+            layer_map = tuple(
+                int(value.strip()) for value in args.gate_layer_map.split(",")
+            )
+        except ValueError as exc:
+            raise SystemExit("--gate-layer-map must contain integers") from exc
+        if len(layer_map) != 2:
+            raise SystemExit("--gate-layer-map needs exactly two entries")
+    gate = GateRun(
+        provider=args.gate_provider,
+        seed=args.gate_seed,
+        rank_alpha=args.gate_rank_alpha,
+        local_alpha=args.gate_local_alpha,
+        target_rank_imbalance=args.gate_target_rank_imbalance,
+        fast_skew=args.gate_fast_skew,
+        raw_placement_json=args.gate_raw_placement_json.resolve(),
+        raw_csv_pattern=args.gate_raw_csv_pattern,
+        layer_map=layer_map,
+    )
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_dir = (
         ROOT
@@ -575,6 +745,8 @@ def main() -> int:
                 "mode": asdict(mode),
                 "algorithms": algorithms,
                 "workers": min(args.workers, len(algorithms)),
+                "gate": asdict(gate),
+                "moonep_replicas_per_rank": args.moonep_replicas_per_rank,
                 "topology": {
                     "ranks": 32,
                     "servers": 4,
@@ -583,6 +755,11 @@ def main() -> int:
                     "leaf": 8,
                     "spine": 4,
                     "rdma_gbps": 400,
+                    "mtu_bytes": 4150,
+                    "queue_packets": 128,
+                    "queue_bytes": 531200,
+                    "ecn_low_bytes": 16600,
+                    "ecn_high_bytes": 53950,
                 },
             },
             ensure_ascii=False,
@@ -615,7 +792,14 @@ def main() -> int:
         max_workers=min(args.workers, len(algorithms))
     ) as executor:
         futures = {
-            executor.submit(run_algorithm, run_dir, algorithm, mode): algorithm
+            executor.submit(
+                run_algorithm,
+                run_dir,
+                algorithm,
+                mode,
+                gate,
+                args.moonep_replicas_per_rank,
+            ): algorithm
             for algorithm in algorithms
         }
         for future in as_completed(futures):
@@ -633,6 +817,12 @@ def main() -> int:
                 print(f"[{algorithm}] failed: {exc}")
 
     results = [by_algorithm[algorithm] for algorithm in algorithms]
+    if all(item["status"] == "passed" for item in results):
+        reference = results[0]["gate_assignment_digests"]
+        require(
+            all(item["gate_assignment_digests"] == reference for item in results),
+            "algorithms did not consume identical Gate assignments",
+        )
     comparison_path: Path | None = None
     comparison_member: str | None = None
     visualization_zip: Path | None = None
@@ -691,9 +881,15 @@ def main() -> int:
                     )
                     require(
                         sum(name.endswith(".html") for name in members)
-                        == len(algorithms) + 1,
+                        == 3 * len(algorithms) + 1,
                         "visualization ZIP has an unexpected HTML inventory",
                     )
+                    for algorithm in algorithms:
+                        require(
+                            f"algorithms/{algorithm}/algorithm_dashboard.html"
+                            in members,
+                            f"visualization ZIP is missing {algorithm} dashboard",
+                        )
                     require(
                         not any(
                             "/workload/" in name
@@ -720,6 +916,10 @@ def main() -> int:
         for algorithm in algorithms:
             (run_dir / "algorithms" / algorithm / "timeline" /
              "dag_gpu_timeline.html").unlink()
+            (run_dir / "algorithms" / algorithm / "gate_load" /
+             "gate_load_profile.html").unlink()
+            (run_dir / "algorithms" / algorithm /
+             "algorithm_dashboard.html").unlink()
         require(
             not any(run_dir.rglob("*.html")),
             "successful run left loose HTML files outside the ZIP",

@@ -96,6 +96,7 @@ class FixedOperationCostModel:
         *,
         operation: str,
         overlaps_communication: bool = False,
+        token_count: int | None = None,
     ) -> ComputeEstimate:
         duration_us = self._durations_us[operation]
         available_sms = 112 if overlaps_communication else 132
@@ -106,6 +107,10 @@ class FixedOperationCostModel:
             available_sms=available_sms,
             peak_flops_per_second=operation_flops / duration_us * 1e6,
             source=f"test_fixed_operation:{operation}",
+            token_count=token_count,
+            us_per_token=(
+                duration_us / token_count if token_count is not None else None
+            ),
         )
 
     def manifest(self) -> dict[str, object]:
@@ -154,10 +159,11 @@ def json_compute_cost_case(run_dir: Path) -> str:
         1_000_000,
         operation="attention",
         overlaps_communication=True,
+        token_count=4096,
     )
     require(
         math.isclose(estimate.duration_us, 2188.73965337108),
-        "JSON theoretical_us 没有成为固定 compute_us",
+        "JSON theoretical_us_per_token 没有按 4096 tokens 缩放",
     )
     require(estimate.available_sms == 112, "JSON cost model 的 overlap SM 错误")
     require(
@@ -165,8 +171,24 @@ def json_compute_cost_case(run_dir: Path) -> str:
         "JSON cost manifest 没有记录 theoretical 选择",
     )
     profile_payload = json.loads(config_path.read_text(encoding="utf-8"))
+    legacy_payload = dict(profile_payload)
+    legacy_payload["schema_version"] = 1
+    legacy_path = run_dir / "generated" / "legacy_compute_test.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps(legacy_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        JsonComputeCostModel.from_path(legacy_path)
+    except ValidationError as exc:
+        require("schema_version must be 2" in str(exc), "旧 schema 报错不明确")
+    else:
+        raise AssertionError("旧的固定总时间 schema v1 应被拒绝")
     profile_payload["selected_source"] = "profiled"
-    profile_payload["modules"]["attention"]["profiled_us"] = 7.5
+    profile_payload["modules"]["attention"]["profiled_us_per_token"] = (
+        7.5 / 4096
+    )
     profiled_path = run_dir / "generated" / "profiled_compute_test.json"
     profiled_path.parent.mkdir(parents=True, exist_ok=True)
     profiled_path.write_text(
@@ -177,20 +199,72 @@ def json_compute_cost_case(run_dir: Path) -> str:
     profiled_estimate = profiled.estimate(
         1_000_000,
         operation="attention",
+        token_count=4096,
     )
     require(
         profiled_estimate.duration_us == 7.5,
-        "JSON profiled_us 没有成为固定 compute_us",
+        "JSON profiled_us_per_token 没有按 token 数缩放",
+    )
+    expert_100 = theoretical.estimate(
+        100_000,
+        operation="expert_ffn",
+        token_count=100,
+    )
+    expert_200 = theoretical.estimate(
+        200_000,
+        operation="expert_ffn",
+        token_count=200,
+    )
+    require(
+        math.isclose(expert_200.duration_us, 2 * expert_100.duration_us),
+        "expert_ffn compute_us 没有随 routed token 数线性缩放",
+    )
+    skewed_invocation = MoEInvocation(
+        invocation_id="json_per_token_skew",
+        placement=Placement(2, 2, (0, 1)),
+        tokens_per_source_rank=(4, 4),
+        hidden=7168,
+        ffn_hidden=2048,
+        topk=1,
+        dispatch_dtype="fp8",
+        combine_dtype="bf16",
+        weight_dtype="bf16",
+        assignments=tuple(
+            RoutingAssignment(
+                src_rank=source,
+                token_id=token,
+                topk_slot=0,
+                expert_id=(1 if source == 1 and token == 3 else 0),
+            )
+            for source in range(2)
+            for token in range(4)
+        ),
+    )
+    skewed_graph = TaskGraph("json_per_token_skew", 2)
+    NCCLBuilder(theoretical, NCCLConfig(chunk_routes=8)).build(
+        skewed_graph,
+        skewed_invocation,
+    )
+    hot = skewed_graph.task("json_per_token_skew.expert.rank0")
+    cold = skewed_graph.task("json_per_token_skew.expert.rank1")
+    require(hot.metadata["real_token_routes"] == 7, "热点 rank route 数错误")
+    require(cold.metadata["real_token_routes"] == 1, "冷点 rank route 数错误")
+    require(
+        math.isclose(hot.duration_us, 7 * cold.duration_us),
+        "实际 NCCL FFN task 没有按 7:1 routed tokens 缩放",
     )
     try:
         JsonComputeCostModel.from_path(
             config_path, selected_source="profiled"
-        ).estimate(1_000_000, operation="expert_ffn")
+        ).estimate(1_000_000, operation="expert_ffn", token_count=100)
     except ValidationError as exc:
-        require("profiled_us is null" in str(exc), "空 profiling 报错信息错误")
+        require(
+            "profiled_us_per_token is null" in str(exc),
+            "空 profiling 报错信息错误",
+        )
     else:
-        raise AssertionError("选中的 profiled_us 为空时应拒绝生成")
-    return "JSON theoretical/profiled 二选一正确；空 profiling 和缺失值不会静默回退"
+        raise AssertionError("选中的 profiled_us_per_token 为空时应拒绝生成")
+    return "JSON per-token theoretical/profiled 二选一正确；实际 FFN task 按 7:1 routed tokens 缩放"
 
 
 def emitter_case(run_dir: Path) -> str:
@@ -1085,7 +1159,7 @@ def execute_htsim(
     run_dir: Path, name: str, matrix_path: Path, dag_path: Path
 ) -> str:
     case_dir = run_dir / "cases" / name
-    (case_dir / "output_metrics").mkdir(parents=True, exist_ok=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
     command = [
         str(BINARY),
         "-topology", "mprail",
@@ -1114,6 +1188,14 @@ def execute_htsim(
         text=True,
         timeout=60,
         check=False,
+    )
+    require(
+        not (case_dir / "output_metrics").exists(),
+        "未启用链路采样时不应生成 output_metrics",
+    )
+    require(
+        not (case_dir / "idmap.txt").exists(),
+        "htsim_uec 不应生成未使用的 idmap.txt",
     )
     (case_dir / "htsim.log").write_text(completed.stdout, encoding="utf-8")
     require(completed.returncode == 0, f"HTSim 返回码 {completed.returncode}")

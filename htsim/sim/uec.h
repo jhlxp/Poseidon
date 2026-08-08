@@ -315,8 +315,6 @@ public:
     void processNack(const UecNackPacket& pkt);
     void processPull(const UecPullPacket& pkt);
     void runSleek(uint32_t ooo, UecBasePacket::seq_t cum_ack);
-    void logFlowCompletionMetric();
-
     //added for NSCC
     bool can_send_NSCC(mem_b pkt_size);
     bool can_send_RCCC();

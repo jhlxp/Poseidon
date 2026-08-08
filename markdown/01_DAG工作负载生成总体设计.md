@@ -242,11 +242,12 @@ overlap:        cross-layer Attention || Combine
 compute/communication overlap，不允许 compute/compute 或 communication/communication
 重叠。
 
-### 5.4 Compute 使用固定时长
+### 5.4 Compute 在生成时降低为固定时长
 
 HTSim 中的 compute task 始终是固定 `compute_us`。生成器支持两种写入来源：默认
-H100 理论 FLOP 公式，或者模块级 JSON 固定时间。JSON 同时保存 `theoretical_us`
-和 `profiled_us`，通过 `selected_source` 二选一，格式见
+H100 理论 FLOP 公式，或者模块级 JSON per-token 时间。JSON 同时保存
+`theoretical_us_per_token` 和 `profiled_us_per_token`，通过 `selected_source`
+二选一，再乘当前 task 的实际 token 数，格式见
 [15_计算时间JSON配置.md](15_计算时间JSON配置.md)。
 
 未传 JSON 时，生成器按单张 H100 SXM 的 dense BF16 Tensor Core 峰值换算。普通
@@ -265,9 +266,10 @@ compute_us_overlap = operation_flops / 839.15e12 * 1e6
 
 `communication_sms=20` 是本项目的首版仿真假设，不是 DeepEP 对所有模式和拓扑的固定值。它按“每个 rank 上的逻辑通信 kernel/phase”预留一次；同一个 dispatch/combine phase 拆出的多个 flow 或 chunk 共享这 20 SM，不能按 flow 数重复扣减。
 
-传入 JSON 后，选中的模块时间直接写入 `.dag`，不再按 FLOP 或 overlap SM 比例缩放；
-`total_sms`/`communication_sms` 只记录资源假设。这样每个模块只需维护一个理论数字
-和一个 profiling 数字。
+传入 JSON 后使用 `compute_us = token_count * selected_us_per_token`，不再按 FLOP
+或 overlap SM 比例缩放；`total_sms`/`communication_sms` 只记录资源假设。
+`expert_ffn` 的 token_count 是当前 execution rank 的 routed expert tokens，MoonEP
+使用 padding 后 tokens，因此热点和均衡算法会真实改变 FFN task 时长。
 
 换算或读取结果写入 `.dag` 后就是固定时长事件。HTSim 不做运行时 SM 调度，也不
 动态恢复 SM。network task 的 FCT 仍完全由 UEC/MpRail 决定。

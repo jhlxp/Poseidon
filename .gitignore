@@ -22,14 +22,12 @@ htsim/sim/lgs/txt2bin
 *.out
 *.err
 *.cm
-idmap.txt
 logout.dat
 sim_progress.log
 core_*
 htsim/sim/datacenter/core_*
 htsim/sim/datacenter/output_metrics/
 htsim/sim/datacenter/experiments_output*/
-output_metrics/
 paper_plots/
 
 # Test and experiment outputs

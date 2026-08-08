@@ -3,6 +3,11 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from moe_dag import (
     JsonComputeCostModel,
@@ -13,6 +18,15 @@ from moe_dag import (
     make_contiguous_expert_placement,
 )
 from moe_dag.models import TransformerWorkloadConfig, build_transformer_workload
+from workload.gate import GATE_PROVIDER_NAMES, create_gate_provider
+
+
+DEFAULT_RAW_PLACEMENT = (
+    ROOT
+    / "workload"
+    / "raw_data"
+    / "ET_4+4_32_9_gsm8k_r1_2k_2k_0417_al_0.json"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +85,28 @@ def parse_args() -> argparse.Namespace:
         choices=("theoretical", "profiled"),
         help="Override selected_source from --compute-config.",
     )
+    parser.add_argument(
+        "--gate-provider",
+        choices=GATE_PROVIDER_NAMES,
+        default="balanced_permuted",
+    )
+    parser.add_argument("--gate-seed", type=int, default=0)
+    parser.add_argument("--gate-rank-alpha", type=float)
+    parser.add_argument("--gate-local-alpha", type=float, default=4.0)
+    parser.add_argument(
+        "--gate-target-rank-imbalance", type=float, default=2.0
+    )
+    parser.add_argument("--gate-fast-skew", type=float, default=0.8)
+    parser.add_argument(
+        "--gate-raw-placement-json",
+        type=Path,
+        default=DEFAULT_RAW_PLACEMENT,
+    )
+    parser.add_argument("--gate-raw-csv-pattern", default="decode_{rank}.csv")
+    parser.add_argument(
+        "--gate-layer-map",
+        help="Comma-separated raw layer IDs, one for each model layer.",
+    )
     return parser.parse_args()
 
 
@@ -116,6 +152,32 @@ def main() -> int:
             raise ValidationError(
                 "--compute-time-source requires --compute-config"
             )
+        gate_layer_map = None
+        if args.gate_layer_map:
+            try:
+                gate_layer_map = tuple(
+                    int(value.strip())
+                    for value in args.gate_layer_map.split(",")
+                )
+            except ValueError as exc:
+                raise ValidationError(
+                    "--gate-layer-map must be comma-separated integers"
+                ) from exc
+            if len(gate_layer_map) != args.num_layers:
+                raise ValidationError(
+                    "--gate-layer-map needs exactly --num-layers entries"
+                )
+        gate_provider = create_gate_provider(
+            args.gate_provider,
+            seed=args.gate_seed,
+            rank_alpha=args.gate_rank_alpha,
+            local_alpha=args.gate_local_alpha,
+            target_rank_imbalance=args.gate_target_rank_imbalance,
+            fast_skew=args.gate_fast_skew,
+            raw_placement_json=args.gate_raw_placement_json,
+            raw_csv_pattern=args.gate_raw_csv_pattern,
+            layer_map=gate_layer_map,
+        )
         cost_model = (
             JsonComputeCostModel.from_path(
                 args.compute_config,
@@ -141,6 +203,7 @@ def main() -> int:
                     if eplb_loads is not None
                     else "current_invocation_proxy"
                 ),
+                gate_provider=gate_provider,
                 dispatch_dtype=args.dispatch_dtype,
                 combine_dtype=args.combine_dtype,
                 weight_dtype=args.weight_dtype,

@@ -24,6 +24,10 @@ rank、plane、Leaf、Spine 或链路速率组合；算法级纯 Python 单元�
 | L0-L1 链路 | 400 Gbps |
 | 每个 L0-L1 pair 的 bundle | 1 |
 | server-local FullMesh / rank local injection | 7200 Gbps |
+| MTU | 4150 bytes |
+| 每个有向链路 queue | 128 packets = 531200 bytes，约 518.75 KiB |
+| ECN low（实际 marking threshold） | 4 packets = 16600 bytes = queue 的 3.125% |
+| ECN high（仅解析/校验） | 13 packets = 53950 bytes = queue 的 10.15625% |
 
 ## 3. Rail 与 Leaf 映射
 
@@ -94,7 +98,9 @@ cross rail:  rank 0 -> rank 9
 -mprail_l1_eps_per_plane 4 \
 -mprail_l0_l1_links_per_spine 1 \
 -linkspeed 400000 \
--local_linkspeed 7200000
+-local_linkspeed 7200000 \
+-mtu 4150 \
+-q 128
 ```
 
 `.cm` 必须声明 `Nodes 32`。DAG 模式继续使用 `Connections 0` 的空 `.cm`
@@ -247,7 +253,8 @@ double-buffer group 才 drain。
 
 - DSV3 前三个 dense layer 和完整 61 层；
 - MLA、RMSNorm、residual、shared expert 的逐 kernel 实现；
-- layer-specific 真实 router trace；当前两层复用 deterministic balanced-permuted routing；
+- 原始逐 token router trace；默认使用 deterministic `balanced_permuted`，也可显式
+  选择 uniform、UltraEP-style、FAST-style 或 raw receive CDF provider；
 - backward、梯度通信、CUDA runtime、动态 SM 和 HBM 竞争。
 
 因此“DSV3”表示采用 DSV3 的核心 MoE shape 和通信口径，不表示当前 DAG 已覆盖
@@ -262,6 +269,12 @@ python3 tests/run_dsv3_2layer_algorithms.py
 
 # 仅在明确要求“完整测试”时使用
 python3 tests/run_dsv3_2layer_algorithms.py --full --workers 4
+
+# 不均匀 raw CDF smoke；MoonEP 的临时副本容量必须显式给足
+python3 tests/run_dsv3_2layer_algorithms.py \
+  --gate-provider raw_receive_cdf --gate-layer-map 0,1 \
+  --gate-seed 17 --moonep-replicas-per-rank 10 \
+  --simulation-end-us 20000
 ```
 
 默认入口是 `2 tokens/rank/microbatch` smoke，用于日常功能回归。`--full`
@@ -292,6 +305,9 @@ test_logs/run_<timestamp>_dsv3_2layer_4algo_<smoke|full>/
         │   ├── dag_task_timeline.csv
         │   ├── dag_rank_overlap_summary.csv
         │   └── dag_timeline_summary.json
+        ├── gate_load/
+        │   ├── gate_load_profile.csv
+        │   └── gate_load_profile_summary.json
         └── link_load/
             ├── mprail_link_load_by_layer.png
             ├── mprail_link_load_summary.csv
@@ -302,8 +318,26 @@ EP32 smoke/full 的 timeline 必须展示 rank 0-31，也就是四台服务器�
 GPU，不能只截取 server 0。ZIP 中的四算法区域和每个 `Task details` 均可折叠；
 每条 timeline 默认
 Fit 全局，可水平缩放并实时显示 `100 px` 对应的微秒数。
-`dsv3_visualization_bundle.zip` 只打包总览 HTML、四算法 timeline 和链路负载产物，
-不包含 workload 和 simulation 大文件。服务器 run 目录不保留散装 HTML。
+`dsv3_visualization_bundle.zip` 只打包总览 HTML、四算法 Gate/expert before-after、
+timeline 和链路负载产物，不包含 workload 和 simulation 大文件。服务器 run 目录
+不保留散装 HTML。可用 `--gate-provider` 选择分布；同一次四算法实验必须使用完全
+相同的 Gate assignment digest 序列。MoonEP 的 `replicas_per_rank` 是真实容量约束；
+偏斜分布在默认值 2 下无法满足 planner 的严格 rank 均衡时会明确失败，不会静默
+改变 Gate。通过 `--moonep-replicas-per-rank` 显式配置实验容量，并在 `配置.json`
+中记录。
+大量 MoonEP 权重预取也可能超过默认 smoke 的 `end=2000 us`；
+`--simulation-end-us` 只延长仿真截止时间，不改变 token 数或 workload。
+
+ZIP 内采用两级入口：
+
+```text
+dsv3_algorithm_comparison.html
+algorithms/<algorithm>/algorithm_dashboard.html
+```
+
+单算法 dashboard 已包含该算法的 Gate、timeline、link-load 和 CSV 入口；根页面
+再统一嵌入四个算法 dashboard。两级页面都依赖 ZIP 中的相对路径资源，因此必须
+先完整解压 ZIP。
 
 ## 12. DSV3 两层验收条件
 
@@ -322,11 +356,14 @@ Fit 全局，可水平缩放并实时显示 `100 px` 对应的微秒数。
 8. 两个 layer 上的参与 GPU 集合中都必须实际出现 `D0||A1`、`D1||E0`、
    `C0||E1`、`C1||Reduce0`；不要求八个窗口固定落在同一张 GPU。另外
    必须实际出现 `L1 MB0 Attention || L0 MB1 Combine` 跨层窗口。
-9. 每个算法的 task CSV、rank overlap CSV、timeline summary、链路负载 PNG 和
-   链路/endpoint summary 必须在服务器 run 目录中保留。
-10. ZIP 内总览 HTML 必须包含四个可折叠算法区域，并能进入每个算法覆盖
-    rank 0-31 的可缩放 timeline 和 MpRail 链路负载图；四份 timeline summary 的
-    `selected_ranks` 必须均为完整 `0..31`。
+9. 每个算法的 task CSV、rank overlap CSV、timeline summary、Gate load CSV/JSON、
+   链路负载 PNG 和链路/endpoint summary 必须在服务器 run 目录中保留。
+10. ZIP 必须包含四个单算法完整 dashboard 和一个总 dashboard；总览包含四个
+    可折叠算法区域，单算法页面能进入覆盖 rank 0-31 的 Gate before-after、
+    可缩放 timeline 和 MpRail 链路负载图；四份
+    timeline summary 的 `selected_ranks` 必须均为完整 `0..31`。
 11. 可视化 ZIP 必须可完整解压，包含总览页和所有被引用资源，且不得
     包含 workload 或 simulation 目录。
 12. ZIP 校验通过后，服务器 run 目录中不得留下任何 `*.html`。
+13. 四算法每个 layer/microbatch 的 Gate assignment digest 必须逐项相等；每份
+    before/after profile 的 total routes 和 logical expert histogram 必须守恒。

@@ -82,6 +82,9 @@ class TaskGraph:
             barrier_group=barrier_group,
             metadata={
                 "cost_source": estimate.source,
+                "compute_token_count": estimate.token_count,
+                "compute_us_per_token": estimate.us_per_token,
+                "compute_token_kind": estimate.token_kind,
                 **(metadata or {}),
             },
         )

@@ -1,35 +1,42 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "hardware": "H100_SXM",
-  "profile_scope": "DSV3 4-algorithm comparison baseline; EP32; tokens_per_rank=4096; topk=8; uniform routing; balanced_routes_per_rank=32768",
+  "profile_scope": "DSV3 EP32 per-token linear cost; hidden=7168; ffn_hidden=2048; sequence_length=4096; topk=8",
   "selected_source": "theoretical",
   "time_unit": "us",
+  "scaling": "duration_us = token_count * selected_us_per_token",
   "total_sms": 132,
   "communication_sms": 20,
   "modules": {
     "attention": {
-      "theoretical_us": 2188.73965337108,
-      "profiled_us": null
+      "token_kind": "source_token",
+      "theoretical_us_per_token": 0.5343602669362988,
+      "profiled_us_per_token": null
     },
     "router_projection": {
-      "theoretical_us": 15.1995809261881,
-      "profiled_us": null
+      "token_kind": "source_token",
+      "theoretical_us_per_token": 0.003710835187057642,
+      "profiled_us_per_token": null
     },
     "expert_ffn": {
-      "theoretical_us": 3439.44802672599,
-      "profiled_us": null
+      "token_kind": "routed_expert_token",
+      "theoretical_us_per_token": 0.10496362386248749,
+      "profiled_us_per_token": null
     },
     "combine_reduce": {
-      "theoretical_us": 0.474986903943377,
-      "profiled_us": null
+      "token_kind": "source_token_with_topk8",
+      "theoretical_us_per_token": 0.00011596359959555103,
+      "profiled_us_per_token": null
     },
     "combine_final_reduce": {
-      "theoretical_us": 0.474986903943377,
-      "profiled_us": null
+      "token_kind": "source_token_with_topk8",
+      "theoretical_us_per_token": 0.00011596359959555103,
+      "profiled_us_per_token": null
     },
     "per_server_planning_proxy": {
-      "theoretical_us": 0.00477107381193124,
-      "profiled_us": null
+      "token_kind": "server_routed_expert_token",
+      "theoretical_us_per_token": 0.000000018200202224469147,
+      "profiled_us_per_token": null
     }
   }
 }

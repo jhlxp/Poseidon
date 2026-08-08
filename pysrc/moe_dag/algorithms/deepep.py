@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 from ..cost import ComputeCostModel
 from ..graph import TaskGraph
+from ..load_profile import build_expert_load_profile
 from ..schema import MoEInvocation, ValidationError
 from .common import (
     AlgorithmBuildResult,
@@ -90,6 +91,7 @@ class DeepEPBuilder:
                     flops,
                     operation="expert_ffn",
                     overlaps_communication=self.config.overlap_expert_compute,
+                    token_count=route_count,
                 ),
                 predecessors=roots | dispatch_arrivals[rank],
                 metadata={
@@ -130,6 +132,7 @@ class DeepEPBuilder:
                 self.cost_model.estimate(
                     max(1, route_count_by_origin[origin] * invocation.hidden * 2),
                     operation="combine_final_reduce",
+                    token_count=token_count,
                 ),
                 predecessors=predecessors,
                 metadata={
@@ -149,6 +152,7 @@ class DeepEPBuilder:
                 continue
             transfer_bytes[task.payload_kind or "unspecified"] += task.transfer_bytes
         route_count = payload_plan.route_count
+        expert_load_profile = build_expert_load_profile(invocation)
         return AlgorithmBuildResult(
             algorithm="deepep_hierarchical",
             terminal_keys=frozenset(terminal_keys),
@@ -182,5 +186,6 @@ class DeepEPBuilder:
                 "hierarchical_transfer": transfer_summary.manifest(),
                 "transfer_bytes_by_payload": dict(sorted(transfer_bytes.items())),
                 "created_tasks": len(created),
+                "expert_load_profile": expert_load_profile,
             },
         )

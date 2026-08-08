@@ -138,16 +138,16 @@ MpRail 每条有向链路都有独立 queue。当前外部链路和 server-local
 queue_size_bytes = ceil(N * MTU_bytes)
 ```
 
-当前默认 MTU 是 4150 bytes，因此测试中常用的：
+当前默认 MTU 是 4150 bytes，标准 DSV3 smoke/full 固定使用：
 
 ```text
--mtu 4150 -q 32
+-mtu 4150 -q 128
 ```
 
 对应：
 
 ```text
-queue_size_bytes = 32 * 4150 = 132800 bytes
+queue_size_bytes = 128 * 4150 = 531200 bytes ~= 518.75 KiB
 ```
 
 不写 `-q` 时启用自动 BDP buffer：
@@ -189,6 +189,16 @@ MpRail 的 `ECNQueue` 当前只使用 `ecn_low` 作为 marking threshold；`ecn_
 两项输入的单位同样是 packet，进入拓扑前转换为 byte。`-disable_ecn` 会让 MpRail
 使用普通 Queue。
 
+标准拓扑的 `bdp_pkt=16`，所以自动阈值为：
+
+```text
+ecn_low  = 4 packets  = 16600 bytes = 3.125% of queue
+ecn_high = 13 packets = 53950 bytes = 10.15625% of queue
+```
+
+其中只有 low 是 MpRail 当前真正采用的确定性 marking threshold。扩大 `-q` 不会
+自动按队列比例放大 ECN threshold，因为默认公式基于 BDP。
+
 采样 CSV 的 `max_queue_bytes` 是该时间桶观察到的最大 queue occupancy。判断 buffer
 压力时应使用：
 
@@ -211,7 +221,7 @@ HTSIM_LINK_LOAD_SAMPLE_US=1 \
   -linkspeed 400000 \
   -local_linkspeed 7200000 \
   -mtu 4150 \
-  -q 32 \
+  -q 128 \
   -sender_cc_only \
   -sender_cc_algo nscc \
   ...

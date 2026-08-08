@@ -90,7 +90,7 @@ class Suite:
     ) -> None:
         case_dir = self.run_dir / "cases" / name
         input_dir = self.run_dir / "inputs"
-        (case_dir / "output_metrics").mkdir(parents=True, exist_ok=True)
+        case_dir.mkdir(parents=True, exist_ok=True)
         matrix_path = input_dir / f"{name}.cm"
         write_text(matrix_path, matrix)
         command = [
@@ -131,6 +131,14 @@ class Suite:
                 text=True,
                 timeout=60,
                 check=False,
+            )
+            require(
+                not (case_dir / "output_metrics").exists(),
+                "未启用链路采样时不应生成 output_metrics",
+            )
+            require(
+                not (case_dir / "idmap.txt").exists(),
+                "htsim_uec 不应生成未使用的 idmap.txt",
             )
             write_text(case_dir / "htsim.log", completed.stdout)
             detail = validator(completed.stdout, completed.returncode)

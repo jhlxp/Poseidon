@@ -6,6 +6,7 @@ from math import ceil
 
 from ..cost import ComputeCostModel
 from ..graph import TaskGraph
+from ..load_profile import ExpertInstance, build_expert_load_profile
 from ..schema import MoEInvocation, RoutingAssignment, ValidationError
 from .common import (
     AlgorithmBuildResult,
@@ -192,6 +193,7 @@ class MoonEPBuilder:
                     self.cost_model.estimate(
                         planning_flops,
                         operation="per_server_planning_proxy",
+                        token_count=plan.routes_by_server[server],
                     ),
                     predecessors=roots,
                     barrier_group=f"{invocation.invocation_id}.planning_join.server{server}",
@@ -306,6 +308,7 @@ class MoonEPBuilder:
                     padded_routes * 6 * invocation.hidden * invocation.ffn_hidden,
                     operation="expert_ffn",
                     overlaps_communication=self.config.overlap_expert_compute,
+                    token_count=padded_routes,
                 ),
                 predecessors=(
                     planning_keys_by_server[server]
@@ -353,6 +356,7 @@ class MoonEPBuilder:
                 self.cost_model.estimate(
                     max(1, token_count * invocation.topk * invocation.hidden * 2),
                     operation="combine_reduce",
+                    token_count=token_count,
                 ),
                 predecessors=predecessors,
                 metadata={
@@ -370,6 +374,37 @@ class MoonEPBuilder:
             if task.kind != "transfer":
                 continue
             transfer_bytes[task.payload_kind or "unspecified"] += task.transfer_bytes
+        after_instance_values = [
+            ExpertInstance(
+                instance_id=f"logical:{expert}:rank:{placement.expert_rank(expert)}",
+                logical_expert=expert,
+                rank=placement.expert_rank(expert),
+                kind="master",
+                physical_expert=None,
+                replica_index=0,
+            )
+            for expert in range(placement.num_experts)
+        ]
+        for rank, experts in sorted(plan.replicas_by_rank.items()):
+            for replica_index, expert in enumerate(experts, start=1):
+                after_instance_values.append(
+                    ExpertInstance(
+                        instance_id=f"logical:{expert}:rank:{rank}",
+                        logical_expert=expert,
+                        rank=rank,
+                        kind="replica",
+                        physical_expert=None,
+                        replica_index=replica_index,
+                    )
+                )
+        expert_load_profile = build_expert_load_profile(
+            invocation,
+            after_instances=tuple(after_instance_values),
+            select_after_instance=lambda assignment: (
+                f"logical:{assignment.expert_id}:rank:"
+                f"{plan.execution_rank[self._route_key(assignment)]}"
+            ),
+        )
         return AlgorithmBuildResult(
             algorithm="moonep_deepep_hierarchical",
             terminal_keys=frozenset(terminal_keys),
@@ -406,6 +441,7 @@ class MoonEPBuilder:
                 ),
                 "transfer_bytes_by_payload": dict(sorted(transfer_bytes.items())),
                 "created_tasks": len(created),
+                "expert_load_profile": expert_load_profile,
             },
         )
 

@@ -6,6 +6,7 @@ from math import isfinite
 
 from ..cost import ComputeCostModel
 from ..graph import TaskGraph
+from ..load_profile import ExpertInstance, build_expert_load_profile
 from ..schema import MoEInvocation, RoutingAssignment, ValidationError
 from .common import (
     AlgorithmBuildResult,
@@ -341,6 +342,7 @@ class EPLBBuilder:
                     route_count * 6 * invocation.hidden * invocation.ffn_hidden,
                     operation="expert_ffn",
                     overlaps_communication=self.config.overlap_expert_compute,
+                    token_count=route_count,
                 ),
                 predecessors=roots | dispatch_arrivals[rank],
                 metadata={
@@ -386,6 +388,7 @@ class EPLBBuilder:
                 self.cost_model.estimate(
                     max(1, route_count_by_origin[origin] * invocation.hidden * 2),
                     operation="combine_reduce",
+                    token_count=token_count,
                 ),
                 predecessors=predecessors,
                 metadata={
@@ -404,6 +407,28 @@ class EPLBBuilder:
             if task.kind != "transfer":
                 continue
             transfer_bytes[task.payload_kind or "unspecified"] += task.transfer_bytes
+        after_instances = tuple(
+            ExpertInstance(
+                instance_id=f"physical:{physical}",
+                logical_expert=logical,
+                rank=placement_plan.physical_to_rank[physical],
+                kind=(
+                    "primary"
+                    if placement_plan.physical_replica_rank[physical] == 0
+                    else "replica"
+                ),
+                physical_expert=physical,
+                replica_index=placement_plan.physical_replica_rank[physical],
+            )
+            for physical, logical in enumerate(placement_plan.physical_to_logical)
+        )
+        expert_load_profile = build_expert_load_profile(
+            invocation,
+            after_instances=after_instances,
+            select_after_instance=lambda assignment: (
+                f"physical:{execution[self._route_key(assignment)].physical_expert}"
+            ),
+        )
         return AlgorithmBuildResult(
             algorithm="eplb_deepep_hierarchical",
             terminal_keys=frozenset(terminal_keys),
@@ -454,6 +479,7 @@ class EPLBBuilder:
                 "hierarchical_transfer": transfer_summary.manifest(),
                 "transfer_bytes_by_payload": dict(sorted(transfer_bytes.items())),
                 "created_tasks": len(created),
+                "expert_load_profile": expert_load_profile,
             },
         )
 

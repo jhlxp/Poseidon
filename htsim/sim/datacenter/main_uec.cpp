@@ -2575,7 +2575,6 @@ int main(int argc, char **argv) {
     if (oxc_dag_manager) {
         oxc_dag_manager->start();
     }
-    Logged::dump_idmap();
     // Record the setup
     int pktsize = Packet::data_packet_size();
     logfile.write("# pktsize=" + ntoa(pktsize) + " bytes");

@@ -69,7 +69,7 @@ You can run a single network connection using UEC CMS as follows:
 The output consists of two major parts: the configuration and setup section, and the runtime section.
 The first part of the output shows the configured/derived/default parameter settings and values used by htsim.
 It is important to verify that all the parameters are indeed accepted as expected when using custom configurations.
-The runtime section starts with the `Starting simulation` line and ends with a packet summary. Per-flow completion records are written to `output_metrics/flowsInfo.csv`.
+The runtime section starts with the `Starting simulation` line and ends with a packet summary. UEC does not create a default per-flow CSV directory. Set `HTSIM_TRACE_FLOW_COMPLETIONS=1` when per-flow completion lines are needed in stdout.
 
 ```
 Starting simulation
@@ -141,8 +141,7 @@ cd htsim/sim/datacenter
   -flow-small-flows-weight 100.0
 ```
 
-Each run exports CSV metrics in `output_metrics/`, including `flowsInfo.csv`, `packetInfo.csv`, and `globalInfo.csv`.
-By default, UEC flow completion and trigger traces are not printed to stdout; set `HTSIM_TRACE_FLOW_COMPLETIONS=1` or `HTSIM_TRACE_TRIGGERS=1` when debugging old log-parsing workflows.
+UEC does not export `flowsInfo.csv` or `flowsInfo_live.txt` by default. Flow completion and trigger traces are also quiet by default; set `HTSIM_TRACE_FLOW_COMPLETIONS=1` or `HTSIM_TRACE_TRIGGERS=1` when debugging old log-parsing workflows. MpRail link CSVs are a separate opt-in facility: setting `HTSIM_LINK_LOAD_SAMPLE=1` writes `link_info.csv` and `link_load_1ms.csv` under the run's `output_metrics/` directory.
 
 To generate custom Dragonfly topology assets (`dragonfly.topo`, `dragonfly.adjlist`, `host_table/`) for any `(p,a,h)`, use:
 

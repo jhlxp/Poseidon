@@ -8,7 +8,6 @@
 #include <sstream>
 #include <unordered_map>
 #include "circular_buffer.h"
-#include "data_collector.h"
 #include "uec_logger.h"
 #include "pciemodel.h"
 
@@ -54,47 +53,6 @@ void tokenize(const std::string& str, char delim, std::vector<std::string>& out)
     while (std::getline(ss, s, delim)) {
         out.push_back(s);
     }
-}
-
-void writeCsvRow(std::ostream& out, const std::vector<std::string>& row) {
-    for (size_t i = 0; i < row.size(); i++) {
-        out << row[i];
-        if (i + 1 < row.size()) {
-            out << ",";
-        }
-    }
-    out << std::endl;
-}
-
-void appendLiveFlowInfo(const std::vector<std::string>& columns, const std::vector<std::string>& row) {
-    static bool initialized = false;
-    static std::ofstream live_file;
-
-    if (!initialized) {
-        int ret = system("mkdir -p output_metrics");
-        if (ret != 0) {
-            std::cerr << "Failed to create output_metrics for live flow info" << std::endl;
-            initialized = true;
-            return;
-        }
-
-        live_file.open("output_metrics/flowsInfo_live.txt", std::ios::out | std::ios::trunc);
-        if (!live_file.is_open()) {
-            std::cerr << "Failed to open output_metrics/flowsInfo_live.txt" << std::endl;
-            initialized = true;
-            return;
-        }
-        writeCsvRow(live_file, columns);
-        live_file.flush();
-        initialized = true;
-    }
-
-    if (!live_file.is_open()) {
-        return;
-    }
-
-    writeCsvRow(live_file, row);
-    live_file.flush();
 }
 
 void printFastestFlowProgress(uint8_t pct, simtime_picosec now, flowid_t flow_id, mem_b bytes, mem_b flow_size) {
@@ -1023,39 +981,6 @@ void UecSrc::logProgressFromAck() {
     }
 }
 
-void UecSrc::logFlowCompletionMetric() {
-    htsim::DataCollector& data_collector = htsim::DataCollector::get_instance();
-    std::vector<std::string> columns = {
-        "srcNode_dstNode_flowId", "flowSizeBytes", "startTimeNs", "endTimeNs",
-        "fctNs", "baseRttNs", "targetRttNs", "rtoNs", "bdpBytes",
-        "maxCwndBytes", "oooCount", "oooAvgDistance", "oooMaxDistance",
-        "totalPackets"};
-    htsim::CsvMetric* flow_metric = data_collector.RegisterCsvMetric(
-        "flowsInfo", columns);
-
-    simtime_picosec now = eventlist().now();
-    const uint64_t total_packets = _mss ? (_flow_size + _mss - 1) / _mss : 0;
-    std::vector<std::string> row = {
-        std::to_string(_srcaddr) + "_" + std::to_string(_dstaddr) + "_" +
-            std::to_string(flowId()),
-        std::to_string(_flow_size),
-        std::to_string(timeAsNs(_flow_start_time)),
-        std::to_string(timeAsNs(now)),
-        std::to_string(timeAsNs(now - _flow_start_time)),
-        std::to_string(timeAsNs(_base_rtt)),
-        std::to_string(timeAsNs(_target_Qdelay)),
-        std::to_string(timeAsNs(_min_rto)),
-        std::to_string(_bdp),
-        std::to_string(_maxwnd),
-        std::to_string(_sink ? _sink->oooCount() : 0),
-        std::to_string(_sink ? _sink->oooAvgDistance() : 0.0),
-        std::to_string(_sink ? _sink->oooMaxDistance() : 0),
-        std::to_string(total_packets),
-    };
-    flow_metric->LogData(row);
-    appendLiveFlowInfo(columns, row);
-}
-
 void UecSrc::notifyCompletion() {
     std::function<void()> callback = std::move(_completion_callback);
     if (callback) {
@@ -1091,7 +1016,6 @@ bool UecSrc::checkFinished(UecDataPacket::seq_t cum_ack) {
                         << " nack_dec -" << _nscc_overall_stats.dec_nack_bytes 
                         << endl;
                 }
-                logFlowCompletionMetric();
                 cancelRTO();
                 _done_sending = true;
                 notifyCompletion();
@@ -1126,7 +1050,6 @@ bool UecSrc::checkFinished(UecDataPacket::seq_t cum_ack) {
                         << " nack_dec -" << _nscc_overall_stats.dec_nack_bytes 
                         << endl;
                 }
-                logFlowCompletionMetric();
                 _speculating = false;
                 if (_end_trigger) {
                     _end_trigger->activate();

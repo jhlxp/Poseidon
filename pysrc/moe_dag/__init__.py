@@ -6,6 +6,13 @@ from .cost import (
 )
 from .emitter import EmissionResult, emit_workload
 from .graph import Task, TaskGraph
+from .gate import (
+    BalancedPermutedGateProvider,
+    GateProvider,
+    GateSample,
+    make_gate_sample,
+)
+from .load_profile import ExpertInstance, build_expert_load_profile
 from .schema import (
     ModelSpec,
     MoEInvocation,
@@ -29,6 +36,12 @@ __all__ = [
     "RoutingAssignment",
     "Task",
     "TaskGraph",
+    "BalancedPermutedGateProvider",
+    "GateProvider",
+    "GateSample",
+    "make_gate_sample",
+    "ExpertInstance",
+    "build_expert_load_profile",
     "ValidationError",
     "dtype_bytes",
     "emit_workload",

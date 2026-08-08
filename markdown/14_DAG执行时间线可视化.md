@@ -151,6 +151,45 @@ Chrome 和 Firefox 可直接离线打开。
 Inspector 中按需恢复；文件大小以当次 ZIP 和 task 数为准，不在文档中固化旧的
 局部-rank 样本值。
 
+### 4.2 Gate / expert load before-after 模块
+
+`visualization/gate_load_profile.py` 是独立于时间线的第二个 HTML 模块。它参考
+[UltraEP profiler/viewer](https://dots-infra.github.io/UltraEP/zh/#4-效果可视化追踪每个-microbatch-的均衡收益)
+的层次化观察方法：先看所有 rank 的总体不均衡，再下钻到
+指定 layer、microbatch 和 expert instance。UltraEP 采集运行时 reroute 前后的
+真实负载；本项目直接读取 workload `manifest.json` 中生成器已经确定的：
+
+```text
+micro_batch_algorithms[*].gate
+micro_batch_algorithms[*].expert_load_profile.before
+micro_batch_algorithms[*].expert_load_profile.after
+```
+
+两种状态的准确含义是：
+
+| 状态 | 含义 |
+|---|---|
+| `before` | Gate logical assignments 按原始 expert placement 聚合 |
+| `after` | 算法把相同 logical assignments 分给实际 physical instance/execution rank 后聚合 |
+
+页面的 before/after rank 图强制使用相同 load 横轴，不能分别 autoscale 后制造
+“看起来一样均衡”的错觉。rank bar 内按 logical expert 分段，hover 可查看 instance、
+expert、rank 和 load；下方另画不受副本放置影响的 Gate logical-expert 分布，并提供
+可按 before/after 和 rank 筛选的实例明细。
+
+输出为：
+
+```text
+<output-dir>/
+├── gate_load_profile.html
+├── gate_load_profile.csv
+└── gate_load_profile_summary.json
+```
+
+它不是 HTSim 时间结果，也不表示真实 GPU kernel profiler。load 单位是 logical
+token route 数；页面负责回答“Gate 有多偏、算法把执行负载搬到哪里”，DAG timeline
+负责回答“任务实际何时开始/结束”，链路图负责回答“物理网络何时有多少流量”。
+
 ## 5. 使用方法
 
 ```bash
@@ -193,10 +232,14 @@ python3 tests/run_dsv3_2layer_algorithms.py
 python3 tests/run_dsv3_2layer_algorithms.py --full --workers 4
 ```
 
-标准入口在打包阶段临时生成 `dsv3_algorithm_comparison.html`：NCCL、DeepEP、
-EPLB 和 MoonEP 各有一个可折叠区域，页头支持全部展开/收起。每个区域
-包含该算法独立可缩放 timeline、makespan/task/bytes/overlap 摘要，以及同次
-HTSim run 的可折叠 MpRail 链路负载图。四个 timeline 都固定包含 GPU 0-31；
+标准入口先为每个算法临时生成独立的 `algorithm_dashboard.html`。单算法页面完整
+包含可折叠 Gate/expert before-after、独立可缩放 timeline、MpRail 链路负载图、
+makespan/task/bytes/overlap 摘要和相关 CSV 下载。直接打开任一算法页面，不需要
+再回到四算法总览才能查看该算法的完整信息。
+
+根目录再生成 `dsv3_algorithm_comparison.html`：NCCL、DeepEP、EPLB 和 MoonEP
+各有一个可折叠区域，页头支持全部展开/收起；每个区域嵌入对应的完整算法
+dashboard，并提供单独打开链接。四个 timeline 都固定包含 GPU 0-31；
 `selected_ranks` 和 overlap 汇总也必须覆盖全部 32 rank。
 
 合并页通过相对路径引用各算法的 HTML、PNG 和 CSV，不把大文件重复内联到
@@ -204,16 +247,20 @@ HTSim run 的可折叠 MpRail 链路负载图。四个 timeline 都固定包含 
 
 ```text
 dsv3_algorithm_comparison.html
+algorithms/<algorithm>/algorithm_dashboard.html
+algorithms/<algorithm>/gate_load/*
 algorithms/<algorithm>/timeline/*
 algorithms/<algorithm>/link_load/*
 ```
 
 ZIP 不包含 workload、HTSim log、`htsim.dat` 或原始 `output_metrics`。ZIP 写入并
-校验成功后，runner 立即删除服务器 run 目录中的总览 HTML 和四个 timeline
-HTML；CSV、JSON、PNG、workload 和仿真日志仍按原样保留。因此标准 run 成功后
+校验成功后，runner 立即删除服务器 run 目录中的总览 HTML、四个算法 dashboard、
+四个 Gate HTML 和四个 timeline HTML；CSV、JSON、PNG、workload 和仿真日志仍
+按原样保留。因此标准 run 成功后
 服务器目录中应有 `0` 个散装 HTML。
 
-下载 ZIP 后解压，打开根目录的 `dsv3_algorithm_comparison.html` 即可离线查看。
+下载 ZIP 后解压：打开根目录的 `dsv3_algorithm_comparison.html` 查看四算法总览；
+打开 `algorithms/<algorithm>/algorithm_dashboard.html` 只查看一个算法的完整信息。
 
 ## 6. 应当观察什么
 
@@ -226,6 +273,8 @@ HTML；CSV、JSON、PNG、workload 和仿真日志仍按原样保留。因此标
 5. Dispatch/Combine 的字节是否符合算法去冗余规则；
 6. network task 的 FCT 是否存在明显长尾；
 7. 再结合链路负载图定位 endpoint、rail 或 spine 瓶颈。
+8. 对 EPLB/MoonEP 比较 Gate before 与 execution after 的 rank `max/mean`，并确认
+   total routes 和 logical-expert histogram 没有改变。
 
 只有 DAG timeline 和物理链路 timeline 使用相同 HTSim run、相同时间轴时，才能把
 模型 phase 与网络拥塞对应起来。
@@ -248,6 +297,7 @@ HTML；CSV、JSON、PNG、workload 和仿真日志仍按原样保留。因此标
 
 ```bash
 python3 tests/run_dag_timeline_visualization.py
+python3 tests/run_gate_workload_visualization.py
 ```
 
 固定合成 case 包含两个 GPU、三个 compute task 和一个 2-8us network task，验证：
@@ -264,3 +314,8 @@ python3 tests/run_dag_timeline_visualization.py
   可解压 ZIP。
 - EP32 smoke/full 的四个 timeline summary 均报告 `selected_ranks=0..31`，ZIP 内
   页面可恢复 GPU 00 到 GPU 31，服务器 run 目录不保留散装 HTML。
+- Gate 测试验证 raw `32 x 58 x 9` physical receive 数据向 256 logical experts
+  折叠守恒、五种 provider 可复现、before/after 逻辑路由守恒，以及 HTML/CSV/JSON
+  三种产物完整生成。
+- 四算法 runner 验证四份 manifest 的 Gate assignment digest 序列完全相同；ZIP
+  同时包含四个完整算法 dashboard、各算法 Gate/timeline HTML 和一个总 dashboard。

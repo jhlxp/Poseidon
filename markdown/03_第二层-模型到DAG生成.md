@@ -245,9 +245,10 @@ total ~= 6 * H * H_ff
 attention 仍需按 prefill/decode 和实际 shape 计算 FLOP 数，但同样统一除以 `989e12`，不单独建模 KV cache 或内存瓶颈。
 
 指定 `--compute-config` 后，生成器改为读取模块级 JSON。每个模块包含
-`theoretical_us` 和 `profiled_us`，`selected_source` 决定哪一个直接成为
-`compute_us`。JSON 模式仍记录理论 `operation_flops`，但不再用它换算时间，也不按
-overlap SM 比例二次缩放。完整格式、模块名和失败规则见
+`theoretical_us_per_token` 和 `profiled_us_per_token`，`selected_source` 决定
+单 token 单价，再与当前 task 的 `token_count` 相乘得到 `compute_us`。JSON 模式
+仍记录理论 `operation_flops`，但不再用它换算时间，也不按 overlap SM 比例二次
+缩放。不同 rank 的 expert route 数不同，FFN 时间也必须不同。完整格式、模块名和失败规则见
 [15_计算时间JSON配置.md](15_计算时间JSON配置.md)。
 
 ### 6.3 与网络的边界

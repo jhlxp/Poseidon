@@ -119,6 +119,7 @@ class MoEInvocation:
     def _validate_assignments(self) -> None:
         seen: set[tuple[int, int, int]] = set()
         slots_by_token: dict[tuple[int, int], set[int]] = {}
+        experts_by_token: dict[tuple[int, int], set[int]] = {}
         for assignment in self.assignments:
             self.placement.validate_rank(assignment.src_rank)
             token_count = self.tokens_per_source_rank[assignment.src_rank]
@@ -139,6 +140,13 @@ class MoEInvocation:
                 raise ValidationError(f"duplicate routing assignment: {key}")
             seen.add(key)
             slots_by_token.setdefault(key[:2], set()).add(assignment.topk_slot)
+            experts = experts_by_token.setdefault(key[:2], set())
+            if assignment.expert_id in experts:
+                raise ValidationError(
+                    f"token {key[:2]} selected logical expert "
+                    f"{assignment.expert_id} more than once"
+                )
+            experts.add(assignment.expert_id)
 
         expected_tokens = {
             (rank, token_id)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from ..algorithms import (
@@ -15,8 +15,9 @@ from ..algorithms import (
     NCCLConfig,
 )
 from ..cost import ComputeCostModel, H100CostModel
+from ..gate import BalancedPermutedGateProvider, GateProvider
 from ..graph import TaskGraph
-from ..schema import ModelSpec, MoEInvocation, Placement, ValidationError, make_uniform_assignments
+from ..schema import ModelSpec, MoEInvocation, Placement, ValidationError
 from .streams import apply_double_buffered_two_stream_schedule
 
 
@@ -36,6 +37,9 @@ class TransformerWorkloadConfig:
     eplb_num_groups: int = 0
     eplb_estimated_loads: tuple[float, ...] | None = None
     eplb_load_source: str = "current_invocation_proxy"
+    gate_provider: GateProvider = field(
+        default_factory=BalancedPermutedGateProvider
+    )
     dispatch_dtype: str = "fp8"
     combine_dtype: str = "bf16"
     weight_dtype: str = "bf16"
@@ -148,6 +152,7 @@ def build_transformer_workload(
                         _attention_flops(config.tokens_per_rank, config.model),
                         operation="attention",
                         overlaps_communication=micro_batch % 2 == 1,
+                        token_count=config.tokens_per_rank,
                     ),
                     predecessors=set(previous_rank_terminals.get(rank, ())),
                     metadata={
@@ -169,6 +174,7 @@ def build_transformer_workload(
                         _router_flops(config.tokens_per_rank, config.model),
                         operation="router_projection",
                         overlaps_communication=micro_batch % 2 == 1,
+                        token_count=config.tokens_per_rank,
                     ),
                     predecessors={attention_keys[rank]},
                     metadata={
@@ -180,6 +186,13 @@ def build_transformer_workload(
                 )
                 router_keys.add(key)
 
+            gate_sample = config.gate_provider.sample(
+                layer_id=layer,
+                microbatch_id=micro_batch,
+                tokens_per_source_rank=tokens,
+                placement=config.placement,
+                topk=config.model.topk,
+            )
             invocation = MoEInvocation(
                 invocation_id=f"{scope}.moe",
                 placement=config.placement,
@@ -190,11 +203,7 @@ def build_transformer_workload(
                 dispatch_dtype=config.dispatch_dtype,
                 combine_dtype=config.combine_dtype,
                 weight_dtype=config.weight_dtype,
-                assignments=make_uniform_assignments(
-                    tokens,
-                    config.model.topk,
-                    config.model.num_experts,
-                ),
+                assignments=gate_sample.assignments,
             )
             algorithm_result = algorithm_builder.build(
                 graph, invocation, entry_keys=router_keys
@@ -207,6 +216,7 @@ def build_transformer_workload(
                 {
                     "micro_batch": micro_batch,
                     "layer": layer,
+                    "gate": gate_sample.metadata,
                     **algorithm_result.metadata,
                 }
             )
@@ -267,8 +277,12 @@ def build_transformer_workload(
             "weight": config.weight_dtype,
         },
         "routing_provider": {
-            "name": "balanced_permuted_deterministic",
-            "random_seed": 0,
+            "name": algorithm_metadata[0]["gate"]["name"],
+            "random_seed": algorithm_metadata[0]["gate"]["seed"],
+            "routing_fidelity": algorithm_metadata[0]["gate"][
+                "routing_fidelity"
+            ],
+            "parameters": algorithm_metadata[0]["gate"]["parameters"],
         },
         "compute_cost": cost.manifest(),
         "stream_schedule": stream_schedule.manifest(),

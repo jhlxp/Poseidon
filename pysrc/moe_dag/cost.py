@@ -17,6 +17,9 @@ class ComputeEstimate:
     available_sms: int
     peak_flops_per_second: float
     source: str
+    token_count: int | None = None
+    us_per_token: float | None = None
+    token_kind: str | None = None
 
 
 class ComputeCostModel(Protocol):
@@ -28,6 +31,7 @@ class ComputeCostModel(Protocol):
         *,
         operation: str,
         overlaps_communication: bool = False,
+        token_count: int | None = None,
     ) -> ComputeEstimate: ...
 
     def manifest(self) -> dict[str, object]: ...
@@ -65,9 +69,12 @@ class H100CostModel:
         *,
         operation: str = "unspecified",
         overlaps_communication: bool = False,
+        token_count: int | None = None,
     ) -> ComputeEstimate:
         if operation_flops <= 0:
             raise ValidationError("operation_flops must be positive")
+        if token_count is not None and token_count <= 0:
+            raise ValidationError("compute token_count must be positive")
         available_sms = self.overlap_sms if overlaps_communication else self.total_sms
         peak = (
             self.overlap_peak_flops_per_second
@@ -84,6 +91,12 @@ class H100CostModel:
                 "h100_sxm_fixed_comm_sm_partition"
                 if overlaps_communication
                 else "h100_sxm_bf16_dense_peak"
+            ),
+            token_count=token_count,
+            us_per_token=(
+                operation_flops / peak * 1e6 / token_count
+                if token_count is not None
+                else None
             ),
         )
 
@@ -104,8 +117,9 @@ class H100CostModel:
 
 @dataclass(frozen=True)
 class ModuleComputeTime:
-    theoretical_us: float | None
-    profiled_us: float | None
+    token_kind: str
+    theoretical_us_per_token: float | None
+    profiled_us_per_token: float | None
 
 
 @dataclass(frozen=True)
@@ -136,10 +150,17 @@ class JsonComputeCostModel:
             ) from exc
         if not isinstance(payload, dict):
             raise ValidationError("compute config root must be an object")
-        if payload.get("schema_version") != 1:
-            raise ValidationError("compute config schema_version must be 1")
+        if payload.get("schema_version") != 2:
+            raise ValidationError("compute config schema_version must be 2")
         if payload.get("time_unit") != "us":
             raise ValidationError("compute config time_unit must be us")
+        if (
+            payload.get("scaling")
+            != "duration_us = token_count * selected_us_per_token"
+        ):
+            raise ValidationError(
+                "compute config scaling must define per-token multiplication"
+            )
 
         hardware = payload.get("hardware")
         profile_scope = payload.get("profile_scope")
@@ -183,13 +204,26 @@ class JsonComputeCostModel:
                 raise ValidationError(
                     f"compute module {operation} must be an object"
                 )
+            token_kind = values.get("token_kind")
+            if not isinstance(token_kind, str) or not token_kind:
+                raise ValidationError(
+                    f"compute module {operation}.token_kind must be a non-empty string"
+                )
             theoretical = cls._optional_positive_time(
-                values.get("theoretical_us"), operation, "theoretical_us"
+                values.get("theoretical_us_per_token"),
+                operation,
+                "theoretical_us_per_token",
             )
             profiled = cls._optional_positive_time(
-                values.get("profiled_us"), operation, "profiled_us"
+                values.get("profiled_us_per_token"),
+                operation,
+                "profiled_us_per_token",
             )
-            modules[operation] = ModuleComputeTime(theoretical, profiled)
+            modules[operation] = ModuleComputeTime(
+                token_kind,
+                theoretical,
+                profiled,
+            )
         return cls(
             config_path=config_path,
             hardware=hardware,
@@ -227,24 +261,31 @@ class JsonComputeCostModel:
         *,
         operation: str,
         overlaps_communication: bool = False,
+        token_count: int | None = None,
     ) -> ComputeEstimate:
         if operation_flops <= 0:
             raise ValidationError("operation_flops must be positive")
+        if token_count is None or token_count <= 0:
+            raise ValidationError(
+                f"compute module {operation} requires a positive token_count"
+            )
         try:
             module = self.modules[operation]
         except KeyError as exc:
             raise ValidationError(
                 f"compute config has no module named {operation!r}"
             ) from exc
-        duration_us = (
-            module.theoretical_us
+        us_per_token = (
+            module.theoretical_us_per_token
             if self.selected_source == "theoretical"
-            else module.profiled_us
+            else module.profiled_us_per_token
         )
-        if duration_us is None:
+        selected_field = f"{self.selected_source}_us_per_token"
+        if us_per_token is None:
             raise ValidationError(
-                f"compute module {operation}.{self.selected_source}_us is null"
+                f"compute module {operation}.{selected_field} is null"
             )
+        duration_us = token_count * us_per_token
         available_sms = self.overlap_sms if overlaps_communication else self.total_sms
         effective_peak = operation_flops / duration_us * 1e6
         return ComputeEstimate(
@@ -256,23 +297,30 @@ class JsonComputeCostModel:
             source=(
                 f"json_{self.selected_source}:{self.hardware}:{operation}"
             ),
+            token_count=token_count,
+            us_per_token=us_per_token,
+            token_kind=module.token_kind,
         )
 
     def manifest(self) -> dict[str, object]:
         return {
-            "model": "json_fixed_module_duration_v1",
+            "model": "json_linear_per_token_v2",
             "config_path": str(self.config_path),
             "hardware": self.hardware,
             "profile_scope": self.profile_scope,
             "selected_source": self.selected_source,
             "time_unit": "us",
+            "scaling": "duration_us = token_count * selected_us_per_token",
             "total_sms": self.total_sms,
             "communication_sms": self.communication_sms,
             "overlap_sms": self.overlap_sms,
             "modules": {
                 operation: {
-                    "theoretical_us": values.theoretical_us,
-                    "profiled_us": values.profiled_us,
+                    "token_kind": values.token_kind,
+                    "theoretical_us_per_token": (
+                        values.theoretical_us_per_token
+                    ),
+                    "profiled_us_per_token": values.profiled_us_per_token,
                 }
                 for operation, values in sorted(self.modules.items())
             },

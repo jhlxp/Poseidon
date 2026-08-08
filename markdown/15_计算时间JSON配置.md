@@ -1,127 +1,128 @@
 # 计算时间 JSON 配置
 
-## 1. 目标
+## 1. 核心语义
 
-计算时间与 DAG 结构、MoE 算法和 HTSim 网络仿真解耦。每个 compute 模块在 JSON
-中同时保存一个理论时间和一个 profiling 时间，再通过 `selected_source` 二选一：
-
-```text
-theoretical -> 使用 theoretical_us
-profiled    -> 使用 profiled_us
-```
-
-选中的数值直接成为 `.dag` 的固定 `compute_us`。HTSim 不读取 JSON，也不在运行时
-重新计算 FLOP；JSON 由 Python workload generator 读取并降低到 DAG。
-
-## 2. 目录和命名
-
-配置统一放在：
+计算 JSON 保存的是每个 operation 处理一个对应 token 的时间，不再保存某个
+balanced workload 的固定模块总时间：
 
 ```text
-pysrc/compute_profiles/
+compute_us = task_token_count * selected_us_per_token
 ```
 
-当前配置：
+`selected_source` 仍然在理论值和 profiling 值之间二选一：
 
 ```text
-H100_DSV3_EP32_compute_4096tpr.json
+theoretical -> theoretical_us_per_token
+profiled    -> profiled_us_per_token
 ```
 
-该文件对应标准 `4096 tokens/rank/microbatch`。文件名必须携带 token-per-rank
-scope，禁止再使用无法判断 shape 的
-`H100_DSV3_EP32_compute.json`。
+这样同一个 layer 内不同 rank 收到不同数量的 expert tokens 时，`expert_ffn`
+时间会自然不同。HTSim 不读取 JSON；Python generator 在生成 DAG 时完成乘法并把
+结果写入 `compute_us`。
 
-文件名应同时体现硬件和必要的 workload scope。以后 H20 profiling 可以新增：
+## 2. 配置文件
+
+当前标准文件：
 
 ```text
-H20_compute.json
-H20_DSV3_EP32_compute.json
+pysrc/compute_profiles/H100_DSV3_EP32_compute_4096tpr.json
 ```
 
-不要修改 Python 代码来切换硬件时间，只新增或修改 JSON。
+文件名中的 `4096tpr` 表示它服务于标准 DSV3 4096 tokens/rank 实验，并不表示
+JSON 内保存 4096 tokens 的固定总时间。Attention 的单 token 时间仍与固定的
+sequence length、hidden shape 和 kernel 定义有关，因此配置不是跨模型通用常数。
 
-## 3. JSON 格式
-
-当前文件结构为：
+## 3. Schema v2
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "hardware": "H100_SXM",
-  "profile_scope": "DSV3 4-algorithm comparison baseline; EP32; tokens_per_rank=4096",
   "selected_source": "theoretical",
   "time_unit": "us",
+  "scaling": "duration_us = token_count * selected_us_per_token",
   "total_sms": 132,
   "communication_sms": 20,
   "modules": {
-    "attention": {
-      "theoretical_us": 2188.73965337108,
-      "profiled_us": null
-    },
     "expert_ffn": {
-      "theoretical_us": 3439.44802672599,
-      "profiled_us": null
+      "token_kind": "routed_expert_token",
+      "theoretical_us_per_token": 0.10496362386248749,
+      "profiled_us_per_token": null
     }
   }
 }
 ```
 
-字段语义：
-
 | 字段 | 语义 |
 |---|---|
-| `schema_version` | 当前固定为 `1` |
+| `schema_version` | 当前必须为 `2`；旧的固定总时间 schema v1 不再接受 |
 | `hardware` | GPU/加速器名称，写入 manifest |
-| `profile_scope` | 该组固定时间适用的 shape、batch、算法和并行范围 |
+| `profile_scope` | hidden、sequence、top-k 等适用 shape |
 | `selected_source` | `theoretical` 或 `profiled` |
 | `time_unit` | 固定为 `us` |
-| `total_sms` | 该硬件总 SM，用于 task metadata |
-| `communication_sms` | overlap task 的静态通信 SM 预留 |
-| `modules` | operation 名到两种固定时间的映射 |
+| `total_sms` | GPU 总 SM |
+| `communication_sms` | overlap 时静态预留给通信的 SM |
+| `token_kind` | 当前 operation 的乘数具体代表哪种 token |
+| `*_us_per_token` | 每个对应 token 的理论或 profiling 时间 |
 
-JSON 不允许注释。说明信息写进 `profile_scope` 或本 Markdown，不在 JSON 中加入
-非标准注释语法。
+所有实际执行到的模块都必须存在。选中字段为 `null`、零、负数或非数字时立即
+失败，不允许在 theoretical/profiled 之间静默回退。
 
-## 4. 模块名称
+## 4. 各模块 token 口径
 
-当前 generator 可能产生以下 compute operation：
+| operation | `token_kind` | task 使用的 `token_count` |
+|---|---|---:|
+| `attention` | `source_token` | 当前 rank 的输入 tokens |
+| `router_projection` | `source_token` | 当前 rank 的输入 tokens |
+| `expert_ffn` | `routed_expert_token` | 当前 execution rank 的 expert routes；MoonEP 使用 padding 后 routes |
+| `combine_reduce` | `source_token_with_topk8` | 当前 source rank 的输入 tokens |
+| `combine_final_reduce` | `source_token_with_topk8` | 当前 source rank 的输入 tokens |
+| `per_server_planning_proxy` | `server_routed_expert_token` | 当前 server 内需要规划的 expert routes |
 
-| 模块 | 含义 |
-|---|---|
-| `attention` | 当前 coarse Attention 占位 |
-| `router_projection` | router/gate projection |
-| `expert_ffn` | routed expert FFN |
-| `combine_reduce` | NCCL/EPLB/MoonEP combine reduce |
-| `combine_final_reduce` | DeepEP combine final reduce |
-| `per_server_planning_proxy` | MoonEP server-local planning 占位 |
+`expert_ffn` 的一个 routed expert token 是一条 token-to-expert route。DSV3
+`topk=8` 时，一个 source token 会产生 8 个 routed expert tokens。NCCL 和 DeepEP
+按原始 expert placement 聚合；EPLB 按 physical expert placement 聚合；MoonEP
+按实时 execution rank 聚合并加入 kernel padding。
 
-配置可以包含当前 workload 没有使用的模块。实际生成过程中一旦遇到缺失模块，立即
-报错，不允许回退到另一个模块或 H100 默认公式。
+例如理论 FFN 单价为：
 
-## 5. 理论与 profiling 二选一
-
-初始阶段使用：
-
-```json
-"selected_source": "theoretical"
+```text
+0.10496362386248749 us / routed expert token
 ```
 
-完成 profiling 后，为所有会执行的模块填入正数：
+则：
 
-```json
-"profiled_us": 7.5
+```text
+32768 routes -> 3439.448 us
+100817 routes -> 10582.118 us
 ```
 
-然后切换：
+这正是热点专家导致计算 straggler 的建模入口。
+
+## 5. 理论值来源
+
+当前 H100 理论单价由对应 operation 的 FLOP 公式除以 H100 BF16 dense 理论峰值，
+再除以该 operation 的 token 数得到。它是线性理论占位，不模拟小 GEMM 效率、
+grouped GEMM shape、HBM、launch overhead 或真实 occupancy。
+
+JSON 模式沿用当前静态 SM 约定：task metadata 会记录 132 总 SM 和通信预留 20 SM；
+单 token 单价本身不因是否 overlap 再做隐式缩放。需要区分 overlap/non-overlap 的
+实测效率时，应定义明确的 profile，而不是在读取器里隐藏乘数。
+
+## 6. Profiling 值
+
+profiling 完成后，把同一 operation 的实测时间除以本次测量采用的准确
+`token_count`，得到：
 
 ```json
-"selected_source": "profiled"
+"profiled_us_per_token": 0.0875
 ```
 
-选中的字段如果是 `null`、零、负数或非数字，workload 生成立即失败。系统不会从
-`profiled_us` 静默退回 `theoretical_us`，否则同一实验可能混合两种计算口径。
+然后将 `selected_source` 改为 `profiled`。这个线性化值只适用于对应
+`profile_scope`。真实 grouped GEMM 通常不是严格线性；如果需要更高精度，应另外
+开发按 token bucket/shape 查表，而不是把某个总时间伪装成通用 per-token 值。
 
-CLI 也可以临时覆盖 JSON 内的选择：
+CLI 可覆盖 JSON 内的选择：
 
 ```bash
 python3 pysrc/generate_moe_dag.py \
@@ -130,53 +131,41 @@ python3 pysrc/generate_moe_dag.py \
   --compute-time-source theoretical
 ```
 
-`--compute-time-source` 必须与 `--compute-config` 同时使用。
+## 7. Manifest 和 task 审计
 
-## 6. 固定时间的适用边界
-
-模块时间不是跨 shape 通用常数。例如 `expert_ffn` 会受到 token route 数、padding、
-expert placement 和算法影响。一个 balanced-permuted 基线的固定时间不能直接代表
-MoonEP/EPLB 改变 execution placement 后的负载 shape。
-
-因此每份 JSON 必须准确写 `profile_scope`。以下任一参数改变时，应重新确认或新建
-配置：
-
-- hidden、MoE hidden、sequence、token 数；
-- expert 数、top-k、padding；
-- dtype、kernel fusion、通信 overlap 条件；
-- GPU 型号、频率、软件版本；
-- 算法导致的 per-rank expert token shape。
-
-`H100_DSV3_EP32_compute_4096tpr.json` 服务于正常
-`4096 tokens/rank/microbatch` 的训练/prefill 四算法对比基线。当前固定
-`expert_ffn` 时间按 balanced-permuted routing 下每 rank 32768 routes 的平衡参考
-shape 计算；
-因此本轮比较主要隔离通信和 planning 差异，不声称已反映算法改变实际
-per-rank expert shape 后的 kernel 时间差异。
-
-JSON 模式仍保留每个 task 的理论 `operation_flops` 供审计，但实际
-`compute_us` 完全取所选 JSON 数字。需要比较不同 placement 的真实计算
-时间时，应用 profiling 值或为各 shape 建立独立 profile，不应误读该基线。
-
-同一模块的这个数字同时用于普通窗口和 communication-overlap 窗口，不再按可用
-SM 比例二次缩放；`available_sms` 仍按 JSON 的 `total_sms` 和
-`communication_sms` 写入 task metadata。如果两种窗口必须使用不同 profiling
-时间，应先把它们定义成两个明确的 operation，而不是在读取阶段隐式乘系数。
-
-## 7. Manifest 与复现
-
-生成后的 `manifest.json` 在 `metadata.compute_cost` 中记录：
+`manifest.json.metadata.compute_cost` 保存：
 
 ```text
-model
-config_path
-hardware
-profile_scope
-selected_source
-total_sms
-communication_sms
-modules
+model = json_linear_per_token_v2
+config_path / hardware / profile_scope / selected_source
+每个 module 的 token_kind 和两种 us_per_token
 ```
 
-因此一个实验必须同时保存 workload 生成物和使用的 JSON commit。只保存 `.dag`
-虽然可以重放 HTSim，但无法解释计算时间来自理论值还是 profiling 值。
+每个 compute task 的 `task_map.json.metadata` 还保存：
+
+```text
+compute_token_count
+compute_us_per_token
+compute_token_kind
+cost_source
+```
+
+因此可以直接核对：
+
+```text
+task.duration_us == compute_token_count * compute_us_per_token
+```
+
+必须同时保存 workload 生成物和使用的 JSON 版本。只保存 `.dag` 可以重放网络，
+但无法解释计算时间采用了什么 token 口径。
+
+## 8. 测试要求
+
+`tests/run_workload_generator.py` 必须验证：
+
+1. schema v1 固定总时间配置被拒绝；
+2. theoretical/profiled 二选一且不静默回退；
+3. `expert_ffn` token 数翻倍时 `compute_us` 翻倍；
+4. 不均匀 Gate 下各 rank 的 FFN 时间随真实 route 数变化；
+5. MoonEP 使用 padded routes，而不是未 padding 的 real routes；
+6. task metadata 中的 count、单价和最终时长乘法自洽。

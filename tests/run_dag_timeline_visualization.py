@@ -352,11 +352,21 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
     for algorithm in ("nccl", "deepep"):
         case_dir = run_dir / "comparison_inputs" / algorithm
         case_timeline = case_dir / "timeline"
+        case_gate = case_dir / "gate_load"
         case_link = case_dir / "link_load"
         case_timeline.mkdir(parents=True)
+        case_gate.mkdir()
         case_link.mkdir()
         for name in ("dag_gpu_timeline.html", "dag_timeline_summary.json"):
             shutil.copyfile(timeline_dir / name, case_timeline / name)
+        (case_gate / "gate_load_profile.html").write_text(
+            "<!doctype html><title>Gate load</title><p>before after</p>\n",
+            encoding="utf-8",
+        )
+        (case_gate / "gate_load_profile.csv").write_text(
+            "layer,micro_batch,state,rank,load\n0,0,before,0,1\n",
+            encoding="utf-8",
+        )
         (case_link / "mprail_link_load_by_layer.png").write_bytes(b"PNG")
         (case_link / "mprail_link_load_summary.csv").write_text(
             "panel,total_bytes\nall,1\n", encoding="utf-8"
@@ -389,8 +399,10 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
     html = output.read_text(encoding="utf-8")
     require(html.count('<details class="algorithm"') == 2,
             "算法没有分别使用可折叠分区")
-    require(html.count("mprail_link_load_by_layer.png") == 2,
-            "算法分区没有引用各自链路负载图")
+    require("mprail_link_load_by_layer.png" not in html,
+            "总览不应绕过单算法 dashboard 直接引用链路图")
+    require(html.count("algorithm_dashboard.html") == 4,
+            "总览没有为每个算法提供 dashboard 链接和 iframe")
     require("Expand all" in html and "Collapse all" in html,
             "总览缺少全局展开/收起按钮")
     require(zip_output.is_file(), "没有生成可视化 ZIP")
@@ -400,13 +412,27 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
     require("comparison.html" in members, "ZIP 缺少总览 HTML")
     require(
         "comparison_inputs/nccl/timeline/dag_gpu_timeline.html" in members
+        and "comparison_inputs/nccl/gate_load/gate_load_profile.html" in members
+        and "comparison_inputs/nccl/algorithm_dashboard.html" in members
         and "comparison_inputs/deepep/link_load/mprail_link_load_by_layer.png"
         in members,
-        "ZIP 缺少 timeline 或链路负载图",
+        "ZIP 缺少 Gate、timeline 或链路负载图",
     )
     require(not any("workload" in name or "simulation" in name for name in members),
             "ZIP 不应包含 workload 或 simulation 产物")
-    return "算法折叠总览正确；ZIP 只包含 timeline 和链路负载可视化"
+    nccl_dashboard = (
+        run_dir
+        / "comparison_inputs"
+        / "nccl"
+        / "algorithm_dashboard.html"
+    ).read_text(encoding="utf-8")
+    require(
+        "gate_load_profile.html" in nccl_dashboard
+        and "dag_gpu_timeline.html" in nccl_dashboard
+        and "mprail_link_load_by_layer.png" in nccl_dashboard,
+        "单算法 dashboard 没有囊括 Gate、timeline 和链路负载",
+    )
+    return "单算法完整 dashboard 和四算法总 dashboard 均正确打包"
 
 
 class Suite:
