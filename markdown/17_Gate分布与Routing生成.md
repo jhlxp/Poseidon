@@ -106,7 +106,7 @@ realized_server_loads
 ### 5.1 `balanced_permuted`：精确均衡基线
 
 对 expert ID 使用固定 seed 打乱，再按全局 token 序号循环分配 Top-K。
-它对应当前 `make_uniform_assignments()` 的语义：
+当前实现和唯一入口是 `BalancedPermutedGateProvider`。该 provider 的语义为：
 
 - 路由数在 logical experts 间严格均衡；
 - 输出确定，适合 smoke 和回归测试；
@@ -523,11 +523,12 @@ GateProvider -> GateSample
   -> 五算法 dsv3_visualization_bundle.zip
 ```
 
-五算法 runner 会检查每个算法的 assignment digest 序列完全相同，然后才允许
-生成合并 ZIP。Gate 分布错误时，应先检查 pure-Python 的采样与守恒报告，不应用
+静态 runner 会检查所选算法的 assignment digest 序列完全相同；有效五算法
+聚合还必须对动态 ProbeEP 做同样校验，然后才能生成合并 ZIP。Gate 分布错误时，
+应先检查 pure-Python 的采样与守恒报告，不应用
 网络结果反向猜测问题。偏斜 Gate 也可能超过 MoonEP 配置的临时副本容量；runner
-不会静默放宽算法约束，可通过 `--moonep-replicas-per-rank` 显式给出容量。当前
-raw layer 0/1 的 2-token smoke、seed 17 下，MoonEP 需要显式给足临时 replica 容量；
-相同 layer/seed 的 4096tpr MoonEP quota 曾使用 14 temporary replicas/rank。ProbeEP
+不会静默放宽算法约束，可通过 `--moonep-replicas-per-rank` 显式给出容量。默认值 2
+是真实容量约束；当实验明确假设显存足够时，当前 raw 4096tpr 完整对比显式使用
+`--moonep-replicas-per-rank 256` 作为非约束上限。ProbeEP
 采用不同口径：当前实验不建模显存容量和 replica-count admission，也不提供虚假 slot
 参数。是否接纳跨机 expert 只取决于逐 NIC 动态迁移字节预算。

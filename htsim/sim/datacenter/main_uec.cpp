@@ -1117,10 +1117,6 @@ int main(int argc, char **argv) {
                 FatTreeSwitch::set_strategy(FatTreeSwitch::ECMP_ADAPTIVE);
                 OxcSwitch::set_strategy(OxcSwitch::ECMP);
                 MpRailSwitch::set_strategy(MpRailSwitch::ECMP);
-                //the stuff below obsolete
-                //FatTreeSwitch::set_ar_fraction(atoi(argv[i+2]));
-                //cout << "AR fraction: " << atoi(argv[i+2]) << endl;
-                //i++;
             } else if (!strcmp(argv[i+1], "ecmp_rr")) {
                 // switch round robin
                 route_strategy = ECMP_FIB;

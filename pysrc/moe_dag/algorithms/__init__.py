@@ -2,7 +2,6 @@ from .common import (
     AlgorithmBuildResult,
     TokenPayload,
     TokenPayloadPolicy,
-    destination_forward_route,
     plan_token_payloads,
 )
 from .deepep import DeepEPBuilder, DeepEPConfig
@@ -47,7 +46,6 @@ __all__ = [
     "ProbeNICControllerConfig",
     "ProbeDispatchFeedback",
     "ProbeControllerUpdate",
-    "destination_forward_route",
     "plan_token_payloads",
     "plan_hierarchical_placement",
 ]

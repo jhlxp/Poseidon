@@ -169,18 +169,18 @@ footprint。只能使用 `remote_weight_rdma_bytes=sum(TX)=sum(RX)` 表示实际
 
 Gate 页的 `Per-NIC directed load` 是整次 invocation 的空间流量汇总，柱中包含
 `Dispatch + Combine + Expert Weight`；它不是 controller 的 migration budget，也不是
-`Weight+Dispatch` observation 的 `Bsample`。例如
-`run_20260809_225300_474846_probeep_2layer_dynamic_full` 最后一层 MB1：
+`Weight+Dispatch` observation 的 `Bsample`。Dashboard 必须分别标出：
 
 ```text
-Per-NIC directed total max（含 Combine） = 102.025 MiB
-controller Bsample（仅 Weight+Dispatch） = 90.05 MiB
-实际 Expert Weight endpoint max         = 44 MiB
-probe total max                         = 157.77 MiB
-下一 Expert Weight migration budget     = 79.16 MiB/NIC（均值）
+directed total       = Dispatch + Combine + Expert Weight 空间汇总
+Bsample and Nmax     = 实测 Weight+Dispatch 窗口的瓶颈 endpoint 字节和时间
+probe total          = alpha * (Cmax / Nmax) * Bsample
+theoretical total    = Cmax * 400 Gbps
+migration budget     = min(probe total, theoretical total) - token baseline
 ```
 
-这些数值回答不同问题，不能直接互相比较大小来判断功能是否正确。
+这些值回答不同问题，不能直接互相比较大小来判断功能是否正确，也不应
+在文档中固化已删除实验的数字。
 `probeep_combine_telemetry.json` 则保存 Combine active/compute/overlap 的 per-rank 数组；
 Dashboard 的 max 值只是摘要。Expert Weight 使用同一主色仅表示数据
 类别一致，判断 controller 是否减少跨机迁移必须查看 `remote_weight_rdma_bytes`，
@@ -326,22 +326,26 @@ python3 visualization/dag_timeline.py \
 缩放时 bar、背景、分割线和刻度使用同一 `px/us` 比例重算。因此同一
 水平距离对应的实际时间是明确的，不会只是把 SVG 图片放大。
 
-### 5.2 五算法合并页
+### 5.2 有效五算法聚合页
 
 ```bash
-python3 tests/run_dsv3_2layer_algorithms.py
-python3 tests/run_dsv3_2layer_algorithms.py --full --workers 4
+python3 tests/run_dsv3_2layer_algorithms.py \
+  --full --workers 4 --algorithms nccl,deepep,eplb,moonep
+python3 tests/run_probeep_2layer_ratio_full.py --full
 ```
 
-标准入口先为每个算法临时生成独立的 `algorithm_dashboard.html`。单算法页面完整
+第一个入口为四个静态算法生成独立的 `algorithm_dashboard.html`；第二个入口
+在单个持续 HTSim PID 中生成动态 ProbeEP dashboard。单算法页面完整
 包含可折叠 Gate/expert before-after、独立可缩放 timeline、MpRail 链路负载图、
 makespan/task/bytes/overlap 摘要和相关 CSV 下载。直接打开任一算法页面，不需要
 再回到五算法总览才能查看该算法的完整信息。
 
-根目录再生成 `dsv3_algorithm_comparison.html`：NCCL、DeepEP、EPLB、MoonEP 和
-ProbeEP 各有一个可折叠区域，页头支持全部展开/收起；每个区域嵌入对应的完整算法
-dashboard，并提供单独打开链接。五个 timeline 都固定包含 GPU 0-31；
+聚合步骤再生成 `dsv3_algorithm_comparison.html`：NCCL、DeepEP、EPLB、MoonEP 和
+动态 ProbeEP 各有一个可折叠区域，页头支持全部展开/收起；每个区域嵌入对应的
+完整算法 dashboard，并提供单独打开链接。五个 timeline 都固定包含 GPU 0-31；
 `selected_ranks` 和 overlap 汇总也必须覆盖全部 32 rank。
+通用静态 runner 的默认列表中虽然有静态 ProbeEP，但该页面只能用于结构回归，
+有效性能聚合必须替换为动态入口的页面。
 
 合并页通过相对路径引用各算法的 HTML、PNG 和 CSV，不把大文件重复内联到
 一个文件。同时生成 `dsv3_visualization_bundle.zip`，其内只包含：
@@ -355,8 +359,8 @@ algorithms/<algorithm>/link_load/*
 ```
 
 ZIP 不包含 workload、HTSim log、`htsim.dat` 或原始 `output_metrics`。ZIP 写入并
-校验成功后，runner 立即删除服务器 run 目录中的总览 HTML、五个算法 dashboard、
-五个 Gate HTML 和五个 timeline HTML；CSV、JSON、PNG、workload 和仿真日志仍
+校验成功后，打包流程删除服务器 run 目录中的总览 HTML，以及本次实际
+包含的每个算法 dashboard、Gate HTML 和 timeline HTML；CSV、JSON、PNG、workload 和仿真日志仍
 按原样保留。因此标准 run 成功后
 服务器目录中应有 `0` 个散装 HTML。
 
@@ -413,11 +417,12 @@ python3 tests/run_gate_workload_visualization.py
   逐 rank CSV 和总览 JSON 完整生成；
 - 两个伪算法 case 能合成可折叠总览页，并生成仅含 timeline 和链路图的
   可解压 ZIP。
-- EP32 smoke/full 的五个 timeline summary 均报告 `selected_ranks=0..31`，ZIP 内
+- 有效 EP32 smoke/full 聚合的五个 timeline summary 均报告 `selected_ranks=0..31`，ZIP 内
   页面可恢复 GPU 00 到 GPU 31，服务器 run 目录不保留散装 HTML。
 - Gate 测试验证 raw `32 x 58 x 9` physical receive 数据向 256 logical experts
   折叠守恒、五种 provider 可复现、before/after 逻辑路由守恒，以及 HTML/CSV/JSON
   三种产物完整生成；HTML 只按 MB 选择，首层 raw/末层 admitted 比较和末层
   migration/server-pair/per-NIC 数据绑定必须同时成立。
-- 五算法 runner 验证五份 manifest 的 Gate assignment digest 序列完全相同；ZIP
+- 静态 runner 先验证四份 manifest 的 Gate assignment digest，聚合时再验证动态
+  ProbeEP 的 digest 序列完全相同；ZIP
   同时包含五个完整算法 dashboard、各算法 Gate/timeline HTML 和一个总 dashboard。

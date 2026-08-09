@@ -8,7 +8,7 @@ MoE workload 生成器与 HTSim/MpRail 仿真器应当解耦。
 
 - 描述模型、并行布局、expert placement 和 router 输出；
 - 把 NCCL、DeepEP、EPLB、MoonEP、ProbeEP 等算法展开成计算与通信任务图；
-- 用 H100 SXM dense BF16 理论峰值把算子 FLOP 数换算成固定 `compute_us` 占位；
+- 用内置 H100 理论模型，或显式选择的 H100/H20 schema-v2 JSON，把算子降低成固定 `compute_us`；
 - 根据 tensor 形状、数据类型、去重、padding 和转发方案计算 `transfer_bytes`；
 - 最终输出 HTSim 可读取的 `.dag` 和空 `.cm`。
 
@@ -37,7 +37,7 @@ HTSim 负责：
   MoE invocation + expert placement + token routes + algorithm config
                             |
                             v
-  NCCL / DeepEP / EPLB / MoonEP 等算法专属 phase graph
+  NCCL / DeepEP / EPLB / MoonEP / ProbeEP 的 TaskGraph fragment
                             |
                             v
 共享 lowering
@@ -49,7 +49,9 @@ HTSim / MpRail
 
 第一层可以独立使用：给定一次 MoE invocation，直接生成仅包含 router、dispatch、expert、combine 的小型 workload。
 
-第二层复用第一层：构造 attention、norm、residual、MoE 等完整 block，再将多个 block、microbatch 或训练阶段拼接起来。
+第二层复用第一层：当前构造 Attention、Router、MoE 和 Reduce 组成的
+代表性 forward block，再将多个 layer 和 microbatch 拼接起来。Norm、Residual、
+完整 DSV3 kernel 和 backward 仍属于未实现边界。
 
 ## 3. 当前代码目录
 
@@ -63,7 +65,10 @@ pysrc/
 │   ├── schema.py
 │   ├── graph.py
 │   ├── cost.py
+│   ├── gate.py
+│   ├── load_profile.py
 │   ├── emitter.py
+│   ├── dynamic.py
 │   ├── algorithms/
 │   │   ├── common.py
 │   │   ├── nccl.py
@@ -73,9 +78,14 @@ pysrc/
 │   │   └── probeep.py
 │   └── models/
 │       ├── transformer.py
+│       ├── incremental.py
 │       └── streams.py
+workload/
+└── gate/
 tests/
-└── run_workload_generator.py
+├── run_workload_generator.py
+├── run_dynamic_dag_functional.py
+└── run_probeep_2layer_ratio_full.py
 ```
 
 `schema.py` 保存 placement、routing assignment 和 invocation；`graph.py` 是
@@ -105,7 +115,7 @@ python3 pysrc/generate_moe_dag.py \
 | 模型规格 | hidden、FFN hidden、head、layer、expert、top-k、激活和 dtype |
 | 并行与 placement | DP/TP/PP/EP、rank 到 server 的映射、expert 到 rank 的映射 |
 | token routing | 每个 source rank 的 token 选择了哪些 expert；来自 trace 或合成分布 |
-| 硬件 cost | 首版固定为 H100 SXM、dense BF16、`989 TFLOP/s/GPU` |
+| 硬件 cost | 内置 H100 smoke 理论模型，或显式 H100/H20 schema-v2 per-token JSON |
 
 算法配置是第一层的额外输入。本阶段代码接受：
 
@@ -123,7 +133,7 @@ rank，并复用 DeepEP 的两级去冗余和分层 transport。稳态 DAG 不�
 migration task；当前 CLI 可直接传负载快照，未传时使用第一次 invocation 的 route
 count 作为静态代理。
 
-DeepEP/MoonEP/ProbeEP backward、expanded metadata、zero-copy 和 kernel profiling 尚未
+DeepEP/MoonEP/ProbeEP backward、zero-copy 和真实 kernel profiling 尚未
 实现，CLI 不提供对应开关。DeepEP low-latency/decode 不属于当前项目范围。
 
 ### 4.2 输出
@@ -156,8 +166,8 @@ generated_workloads/<name>/
 不能让每个算法从头实现 token、expert、rank 和 byte 计算，否则同一模型在不同算法间不可比较。
 
 也不能定义一个固定的 `dispatch -> expert -> combine` 模板后只替换路由。NCCL
-保留全部 top-k payload 并直达 expert rank；MoonEP 还包含在线规划、动态冗余
-expert、权重预取和训练梯度归并，并复用 DeepEP scale-out transport；DeepEP 按
+保留全部 top-k payload 并直达 expert rank；MoonEP 包含 per-server planning proxy、
+动态冗余 expert 和权重预取，并复用 DeepEP scale-out transport；DeepEP 按
 destination rank 和 destination server 两级去重，通过同 index relay 显式完成
 RDMA、local fanout 和 local reduce。
 这些不是普通 all-to-all 的参数变化。
@@ -166,7 +176,7 @@ RDMA、local fanout 和 local reduce。
 
 ```text
 共享：MoE 数学语义、placement、routing trace、IR、cost 接口、去冗余策略接口、DAG emitter
-独立：每个算法的 planner、phase graph、去冗余开关/scope、复制规则、通信聚合规则
+独立：每个算法的 planner、TaskGraph fragment、去冗余开关/scope、复制规则、通信聚合规则
 ```
 
 ### 5.2 Task graph 直接映射到 barrier DAG
@@ -191,8 +201,8 @@ barrier(A) -> barrier(B)
 
 模型层为每张 GPU **固定**一条 compute stream 和一条 communication stream。这是
 当前项目的 workload 执行契约，不是算法参数，也不提供改变 stream 数量的配置。
-NCCL、DeepEP、EPLB 和 MoonEP 都复用该模型层契约；算法插件只负责各自的 MoE
-phase graph。
+NCCL、DeepEP、EPLB、MoonEP 和 ProbeEP 都复用该模型层契约；算法插件只负责向
+`TaskGraph` 追加各自的 MoE task fragment。
 
 stream 不是新的 `.dag` 字段，而是在生成阶段降低为普通 predecessor edges：
 
@@ -249,8 +259,8 @@ compute/communication overlap，不允许 compute/compute 或 communication/comm
 
 ### 5.4 Compute 在生成时降低为固定时长
 
-HTSim 中的 compute task 始终是固定 `compute_us`。生成器支持两种写入来源：默认
-H100 理论 FLOP 公式，或者模块级 JSON per-token 时间。JSON 同时保存
+HTSim 中的 compute task 始终是固定 `compute_us`。生成器支持两种写入来源：未传
+JSON 时使用内置 H100 理论 FLOP 公式，或者显式读取模块级 H100/H20 JSON per-token 时间。JSON 同时保存
 `theoretical_us_per_token` 和 `profiled_us_per_token`，通过 `selected_source`
 二选一，再乘当前 task 的实际 token 数，格式见
 [16_计算时间JSON配置.md](16_计算时间JSON配置.md)。
@@ -294,7 +304,7 @@ compute_us_overlap = operation_flops / 839.15e12 * 1e6
 | 同进程动态 DAG 追加 | ProbeEP 闭环使用 | `-dag_control`；HTSim 端整批校验后原子 append，observation 点不推进模拟时间 |
 | chunk 级流水转发 | 已支持表达 | 显式拆成多个 network task，每个 flow 完成后释放自己的 barrier |
 | 单 flow 内部流式事件 | 不支持且首版不需要 | 不监听第 N 个 packet；需要时拆 chunk flow |
-| GPU compute | 固定时长事件 | 默认 H100 理论公式，或 JSON theoretical/profiled 二选一 |
+| GPU compute | 固定时长事件 | 内置 H100 smoke 公式，或显式 H100/H20 JSON theoretical/profiled 二选一 |
 | 通信/计算 SM 竞争 | 静态近似 | 每 rank 的逻辑通信 phase 固定预留 20/132 SM |
 | HBM/NVLink memory contention | 未支持 | 不进入首版 compute 占位，报告中标注 |
 | multicast/one-to-many 原语 | 无专用原语 | DeepEP 用一个 fabric task 加多个 local fanout task 表达 |
@@ -332,5 +342,5 @@ MpRail 的 server-local FullMesh 也只是对 NVLink rank-to-rank 数据移动�
 统一算法验收使用 EP32、4 servers x 8 GPUs、plane=1、400 Gbps：NCCL 直达真实
 rank，DeepEP 使用 hierarchical scaleout/scaleup transport，EPLB 使用持久 hierarchical
 placement，MoonEP 在每个 expert home server 内独立创建 replica 并复用 DeepEP
-scale-out transport。四者共享相同 routing
-assignments、expert placement 和 dtype，保证字节、路径和计算分布可比较。
+scale-out transport，ProbeEP 使用单 HTSim 动态闭环。五者共享相同 routing
+assignment digest、expert placement 和 dtype；有效性能对比不得用静态 ProbeEP 代替动态反馈结果。

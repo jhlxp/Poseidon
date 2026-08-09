@@ -19,11 +19,7 @@ NCCL、DeepEP 或 MoonEP 实际需要哪些计算、复制、转发、归并和�
 ```text
 MoEInvocation
   invocation_id
-  mode: train_fwd | train_bwd | prefill | decode
-  ranks: [Rank]
-  rank_to_server: rank -> server
-  experts: E
-  expert_placement: expert -> home_rank
+  placement: num_ranks, gpus_per_server, expert_to_rank
   tokens_per_source_rank: S_r
   hidden: H
   ffn_hidden: H_ff
@@ -41,10 +37,10 @@ MoEInvocation
 
 ### 3.1 Task
 
-生成器内部至少需要三类节点：
+生成器内部使用一个 `Task` dataclass，由 `kind` 区分两种任务：
 
 ```text
-ComputeTask
+Task(kind=compute)
   rank
   op_kind
   shape_key
@@ -53,7 +49,7 @@ ComputeTask
   overlaps_communication
   metadata
 
-TransferTask
+Task(kind=transfer)
   src_rank
   dst_rank
   bytes
@@ -61,25 +57,33 @@ TransferTask
   route_spec | none
   communication_phase_id
   metadata
-
-BarrierGroup (optional)
-  task_ids
-  reason
+common fields
+  predecessors: set[task_key]
+  barrier_group: optional string
+  metadata
 ```
 
-HTSim emitter 最终只输出 compute 和 network task。默认每个 task 分配独立 barrier；`BarrierGroup` 只用于显式声明多个 task 必须共同完成后才能释放后继。
+HTSim emitter 最终只输出 compute 和 network task。默认每个 task 分配独立 barrier；
+`barrier_group` 是 `Task` 上的可选合并键，不是第三种节点类型。同组 task 必须拥有完全相同的
+predecessor 集合，且组内不能互相依赖。
 
 每个 task 使用 task-level predecessor 集合。task ID 和 barrier ID 只在最终 lowering 时分配。
 
-### 3.2 PhaseGraph
+### 3.2 TaskGraph fragment 和 AlgorithmBuildResult
 
-算法插件返回一个带命名边界的 graph fragment：
+当前算法 builder 直接向共享 `TaskGraph` 追加 task，并返回：
 
 ```text
-entry -> planning/layout -> dispatch -> expert_compute -> combine -> exit
+AlgorithmBuildResult
+  algorithm
+  terminal_keys
+  rank_terminal_keys
+  metadata
 ```
 
-命名边界用于第二层把 shared expert、attention 或下一个 microbatch 接进来。算法可以在边界内部加入任意专属 task。
+`rank_terminal_keys` 是模型层连接同 rank 下一层数据依赖的真实边界；`metadata`
+保存去重、placement、字节和负载快照。代码中没有 `PhaseGraph` 类，也没有一个通用
+`build_forward/build_backward` 插件协议。
 
 ## 4. 为什么需要共享 base
 
@@ -94,15 +98,15 @@ entry -> planning/layout -> dispatch -> expert_compute -> combine -> exit
 - 理论 FLOP 数和固定 `compute_us` 占位；
 - task graph、ID、barrier 映射和输出校验。
 
-但 base 不定义固定的通信 phase。算法插件至少实现：
+但 base 不定义固定的通信 phase。当前实际接口为：
 
 ```text
-validate(invocation, topology, config)
-plan(invocation, placement, routing) -> AlgorithmPlan
-build_forward(plan, cost_provider) -> PhaseGraph
-build_backward(plan, cost_provider) -> PhaseGraph
-summarize(plan) -> AlgorithmReport
+builder.plan(invocation, algorithm-specific inputs) -> AlgorithmPlan
+builder.build(graph, invocation, entry_keys=...) -> AlgorithmBuildResult
 ```
+
+NCCL/DeepEP 可以在 `build` 内直接构造；EPLB/MoonEP/ProbeEP 各自保留专用 plan。
+backward 尚未实现，不应在当前接口文档中伪装成已存在的方法。
 
 NCCL 的 `AlgorithmPlan` 关闭去冗余并保留每条 top-k route；DeepEP 的 plan 保存
 destination-rank 去重和 relay；MoonEP 的 plan 按 home server 保存动态 replica、
@@ -116,7 +120,7 @@ placement/intents，不作为 CPU task 进入 DAG；其复杂度由论文单独�
 
 EPLB planner 返回跨多个 invocation 使用的 `phy2log/log2phy/logcnt` placement
 plan。当前 builder 缓存该 plan，以确定性 round-robin 把当前 routes 分给 physical
-replicas，再构造 DeepEP 稳态 phase graph。estimated-load placement 和当前 batch
+replicas，再构造 DeepEP 稳态 TaskGraph fragment。estimated-load placement 和当前 batch
 route planning 在代码与 manifest 中仍是两个明确步骤。
 
 ## 5. Token 路由与字节核算

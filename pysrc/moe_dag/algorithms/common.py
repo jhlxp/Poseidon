@@ -576,17 +576,6 @@ def _server_leg_metadata(
     }
 
 
-def destination_forward_route(
-    placement: Placement, src_rank: int, dst_rank: int
-) -> tuple[str | None, int | None]:
-    if placement.rank_server(src_rank) == placement.rank_server(dst_rank):
-        return None, None
-    relay = placement.server_rank(
-        placement.rank_server(dst_rank), placement.rank_local(src_rank)
-    )
-    return f"server_forward src_relay:{src_rank} dst_relay:{relay}", relay
-
-
 @dataclass(frozen=True)
 class AlgorithmBuildResult:
     algorithm: str

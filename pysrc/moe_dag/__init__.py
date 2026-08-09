@@ -26,7 +26,6 @@ from .schema import (
     ValidationError,
     dtype_bytes,
     make_contiguous_expert_placement,
-    make_uniform_assignments,
 )
 
 __all__ = [
@@ -53,6 +52,5 @@ __all__ = [
     "dtype_bytes",
     "emit_workload",
     "make_contiguous_expert_placement",
-    "make_uniform_assignments",
     "probeep_weight_dispatch_observations",
 ]

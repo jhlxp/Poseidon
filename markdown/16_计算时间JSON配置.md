@@ -29,7 +29,7 @@ pysrc/compute_profiles/H100_DSV3_EP32_compute_4096tpr.json
 pysrc/compute_profiles/H20_DSV3_EP32_compute_4096tpr.json
 ```
 
-ProbeEP 两层 full 和五算法 full runner 的默认完整实验 profile 为
+ProbeEP 两层 full 和静态算法 full runner 的默认完整实验 profile 为
 `H20_DSV3_EP32_compute_4096tpr.json`。H100 profile 保留为显式对照，不再是默认。
 
 文件名中的 `4096tpr` 表示它服务于标准 DSV3 4096 tokens/rank 实验，并不表示

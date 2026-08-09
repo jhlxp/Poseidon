@@ -239,7 +239,7 @@ double-buffer group，前一组的完整 workload drain 后下一组才启动；
 奇数尾项单独成组。当前 builder 的完整范围是一个 forward MoE block；完整 DSV3
 builder 接入后，同一规则扩大为两个 microbatch 走完全部 DSV3 层后再启动下一组。
 
-compute task 中相等的 `src_rank`/`dst_rank` 用于校验和记录计算归属。HTSim 只执行输入给定的固定 `compute_us`，不在运行时模拟 SM occupancy、kernel 抢占、CUDA stream scheduler 或 HBM 竞争。首版的 SM 影响由 workload generator 预先折算：普通计算使用 H100 的 132 SM/989 TFLOP/s，明确与通信重叠的计算按通信预留 20 SM、剩余 112 SM/约 839.15 TFLOP/s 计算固定时长。
+compute task 中相等的 `src_rank`/`dst_rank` 用于校验和记录计算归属。HTSim 只执行输入给定的固定 `compute_us`，不在运行时模拟 SM occupancy、kernel 抢占、CUDA stream scheduler 或 HBM 竞争。SM 影响由 workload generator 预先折算：未传 JSON 的 smoke 默认使用 H100 理论模型；完整实验则显式选择 H100/H20 schema-v2 profile。两者都将通信预留 20 SM 的约定预先算入固定时长，不由 HTSim 在运行时动态分配 SM。
 
 同一逻辑通信 phase 拆出的多条 flow 或 chunk 共享一次 20 SM 预留。这个归属记录在 manifest/task map 中，不增加 `.dag` 字段，HTSim 也不做动态 SM 恢复。
 

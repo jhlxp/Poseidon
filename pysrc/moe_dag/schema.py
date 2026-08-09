@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import random
 from dataclasses import dataclass
-from typing import Iterable
 
 
 class ValidationError(ValueError):
@@ -225,35 +223,6 @@ class ModelSpec:
         if self.topk > self.num_experts:
             raise ValidationError("model topk must not exceed num_experts")
         dtype_bytes(self.dtype)
-
-
-def make_uniform_assignments(
-    tokens_per_source_rank: Iterable[int],
-    topk: int,
-    num_experts: int,
-) -> tuple[RoutingAssignment, ...]:
-    if topk <= 0 or topk > num_experts:
-        raise ValidationError("topk must be in [1, num_experts]")
-
-    expert_order = list(range(num_experts))
-    random.Random(0).shuffle(expert_order)
-    assignments: list[RoutingAssignment] = []
-    global_token_id = 0
-    for src_rank, token_count in enumerate(tokens_per_source_rank):
-        for token_id in range(token_count):
-            first_slot = (global_token_id * topk) % num_experts
-            for slot in range(topk):
-                assignments.append(
-                    RoutingAssignment(
-                        src_rank=src_rank,
-                        token_id=token_id,
-                        topk_slot=slot,
-                        expert_id=expert_order[(first_slot + slot) % num_experts],
-                        route_weight=1.0 / topk,
-                    )
-                )
-            global_token_id += 1
-    return tuple(assignments)
 
 
 def make_contiguous_expert_placement(

@@ -23,6 +23,7 @@
 | [15_DAG执行时间线可视化.md](15_DAG执行时间线可视化.md) | GPU 0-31 可缩放 timeline、Gate/expert before-after、折叠明细和五算法合并页 |
 | [16_计算时间JSON配置.md](16_计算时间JSON配置.md) | 模块级 theoretical/profiled 固定时间、二选一规则、文件格式和适用边界 |
 | [17_Gate分布与Routing生成.md](17_Gate分布与Routing生成.md) | Gate provider、UltraEP/FAST 合成分布、raw receive 精确 quota 和 routing fidelity |
+| [18_历史遗留代码盘点.md](18_历史遗留代码盘点.md) | 可删候选、兼容路径、旧命名活动代码和建议清理顺序 |
 
 ## 仿真器的两种输入模式
 
@@ -100,8 +101,8 @@ python3 tests/run_workload_generator.py
 
 ```bash
 python3 visualization/mprail_link_load.py \
-  --metrics-dir <run-dir>/output_metrics \
-  --output-dir <run-dir>/visualization
+  --metrics-dir <algorithm-case>/simulation/output_metrics \
+  --output-dir <algorithm-case>/link_load
 ```
 
 采样开关、五类面板和统计语义见
@@ -140,19 +141,24 @@ python3 visualization/gate_load_profile.py \
 ## 运行 DSV3 两层五算法案例
 
 ```bash
-python3 tests/run_dsv3_2layer_algorithms.py
-# 只有明确要求完整测试时：
-python3 tests/run_dsv3_2layer_algorithms.py --full --workers 4
+# 日常 2-token 功能回归
+python3 tests/run_dsv3_2layer_algorithms.py \
+  --algorithms nccl,deepep,eplb,moonep
+python3 tests/run_probeep_2layer_ratio_full.py --gate-layer-map 0,1
+
+# 只有明确要求完整测试时：四个静态 case
+python3 tests/run_dsv3_2layer_algorithms.py \
+  --full --workers 4 --algorithms nccl,deepep,eplb,moonep \
+  --gate-provider raw_receive_cdf --gate-layer-map 0,1 --gate-seed 17 \
+  --moonep-replicas-per-rank 256
 ```
 
-该入口固定使用两个代表性 DSV3 MoE layer、两个 microbatch、
-NCCL/DeepEP/EPLB/MoonEP/ProbeEP 和 EP32 单 plane/400 Gbps 拓扑。默认为
-`2 tokens/rank/microbatch` smoke；`--full` 才是 `4096 tokens/rank/microbatch`。
-每个算法都生成一个完整 `algorithm_dashboard.html`，其中包含 Gate/expert
-before-after、GPU 0-31 完整可缩放 timeline 和 MpRail 链路负载图；五个算法页面
-再组合到 ZIP 根目录的可折叠 `dsv3_algorithm_comparison.html` 总入口，并生成不含仿真大文件的
-`dsv3_visualization_bundle.zip` 供下载。ZIP 成功后服务器 run 目录不保留散装
-HTML，其他产物仍保留。参数、边界和验收条件见
+两个入口都固定使用两个代表性 DSV3 MoE layer、两个 microbatch 和
+EP32 单 plane/400 Gbps 拓扑。默认为 `2 tokens/rank/microbatch` smoke；
+`--full` 才是 `4096 tokens/rank/microbatch`。有效五算法性能对比必须聚合四个
+静态结果和一个单 HTSim PID 动态 ProbeEP 结果；通用 runner 默认生成的静态
+ProbeEP 只能做结构回归。聚合后每个算法都有完整 dashboard，ZIP 根目录的
+`dsv3_algorithm_comparison.html` 提供五算法总览。参数、边界和验收条件见
 [14_专用测试拓扑-EP32-1Plane.md](14_专用测试拓扑-EP32-1Plane.md)，计算时间选择见
 [16_计算时间JSON配置.md](16_计算时间JSON配置.md)。
 

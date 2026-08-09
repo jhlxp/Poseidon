@@ -157,8 +157,9 @@ expert_flops[rank]
 - dispatch/combine 的 src-dst matrix；
 - Expert FFN 等待哪些 weight/token flows。
 
-计算仍是 H100 理论固定时长占位，不模拟 grouped GEMM kernel、HBM、zero-copy 或
-动态 SM 调度。
+计算仍是生成时选定的固定时长占位：smoke 可使用内置 H100 理论模型，full
+应显式选择 H100/H20 schema-v2 profile。当前不模拟 grouped GEMM kernel、HBM、
+zero-copy 或动态 SM 调度。
 
 ## 7. Combine
 
@@ -215,6 +216,12 @@ token_payload_policy:
   scope: destination_rank_then_server
 ```
 
+`replicas_per_rank=2` 是 CLI 默认的容量约束，不是 MoonEP 算法定理。对
+`raw_receive_cdf` 热点完整实验，该值可能在 workload 生成阶段被 planner 拒绝。
+若实验明确不建模显存容量，必须显式传入足够大的上限（当前 EP32 完整对比使用
+`--moonep-replicas-per-rank 256`），并在报告中记录。这是 MoonEP 本地 replica slot 约束，
+与 ProbeEP 当前完全关闭 HBM/slot admission 是两个不同契约。
+
 manifest 至少记录：
 
 ```text
@@ -241,6 +248,7 @@ dispatch/combine bytes
 7. Expert FFN route count 不受 payload 去冗余影响。
 8. EP32 测试中可同时观察服务器内权重复制和跨服务器 token flow。
 9. 生成的完整 DAG 能由 HTSim 加载并完成。
+10. 偏斜 Gate 实验必须显式记录 `replicas_per_rank`；容量不足时必须失败，不得静默改变 Gate。
 
 ## 11. 当前边界
 

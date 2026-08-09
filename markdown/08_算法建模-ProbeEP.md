@@ -172,7 +172,7 @@ Attention 0 -> Attention 1 -> MoE 0 -> MoE 1
 Amax = max_rank(attention_compute_us_by_rank)
 Mmax = max_rank(moe_compute_us_by_rank)
 dispatch_overlap_compute_kind = attention | moe
-Cmax = Amax if dispatch_overlap_compute_kind == attention else Emax
+Cmax = Amax if dispatch_overlap_compute_kind == attention else Mmax
 ```
 
 - `Amax` 来自与 `Weight+Dispatch` overlap 的 Attention 时间，通常跨层较稳定；
@@ -406,29 +406,21 @@ subject to the admitted server mapping
 喷到所有 GPU；尽量连续填充同一 rank，避免为追求完全均衡产生上千个无效
 NVLink 权重副本。
 
-### 5.1 EP32 两层完整实验证据
+### 5.1 均衡验收口径
 
-`run_20260809_160653_947420_probeep_2layer_ratio_full` 的 Layer 1 MoE-chain 说明为什么
-不能用 intent 数判断均衡程度。旧版同样接纳 4 个 remote replicas，但只以 raw route
-quota 为终点；新版仍为 4 个 replicas/336 MiB RDMA weight，却重新调整了它们承接的
-route 数：
+不能用 intent 或 remote replica 数量判断均衡程度。一个有效 plan 必须同时报告：
 
-| 指标 | 旧 raw-quota planner | 新 server-first padding-aware planner |
-|---|---:|---:|
-| server raw routes | 262144/262144/262144/262144 | 262174/262213/262276/261913 |
-| server padded routes | 267264/267648/266752/268416 | 266112/266112/266112/266112 |
-| server padded spread | 1664 | 0 |
-| 32-GPU Expert FFN min-max | 3452.88-3600.67 us | 3479.75-3493.19 us |
-| 32-GPU compute spread | 147.79 us | 13.44 us（1 padding block） |
-| remote replicas / RDMA weight | 4 / 336 MiB | 4 / 336 MiB |
-| local prefetch count | 145 | 226 |
-| Weight+Dispatch N/C | 0.7164 | 0.7261 |
+```text
+server raw routes before/after
+server padded routes before/after
+rank padded routes before/after
+global max_rank_compute_us before/after
+remote RDMA weight bytes and local NVLink prefetch bytes
+```
 
-这是有意识的工程取舍：允许 raw routes 对理论 quota 有不超过约 0.1% 的小幅
-偏移，换取全局 padded compute 更接近；利用高带宽 NVLink 多建立一部分本地副本，
-但不增加跨机权重字节。最终 MoE Weight+Dispatch 仍只占计算窗口的 0.7261，
-通信未变成新瓶颈。此时继续为“用满网络”增加 remote replicas 没有计算收益，
-不属于 ProbeEP 的优化目标。
+允许 raw routes 对理论 quota 有小幅工程偏移，前提是它严格降低全局 padded maximum 或
+spread，且不额外增加无计算收益的跨机副本。当 planner 已无法改善全局最慢 GPU 时，
+即使 NIC 窗口尚有余量，也不应为“用满网络”继续迁移专家。
 
 对于 home server，expert master rank 是原始 placement rank。对于 remote server，
 第二阶段选择一个 seed rank 接收跨机完整权重；同一 remote expert 若需要在该 server
@@ -513,7 +505,7 @@ EP32 只有几十个标量，payload 开销可忽略；同步 latency 不是严�
 比较的 `Cmax` 和 `Nmax` 必须来自同一个 release/deadline 窗口，
 不能拿整轮任意两个不对齐的区间直接比较。一个 rank 较早完成不能让
 全局 barrier 提前释放；因此 `N_i` 仅用于定位最慢 endpoint，窗口增减
-方向和比例只能由全局 `beta*Cmax/Nmax` 决定，不得为每个 rank
+方向和比例只能由全局 `alpha*Cmax/Nmax` 决定，不得为每个 rank
 单独计算 `Cmax/N_i`。
 
 ## 8. 理论线速硬上限
@@ -539,7 +531,7 @@ stripe 的聚合 endpoint 后，才能使用聚合速率。
 硬上限直接使用上一个已完成、且与当前通信类型对应的跨 GPU 最大计算时间：
 
 ```text
-Cmax(t) = previous Amax(t) or previous Emax(t)
+Cmax(t) = previous Amax(t) or previous Mmax(t)
 NICmax(t) = floor(Rnic * Cmax(t))
 Bhard_tx_i(t) = max(0, NICmax(t) - dispatch_tx_bytes_i)
 Bhard_rx_i(t) = max(0, NICmax(t) - dispatch_rx_bytes_i)
@@ -609,7 +601,7 @@ incast、协议控制和 chunk 离散化也会使实际时间高于理论值。�
 每个 Dispatch control observation 记录：
 
 ```text
-Cmax(t) = Amax(t) 或 Emax(t)
+Cmax(t) = Amax(t) 或 Mmax(t)
 N_i(t) = rank i 的完整 Weight+Dispatch TX/RX stage elapsed time
 Nmax(t) = max_i(N_i(t))
 U_i(t) = rank i 的 Weight RDMA+Dispatch fabric active time（辅助指标）
@@ -628,14 +620,14 @@ source TX 和 destination RX，通常把一次 RDMA 传输计算两遍。实际�
 工程目标不是令通信时间严格等于计算时间，而是保留 10% 余量：
 
 ```text
-target_overlap_ratio = beta = 0.90
-Ttarget = beta * Cmax
+target_overlap_ratio = alpha = 0.90
+Ttarget = alpha * Cmax
 ```
 
 全局 barrier 的控制比例为：
 
 ```text
-scale(t) = beta * Cmax(t) / Nmax(t)
+scale(t) = alpha * Cmax(t) / Nmax(t)
 ```
 
 同一 Attention 或 MoE 状态链的所有 NIC 使用同一个 `scale`。若
@@ -678,58 +670,27 @@ Bnext_i(t+1)
 deferred intent 不影响反馈，因为下一层 Gate 可能重新产生迁移需求。只有没有任何可测
 通信字节或时间无效时才保持当前 budget。
 
-不再增加 `0.5-2.0` 人为调节限幅。`beta=0.90` 已为测量误差和排队保留 10%
+不再增加 `0.5-2.0` 人为调节限幅。`alpha=0.90` 已为测量误差和排队保留 10%
 余量，比例反算结果只经过 `Bhard` 物理硬上限 clamp。这样 `Nmax/Cmax` 偏离较大时，
 下一次同类 Dispatch observation 可以一步接近目标，而不是被固定步幅拖慢。若测量
 无效或没有任何实际通信字节时保持当前 budget。
 
-### 9.1 H20 两层旧实验核算与修复口径
+### 9.1 当前验收口径
 
-`run_20260809_210222_024276_probeep_2layer_dynamic_full` 的第一次 Attention-chain
-observation 为：
-
-```text
-Cmax                 = 14626.104846 us
-Nmax                 = 2447.3 us
-beta * Cmax          = 13163.494361 us
-scale                = 5.378782
-旧 budget            = 16 MiB/NIC
-NICmax               = 731305242 bytes = 697.43 MiB/NIC
-Bhard                = 616.46-619.83 MiB/NIC
-```
-
-该历史 run 由修复前代码生成，当时错误执行
-`16 MiB * scale = 86.06 MiB/NIC`。它缩放了未必用满的配置预算，并遗漏 token
-Dispatch 已经贡献的约 78-81 MiB endpoint bytes。按修复后的全局瓶颈字节公式核算：
+旧版“用 `scale` 乘未用满的配置 budget”已不是当前算法，文档不再保留该历史数值。
+当前每次 observation 必须直接审计：
 
 ```text
-Bsample              = 88.32 MiB（Nmax ranks 中较大的 full-duplex endpoint 总字节）
-Bprobe_total         = 475.07 MiB/NIC
-Btotal_max           = min(475.07, 697.43) = 475.07 MiB/NIC
-migration budget     = 394.10-397.48 MiB/NIC（扣除各 NIC token baseline）
+Bsample = 瓶颈 rank 实际 Token+Weight full-duplex endpoint bytes
+Bprobe_total = alpha * Cmax / Nmax * Bsample
+Btheory_total = Rnic * Cmax
+Bnext = min(Bprobe_total, Btheory_total) - 不可裁剪的 Dispatch baseline
 ```
 
-本次两层实验中 `86.06 MiB/NIC` 仍足以接纳最后一层的 4/4 planned replicas，因而
-最后一层 server real routes 为 `262174/262213/262276/261913`，不影响该次 placement
-已接近均值的事实；但 `86.06 MiB/NIC` 只能作为旧错误实现的观测值，不能写成设计
-结论。修复后必须重新运行同一 H20 full case，以新 observation 中的
-`bottleneck_observed_total_bytes/probed_total_nic_max_bytes/effective_total_nic_max_bytes`
-作为验收证据。
-
-修复后的完整实验为
-`run_20260809_225300_474846_probeep_2layer_dynamic_full`。四次 observation 为：
-
-| ID | 窗口 | `Cmax` us | `Nmax` us | `alpha*k` | `Bsample` MiB | `Bprobe_total` MiB | `Btheory_total` MiB | 下一 migration budget 均值 MiB |
-|---:|---|---:|---:|---:|---:|---:|---:|---:|
-| 0 | L0/MB0 Attention | 14626.10 | 2447.30 | 5.379 | 88.32 | 475.07 | 697.43 | 395.92 |
-| 1 | L0/MB1 MoE | 34729.12 | 2251.90 | 13.880 | 87.82 | 1218.99 | 1656.01 | 1139.77 |
-| 2 | L1/MB0 Attention | 14626.10 | 13659.00 | 0.964 | 90.23 | 86.96 | 697.43 | 8.28 |
-| 3 | L1/MB1 MoE | 26635.90 | 13682.00 | 1.752 | 90.05 | 157.77 | 1270.10 | 79.16 |
-
-ID 2 说明通信超过 `0.9*Cmax` 时会压缩 Expert Weight 空间；ID 3 即使当前没有
-deferred intent 也继续按实测字节更新，避免陈旧的大 budget 污染下一层。四次
-`dispatch_baseline_bytes_by_rank` 在更新前后完全不变，controller 只改变 Expert Weight
-admission 上限。
+当前保留的 H20/H100 两层五算法完整结果在
+`test_logs/run_20260809_234100_h20_h100_2layer_5algo_full/`：H20 ProbeEP makespan
+为 `185430.0 us`、接纳 12 个跨机 replica；H100 为 `32305.9 us`、接纳 8 个。
+两者均为单 HTSim、4 个 Dispatch observations，不是静态 ProbeEP 或 baseline/replay。
 
 ### 9.2 Attention/MoE 独立状态
 
@@ -748,24 +709,24 @@ Dispatch observation 只更新 `B_moe`。Combine observation 不更新任何 bud
 ### 9.3 收敛边界
 
 在 workload 稳定、`Nmax` 随全局窗口单调且局部近似线性时，上述公式理想上一步到达
-`beta*Cmax`。实际系统只要求工程上接近，不声称对任意动态 trace 严格收敛：
+`alpha*Cmax`。实际系统只要求工程上接近，不声称对任意动态 trace 严格收敛：
 
 - remote expert 以完整 `invocation.expert_weight_bytes` 接纳，决策不是连续变量；
 - chunk 为 4 MiB，budget/流量存在离散台阶；
 - 网络拥塞和 Gate load 会随 invocation 改变；
 - 双 microbatch 存在 delayed feedback；
 - 完整 expert/chunk 使有效发送量可能在两个离散档位之间切换；
-- 若不可删除的 Dispatch baseline 已经满足 `Nmax > beta*Cmax`，将 migration budget
+- 若不可删除的 Dispatch baseline 已经满足 `Nmax > alpha*Cmax`，将 migration budget
   降为 0 也不能继续缩短网络时间；
 - 若所有能继续降低 `(global server padded max, global max-rank compute)` 的
   compute planner intents 已接纳，继续增大 NIC budget 也不应凭空产生无效
-  expert migration，网络时间可能停在 `beta*Cmax` 以下。
+  expert migration，网络时间可能停在 `alpha*Cmax` 以下。
 
 当前设计可以严格保证的是：
 
 1. `B_i <= Bhard_i`，有效迁移预算不会无限增长；
 2. 理论满线速总通信时间不超过 `Cmax`；
-3. 每次有效测量都按全局 `beta*Cmax/Nmax` 直接修正，不依赖固定 5% 步长；
+3. 每次有效测量都按全局 `alpha*Cmax/Nmax` 直接修正，不依赖固定 5% 步长；
 4. Attention/MoE 状态互不污染。
 
 因此两层、双 microbatch 的 4-Dispatch-observation 专项实验用于验证“一次同类
@@ -893,7 +854,7 @@ execution placement。
 ```text
 dispatch_observation_id / invocation_index / layer / microbatch
 communication_kind=dispatch
-dispatch_overlap_compute_kind / Amax / Emax / Cmax
+dispatch_overlap_compute_kind / Amax / Mmax / Cmax
 Nmax / Nmax-Cmax / global scale
 每 rank A_i / E_i / N_i / dispatch_baseline_i / Bhard_i / B_i
 planned/admitted/deferred intents
@@ -916,7 +877,7 @@ budget change <= budget_tolerance
 展示稳定区间的均值/P95：
 
 ```text
-Amax, Emax, Cmax, Nmax, makespan
+Amax, Mmax, Cmax, Nmax, makespan
 compute imbalance
 per-NIC Bhard/budget/utilization
 admitted migration bytes
@@ -1117,7 +1078,7 @@ per-rank 字节窗口逐 Dispatch observation 探测可被计算掩盖的 RDMA �
 | F04 | 计算规划与网络 admission 分离 | `ProbeEPBuilder.plan/_admit_intents` | √ | planner 输入与 admission 断言通过 |
 | F05 | 单 NIC 400 Gbps 理论硬上限与 Dispatch baseline 扣减 | `nic_theoretical_max_bytes`、`hard_migration_cap_by_rank` | √ | `probeep_controller` 与双端 budget 断言通过 |
 | F06 | Attention/MoE 两套独立 per-rank 预算状态 | `ProbeNICController._budgets_by_kind` | √ | `probeep_controller` 通过 |
-| F07 | 基于全局 `Cmax/Nmax`、瓶颈 NIC 实际 Token+Weight bytes 和 0.90 目标的统一窗口更新 | `ProbeNICController.update` | √ | `Bprobe=alpha*Cmax/Nmax*Bsample`，再由 400 Gbps 封顶并扣 Token baseline；30/30 与 H20 full 通过 |
+| F07 | 基于全局 `Cmax/Nmax`、瓶颈 NIC 实际 Token+Weight bytes 和 0.90 目标的统一窗口更新 | `ProbeNICController.update` | √ | `Bprobe=alpha*Cmax/Nmax*Bsample`，再由 400 Gbps 封顶并扣 Token baseline；方向反例与 H20/H100 full 均通过 |
 | F08 | 完整 expert weight 分 chunk，完整到达后才执行 Expert FFN | `_schedule_weight_chunks` 与 weight task 依赖 | √ | 权重字节守恒、FFN 前驱和 HTSim 完成检查通过 |
 | F09 | 按有向 `(src_server,dst_server)` 独立维护 per-rail pair load | `_schedule_weight_chunks` | √ | `probeep_pair_aware_chunks` 通过 |
 | F10 | 每个 chunk 同时检查 source TX 和 destination RX 预算 | `_schedule_weight_chunks` | √ | endpoint totals 与逐 rank budget 断言通过 |
@@ -1130,21 +1091,22 @@ per-rank 字节窗口逐 Dispatch observation 探测可被计算掩盖的 RDMA �
 
 ## 18. 测试表
 
-只有本轮实际执行并通过的测试才标记 `√`；历史实验不能替代当前代码的回归结果。
+状态表示当前代码已有对应自动化断言；日常回归入口与当前保留的 full 证据分开记录，
+不再引用已删除的临时 run 目录。
 
 | ID | 测试 | 覆盖范围 | 状态 | 最近核查证据 |
 |---|---|---|:---:|---|
-| T01 | `probeep_cross_server` | 跨机规划、权重 chunks、DAG 依赖、字节守恒 | √ | `run_20260809_205120_765390_workload_generator` |
-| T02 | `probeep_pair_aware_chunks` | server-pair 状态隔离、rail 均衡、双端字节守恒 | √ | `run_20260809_205120_765390_workload_generator` |
-| T03 | `probeep_global_quota` | 全部 donor/receiver、热点优先、raw quota | √ | `run_20260809_205120_765390_workload_generator` |
-| T04 | `probeep_padding_aware_global_balance` | raw load 已相等但 padded server load 不等的 refinement 反例 | √ | `run_20260809_205120_765390_workload_generator`：padded max 16 -> 12，local spread <= 1 block |
-| T05 | `probeep_controller` | A/M 独立状态、full-duplex 瓶颈总字节比例更新、Token baseline 扣减、理论硬上限、零字节 hold | √ | `run_20260809_225244_921443_workload_generator`：30/30 passed；含 TX/RX 方向反例 |
-| T06 | `probeep_dispatch_observations` | 2 layer x 2 microbatch 的 4 次 Dispatch 观测、合并 communication stage 与 budget 注入 | √ | `run_20260809_205120_765390_workload_generator` |
-| T07 | workload generator 全量功能回归 | ProbeEP、动态 emitter/wavefront 与共享 DAG/算法基础功能 | √ | `run_20260809_205120_765390_workload_generator`，30/30 passed |
-| T08 | timeline/dashboard 功能回归 | 32 GPU lanes、动态 task map、Gate/link/ZIP 产物 | √ | `run_20260809_225300_474846_probeep_2layer_dynamic_full`，Dashboard 分列 sample/probe/theory total 与 migration budget |
-| T09 | 2-layer、4096 tokens/rank、EP32 ProbeEP H20 单进程完整实验 | 动态反馈、跨机 expert migration、source-rail TX 顺序、32 GPU lanes | √ | `run_20260809_225300_474846_probeep_2layer_dynamic_full`：12 replicas、240 条顺序检查、64 条零等待检查 |
-| T10 | 同一次 HTSim 内动态反馈闭环 | observation FCT 驱动后续 invocation | √ | `run_20260809_225300_474846_probeep_2layer_dynamic_full`：4 observations、2 append、1 summary |
-| T11 | HTSim 动态 DAG 协议最小测试 | 5 us observation 后同时刻 append 7 us task，单 PID/单 summary | √ | `run_20260809_202850_354975_dynamic_dag_functional`，makespan=12 us |
-| T12 | 迁移方向字节与 endpoint 口径 | `max(TokenTX+WeightTX,TokenRX+WeightRX)`、TX/RX/RDMA 守恒 | √ | `run_20260809_225300_474846_probeep_2layer_dynamic_full`：4/4 observations 守恒 |
-| T13 | 当前 telemetry schema 下的非零跨机迁移 full 验证 | 动态 FCT、sample/probe/theory total、非零 TX/RX/RDMA、Dashboard/ZIP | √ | `run_20260809_225300_474846_probeep_2layer_dynamic_full`，H20 theoretical profile |
-| T14 | Directed load 柱状图 | 首层 raw/末层 admitted、末层 server-pair/per-NIC Dispatch、Combine、Expert Weight | √ | `run_20260809_224833_908121_gate_workload_visualization`，4/4 passed；同口径进入 full ZIP |
+| T01 | `probeep_cross_server` | 跨机规划、权重 chunks、DAG 依赖、字节守恒 | √ | `tests/run_workload_generator.py` |
+| T02 | `probeep_pair_aware_chunks` | server-pair 状态隔离、rail 均衡、双端字节守恒 | √ | `tests/run_workload_generator.py` |
+| T03 | `probeep_global_quota` | 全部 donor/receiver、热点优先、raw quota | √ | `tests/run_workload_generator.py` |
+| T04 | `probeep_padding_aware_global_balance` | raw load 已相等但 padded server load 不等的 refinement 反例 | √ | `tests/run_workload_generator.py` |
+| T05 | `probeep_controller` | A/M 独立状态、full-duplex 瓶颈总字节比例更新、Token baseline 扣减、理论硬上限、零字节 hold | √ | `tests/run_workload_generator.py`，含 TX/RX 方向反例 |
+| T06 | `probeep_dispatch_observations` | 2 layer x 2 microbatch 的 4 次 Dispatch 观测、合并 communication stage 与 budget 注入 | √ | `tests/run_workload_generator.py` |
+| T07 | workload generator 全量功能回归 | ProbeEP、动态 emitter/wavefront 与共享 DAG/算法基础功能 | √ | `tests/run_workload_generator.py` |
+| T08 | timeline/dashboard 功能回归 | 32 GPU lanes、动态 task map、Gate/link/ZIP 产物 | √ | `tests/run_dag_timeline_visualization.py` 与 full ZIP |
+| T09 | 2-layer、4096 tokens/rank、EP32 ProbeEP H20/H100 单进程完整实验 | 动态反馈、跨机 expert migration、source-rail TX 顺序、32 GPU lanes | √ | `run_20260809_234100_h20_h100_2layer_5algo_full`：H20 12 replicas，H100 8 replicas |
+| T10 | 同一次 HTSim 内动态反馈闭环 | observation FCT 驱动后续 invocation | √ | H20/H100 各 4 observations、2 append、1 summary |
+| T11 | HTSim 动态 DAG 协议最小测试 | observation 后同时刻 append，单 PID/单 summary | √ | `tests/run_dynamic_dag_functional.py` |
+| T12 | 迁移方向字节与 endpoint 口径 | `max(TokenTX+WeightTX,TokenRX+WeightRX)`、TX/RX/RDMA 守恒 | √ | `tests/run_probeep_2layer_ratio_full.py` runtime validation |
+| T13 | 当前 telemetry schema 下的非零跨机迁移 full 验证 | 动态 FCT、sample/probe/theory total、非零 TX/RX/RDMA、Dashboard/ZIP | √ | 当前保留的 H20/H100 五算法 ZIP |
+| T14 | Directed load 柱状图 | 首层 raw/末层 admitted、末层 server-pair/per-NIC Dispatch、Combine、Expert Weight | √ | `tests/run_gate_workload_visualization.py`；同口径进入 full ZIP |

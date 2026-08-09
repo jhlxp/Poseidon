@@ -62,16 +62,17 @@ HTSIM_LINK_LOAD_SAMPLE_US=1 \
 | 数百 us 到数 ms | 5-10 us |
 | 更长实验 | 50-1000 us |
 
-DSV3 五算法标准入口固定使用：
+DSV3 静态 runner 和动态 ProbeEP 入口固定使用：
 
 ```text
 2-token smoke:  HTSIM_LINK_LOAD_SAMPLE_US=1
 4096tpr full:   HTSIM_LINK_LOAD_SAMPLE_US=100
 ```
 
-`tests/run_dsv3_2layer_algorithms.py` 已把 sampler 和绘图纳入每个算法的
-必选流程。任一算法缺失 `link_info.csv`、`link_load_1ms.csv` 或主图都会使
-该 case 失败。因此后续使用该标准入口执行仿真时，不需要再手工补画链路图。
+`tests/run_dsv3_2layer_algorithms.py` 和
+`tests/run_probeep_2layer_ratio_full.py` 都已把 sampler 和绘图纳入必选流程。
+任一 case 缺失 `link_info.csv`、`link_load_1ms.csv` 或主图都会失败。
+因此后续使用这两个入口执行仿真时，不需要再手工补画链路图。
 
 HTSim 在当前工作目录写出：
 

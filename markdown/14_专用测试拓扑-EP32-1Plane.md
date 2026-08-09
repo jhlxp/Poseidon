@@ -267,39 +267,50 @@ double-buffer group 才 drain。
 
 ## 11. 运行五算法测试与产物
 
+有效性能对比由四个静态算法 case 和一个动态 ProbeEP case 组成。两条
+入口必须使用相同的硬件 profile、Gate provider、seed 和 layer map：
+
 ```bash
 cd /home/xuheng/EP_ExpertTrans
-python3 tests/run_dsv3_2layer_algorithms.py
-
-# 仅在明确要求“完整测试”时使用
-python3 tests/run_dsv3_2layer_algorithms.py --full --workers 4
-
-# 不均匀 raw CDF smoke；MoonEP 的临时副本容量必须显式给足
+# 日常 2-token 静态功能回归
 python3 tests/run_dsv3_2layer_algorithms.py \
-  --gate-provider raw_receive_cdf --gate-layer-map 0,1 \
-  --gate-seed 17 --moonep-replicas-per-rank 10 \
-  --simulation-end-us 20000
+  --algorithms nccl,deepep,eplb,moonep
 
-# ProbeEP 专用单进程动态 DAG；默认 2-token smoke
+# 日常 2-token ProbeEP 单进程动态回归
 python3 tests/run_probeep_2layer_ratio_full.py --gate-layer-map 0,1
 
-# 只有明确进行完整实验时使用 4096 tokens/rank
+# 仅在明确要求“完整测试”时运行：四个静态 case
+python3 tests/run_dsv3_2layer_algorithms.py \
+  --full --workers 4 --algorithms nccl,deepep,eplb,moonep \
+  --gate-provider raw_receive_cdf --gate-layer-map 0,1 --gate-seed 17 \
+  --moonep-replicas-per-rank 256 \
+  --compute-config pysrc/compute_profiles/H20_DSV3_EP32_compute_4096tpr.json
+
+# 同一完整对比的动态 ProbeEP case
 python3 tests/run_probeep_2layer_ratio_full.py \
-  --full --gate-layer-map 0,1 \
+  --full --gate-layer-map 0,1 --gate-seed 17 \
   --compute-config pysrc/compute_profiles/H20_DSV3_EP32_compute_4096tpr.json
 ```
 
-该入口不接受 baseline run；compute config 直接决定同一条动态时间线中
-所有计算 task 的时间。
+H100 对照将两条 full 命令的 compute config 同时替换为
+`H100_DSV3_EP32_compute_4096tpr.json`，其余参数保持不变。
 
-默认入口是 `2 tokens/rank/microbatch` smoke，用于日常功能回归。`--full`
-才使用 4096tpr JSON 和完整通信字节。五个算法分别使用独立进程，默认最多 4 个
-并行仿真；`--workers` 可限制并发数。
+默认都是 `2 tokens/rank/microbatch` smoke；`--full` 才使用 4096tpr JSON
+和完整通信字节。静态 runner 的默认算法列表仍包含静态 ProbeEP，但它只用于
+task 结构、字节和可视化回归，不能用于 ProbeEP 闭环性能结论。
+`run_probeep_2layer_ratio_full.py` 不接受 baseline/replay；compute config 直接决定
+同一 HTSim PID 动态时间线中的所有 compute task。
+
+当前没有单独的、已纳入仓库的 H20/H100 十 case 统一 runner。五算法总览必须在
+上述五个有效 case 完成后聚合，不能将通用 runner 的静态 ProbeEP 页面替换
+动态结果。当前保留的 H20/H100 完整例证是
+`test_logs/run_20260809_234100_h20_h100_2layer_5algo_full/`，其 ProbeEP 每个硬件
+case 都只启动一个 HTSim。
 
 每次运行生成独立目录：
 
 ```text
-test_logs/run_<timestamp>_dsv3_2layer_5algo_<smoke|full>/
+test_logs/run_<timestamp>_dsv3_2layer_<N>algo_<smoke|full>/
 ├── 配置.json
 ├── 构建.log
 ├── 测试报告.md
@@ -330,7 +341,8 @@ test_logs/run_<timestamp>_dsv3_2layer_5algo_<smoke|full>/
 ```
 
 EP32 smoke/full 的 timeline 必须展示 rank 0-31，也就是四台服务器的全部 32 张
-GPU，不能只截取 server 0。ZIP 中的五算法区域和每个 `Task details` 均可折叠；
+GPU，不能只截取 server 0。有效聚合 ZIP 中的五算法区域和每个
+`Task details` 均可折叠；
 每条 timeline 默认
 Fit 全局，可水平缩放并实时显示 `100 px` 对应的微秒数。
 `dsv3_visualization_bundle.zip` 只打包总览 HTML、五算法 Gate/expert before-after、
@@ -397,7 +409,8 @@ algorithms/<algorithm>/algorithm_dashboard.html
    DeepEP/EPLB/MoonEP/ProbeEP 必须包含 dispatch/combine 的 fabric/local 四类 leg，
    且四者都不得再把算法通信封装为 `server_forward`。
 6. full compute manifest 必须记录 4096tpr JSON 路径和 `selected_source`。
-7. 五个 HTSim 进程必须完成各自 manifest 中全部 task/barrier。
+7. NCCL/DeepEP/EPLB/MoonEP 各使用一个静态 HTSim 进程；ProbeEP 使用一个
+   持续的动态 HTSim 进程。五个 case 都必须完成各自全部 task/barrier。
 8. 两个 layer 上的参与 GPU 集合中都必须实际出现 `D0||A1`、`D1||E0`、
    `C0||E1`、`C1||Reduce0`；不要求八个窗口固定落在同一张 GPU。另外
    必须实际出现 `L1 MB0 Attention || L0 MB1 Combine` 跨层窗口。

@@ -156,8 +156,9 @@ tokens_per_rank_per_microbatch = 4096
 
 ## 5. Router 输入来源
 
-模型层把 routing provider 分成以下三类；当前 CLI 只内置第 5.2 节中的
-balanced-permuted 功能基线：
+模型层把 routing provider 分成以下三类。当前 CLI 已通过 `workload/gate/`
+接入 `balanced_permuted`、`uniform_random`、`ultra_rank_zipf`、
+`fast_matrix_zipf` 和 `raw_receive_cdf`：
 
 ### 5.1 Trace
 
@@ -171,17 +172,16 @@ balanced-permuted 功能基线：
 
 ### 5.2 合成分布
 
-规划用于功能测试和参数扫描的合成分布包括：
+已实现的合成分布包括：
 
 - balanced-permuted deterministic（当前已实现，seed 0）；
-- perfectly balanced；
 - uniform random；
-- Zipf/skew；
-- hot expert；
-- group-limited top-k；
-- layer-correlated 或 step-correlated routing。
+- UltraEP 风格 rank/local Zipf；
+- FAST 风格 source-specific matrix Zipf。
 
 合成器必须使用显式 seed，并输出每 expert/rank/server 的 token histogram。
+perfectly-balanced 由 `balanced_permuted` 承担；独立 hot-expert、group-limited
+和 layer-correlated provider 尚未实现，不列为当前 CLI 能力。
 
 ### 5.3 仅计数输入
 
@@ -414,7 +414,8 @@ TP=1, PP=1, EP=32
 每 rank 每 microbatch 4096 tokens（smoke 为 2）
 H=7168, E=256, top-k=8
 连续 expert placement
-seed 0 的 balanced-permuted router assignment
+smoke/baseline: seed 0 balanced_permuted
+skew/full comparison: raw_receive_cdf, seed 17, layer map 0,1
 NCCL、DeepEP、EPLB、MoonEP 与 ProbeEP 五种输出
 ```
 
@@ -423,8 +424,9 @@ rank-direct All-to-All 和 Spine 流量；DeepEP 验证 rank/server 两级去冗
 RDMA/NVLink hierarchy legs；EPLB 验证持久 hierarchical placement 和稳态 DeepEP
 transport；MoonEP 在每个 expert home server 内独立规划 replica，并复用 DeepEP
 跨服务器 transport。该 MoonEP 组合是本项目的核心算法抽象，不声称官方实现提供
-多节点 RDMA。ProbeEP 在 MoonEP/DeepEP 语义上增加跨服务器临时专家迁移和
-单进程 HTSim 内的 Dispatch FCT 闭环反馈。
+多节点 RDMA。ProbeEP 在 DeepEP 分层 token 数据面上增加跨服务器临时专家迁移和
+单进程 HTSim 内的 Dispatch FCT 闭环反馈；它不导入或调用 MoonEP builder。
+静态生成可用于 ProbeEP 结构功能测试，但不能作为有效闭环性能结果。
 
 ## 12. 硬件规格来源
 
