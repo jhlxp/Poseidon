@@ -77,27 +77,15 @@ def load_case(algorithm: str, case_dir: Path, output: Path) -> dict[str, object]
             admitted = invocation.get("admitted_migration_intents", [])
             deferred = invocation.get("deferred_migration_intents", [])
             remote_replicas = invocation.get("remote_replicas", [])
-            total_slots = invocation.get("total_expert_slots_used_by_rank", {})
-            if not total_slots:
-                home_slots = invocation.get("home_expert_slots_by_rank", [])
-                temporary_counts: dict[int, int] = {}
-                instances = invocation.get("expert_load_profile", {}).get(
-                    "after", {}
-                ).get("instances", [])
-                for instance in instances:
-                    if instance.get("kind") == "master":
-                        continue
-                    rank = int(instance["rank"])
-                    temporary_counts[rank] = temporary_counts.get(rank, 0) + 1
-                total_slots = {
-                    str(rank): int(count) + temporary_counts.get(rank, 0)
-                    for rank, count in enumerate(home_slots)
-                }
             migration_rows.append(
                 {
                     "layer": int(invocation["layer"]),
                     "micro_batch": int(invocation["micro_batch"]),
-                    "sample_id": int(invocation["sample_id"]),
+                    "invocation_index": int(
+                        invocation.get(
+                            "invocation_index", invocation.get("sample_id", 0)
+                        )
+                    ),
                     "planned_experts": len(
                         {
                             (item["expert_id"], item["destination_server"])
@@ -116,16 +104,6 @@ def load_case(algorithm: str, case_dir: Path, output: Path) -> dict[str, object]
                     ),
                     "weight_bytes": int(
                         invocation.get("remote_weight_rdma_bytes", 0)
-                    ),
-                    "peak_slots_used": max(
-                        (
-                            int(value)
-                            for value in total_slots.values()
-                        ),
-                        default=0,
-                    ),
-                    "slot_capacity": int(
-                        invocation.get("expert_slots_per_rank", 0)
                     ),
                 }
             )
@@ -171,12 +149,6 @@ def load_case(algorithm: str, case_dir: Path, output: Path) -> dict[str, object]
         "expert_weight_bytes_total": sum(
             row["weight_bytes"] for row in migration_rows
         ),
-        "peak_expert_slots_used": max(
-            (row["peak_slots_used"] for row in migration_rows), default=0
-        ),
-        "expert_slot_capacity": max(
-            (row["slot_capacity"] for row in migration_rows), default=0
-        ),
         "bundle_files": bundle_files,
     }
 
@@ -211,11 +183,10 @@ def write_algorithm_dashboard(
         migration_metric = (
             f"<span>{case['admitted_experts_total']} cross-server expert moves</span>"
             f"<span>{escape(format_bytes(int(case['expert_weight_bytes_total'])))} RDMA weights</span>"
-            f"<span>{case['peak_expert_slots_used']}/{case['expert_slot_capacity']} peak slots</span>"
         )
         table_rows = "".join(
             "<tr>"
-            f"<td>{row['sample_id']}</td>"
+            f"<td>{row['invocation_index']}</td>"
             f"<td>{row['layer']}</td>"
             f"<td>{row['micro_batch']}</td>"
             f"<td>{row['planned_experts']}</td>"
@@ -223,11 +194,10 @@ def write_algorithm_dashboard(
             f"<td>{row['deferred_experts']}</td>"
             f"<td>{row['moved_routes']}</td>"
             f"<td>{escape(format_bytes(row['weight_bytes']))}</td>"
-            f"<td>{row['peak_slots_used']}/{row['slot_capacity']}</td>"
             "</tr>"
             for row in migration_rows
         )
-        migration_module = f"""<details class="module" open><summary>Cross-server expert migration</summary><div class="module-body migration-content"><table><thead><tr><th>Sample</th><th>Layer</th><th>MB</th><th>Planned experts</th><th>Admitted experts</th><th>Deferred experts</th><th>Moved routes</th><th>RDMA weights</th><th>Peak slots</th></tr></thead><tbody>{table_rows}</tbody></table></div></details>"""
+        migration_module = f"""<details class="module" open><summary>Cross-server expert migration</summary><div class="module-body migration-content"><table><thead><tr><th>Invocation</th><th>Layer</th><th>MB</th><th>Planned experts</th><th>Admitted experts</th><th>Deferred experts</th><th>Moved routes</th><th>RDMA weights</th></tr></thead><tbody>{table_rows}</tbody></table></div></details>"""
     document = f"""<!doctype html>
 <html lang="en">
 <head>

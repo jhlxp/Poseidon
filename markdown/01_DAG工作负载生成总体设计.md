@@ -19,7 +19,9 @@ HTSim 负责：
 - 对 compute task 执行固定时长事件；
 - 输出 FCT、链路负载和 DAG makespan。
 
-两者不是零耦合，而是只通过一个稳定的输出契约耦合：rank 编号、`.dag` 字段、route 语义和时间/字节单位。生成器不能依赖 HTSim 内部的 C++ 类。
+两者不是零耦合，而是只通过一个稳定的文本契约耦合：rank 编号、`.dag`
+字段、动态 `APPEND/OBSERVE/CLOSE` 行协议、route 语义和时间/字节单位。
+生成器不能依赖 HTSim 内部的 C++ 类；静态和动态模式都只传输文本 task。
 
 ## 2. 两层架构
 
@@ -139,7 +141,7 @@ generated_workloads/<name>/
 
 | 文件 | 用途 |
 |---|---|
-| `workload.dag` | HTSim 的计算通信任务输入 |
+| `workload.dag` | 静态 HTSim 的计算通信任务输入；动态模式保存所有已 append task 的累计审计快照，最后一次 append 后即完整，不要求等待仿真结束 |
 | `nodes.cm` | `Nodes N`、`Connections 0`，满足当前 DAG CLI 契约 |
 | `manifest.json` | 完整输入、随机种子、版本、算法配置和 cost 来源 |
 | `task_map.json` | task 与 barrier 到模型 layer、kernel、通信 phase 的映射 |
@@ -289,6 +291,7 @@ compute_us_overlap = operation_flops / 839.15e12 * 1e6
 | 严格消息级服务器转发 | 已支持 | `server_forward` route |
 | 任意 task 级依赖 | 已支持 | 默认每个 task 分配独立 barrier |
 | 每 GPU compute/comm stream 顺序 | 已支持静态 lowering | 模型生成器增加 predecessor edges；HTSim 不做运行时 stream 调度 |
+| 同进程动态 DAG 追加 | ProbeEP 闭环使用 | `-dag_control`；HTSim 端整批校验后原子 append，observation 点不推进模拟时间 |
 | chunk 级流水转发 | 已支持表达 | 显式拆成多个 network task，每个 flow 完成后释放自己的 barrier |
 | 单 flow 内部流式事件 | 不支持且首版不需要 | 不监听第 N 个 packet；需要时拆 chunk flow |
 | GPU compute | 固定时长事件 | 默认 H100 理论公式，或 JSON theoretical/profiled 二选一 |

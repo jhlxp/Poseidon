@@ -13,6 +13,7 @@ from .common import (
     TokenPayloadPolicy,
     build_hierarchical_combine,
     build_hierarchical_dispatch,
+    hierarchical_token_server_pair_profile,
     plan_hierarchical_token_payloads,
 )
 
@@ -184,6 +185,11 @@ class DeepEPBuilder:
                 ),
                 "server_forward_task_count": 0,
                 "hierarchical_transfer": transfer_summary.manifest(),
+                "token_server_pair_transport": (
+                    hierarchical_token_server_pair_profile(
+                        invocation, payload_plan
+                    )
+                ),
                 "transfer_bytes_by_payload": dict(sorted(transfer_bytes.items())),
                 "created_tasks": len(created),
                 "expert_load_profile": expert_load_profile,

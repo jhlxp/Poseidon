@@ -4,6 +4,10 @@ from .transformer import (
     build_transformer_workload,
 )
 from .streams import TwoStreamScheduleResult, apply_double_buffered_two_stream_schedule
+from .incremental import (
+    IncrementalLayerResult,
+    IncrementalTransformerWorkloadBuilder,
+)
 
 __all__ = [
     "TransformerWorkloadConfig",
@@ -11,4 +15,6 @@ __all__ = [
     "build_transformer_workload",
     "TwoStreamScheduleResult",
     "apply_double_buffered_two_stream_schedule",
+    "IncrementalLayerResult",
+    "IncrementalTransformerWorkloadBuilder",
 ]

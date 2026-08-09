@@ -310,9 +310,24 @@ def apply_double_buffered_two_stream_schedule(
         for layer in layer_ids:
             for micro_batch in pair:
                 phases = transfer_phases[(micro_batch, layer)]
-                for phase_name in ("prefetch", "dispatch"):
-                    if phases[phase_name]:
-                        phase_order.append((phase_name, phases[phase_name]))
+                weight_dispatch = phases["prefetch"] + phases["dispatch"]
+                is_probeep = any(
+                    task.metadata.get("algorithm") == "probeep"
+                    for task in weight_dispatch
+                )
+                if is_probeep and weight_dispatch:
+                    phase_order.append(("weight_dispatch", weight_dispatch))
+                    stage_id = f"mb{micro_batch}.weight_dispatch"
+                    if len(layer_ids) > 1:
+                        stage_id = (
+                            f"mb{micro_batch}.layer{layer}.weight_dispatch"
+                        )
+                    for task in weight_dispatch:
+                        task.metadata["communication_stage_id"] = stage_id
+                else:
+                    for phase_name in ("prefetch", "dispatch"):
+                        if phases[phase_name]:
+                            phase_order.append((phase_name, phases[phase_name]))
             for micro_batch in pair:
                 phases = transfer_phases[(micro_batch, layer)]
                 if phases["combine"]:

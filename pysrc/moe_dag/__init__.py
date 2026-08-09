@@ -5,6 +5,11 @@ from .cost import (
     JsonComputeCostModel,
 )
 from .emitter import EmissionResult, emit_workload
+from .dynamic import (
+    DynamicDagBatch,
+    DynamicDagEmitter,
+    probeep_weight_dispatch_observations,
+)
 from .graph import Task, TaskGraph
 from .gate import (
     BalancedPermutedGateProvider,
@@ -27,6 +32,8 @@ from .schema import (
 __all__ = [
     "ComputeEstimate",
     "ComputeCostModel",
+    "DynamicDagBatch",
+    "DynamicDagEmitter",
     "EmissionResult",
     "H100CostModel",
     "JsonComputeCostModel",
@@ -47,4 +54,5 @@ __all__ = [
     "emit_workload",
     "make_contiguous_expert_placement",
     "make_uniform_assignments",
+    "probeep_weight_dispatch_observations",
 ]

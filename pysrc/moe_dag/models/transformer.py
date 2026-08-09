@@ -38,14 +38,12 @@ class TransformerWorkloadConfig:
     token_padding: int = 128
     probeep_route_chunk_tokens: int = 0
     probeep_weight_chunk_bytes: int = 4 * 1024 * 1024
-    probeep_max_remote_replicas: int = 64
-    probeep_expert_slots_per_rank: int = 40
     probeep_initial_nic_budget_bytes: int = 16 * 1024 * 1024
-    probeep_min_nic_budget_bytes: int = 0
-    probeep_max_nic_budget_bytes: int = 128 * 1024 * 1024
-    probeep_multiplicative_decrease: float = 0.9
-    probeep_additive_increase_bytes: int = 1024 * 1024
-    probeep_deadband_ratio: float = 0.05
+    probeep_nic_line_rate_gbps: float = 400.0
+    probeep_target_overlap_ratio: float = 0.90
+    probeep_nic_budget_by_dispatch: dict[
+        tuple[int, int], tuple[int, ...]
+    ] | None = None
     eplb_num_physical_experts: int = 0
     eplb_num_groups: int = 0
     eplb_estimated_loads: tuple[float, ...] | None = None
@@ -70,14 +68,26 @@ class TransformerWorkloadConfig:
             )
         if self.probeep_weight_chunk_bytes <= 0:
             raise ValidationError("probeep_weight_chunk_bytes must be positive")
-        if self.probeep_max_remote_replicas < 0:
-            raise ValidationError(
-                "probeep_max_remote_replicas must be non-negative"
-            )
-        if self.probeep_expert_slots_per_rank <= 0:
-            raise ValidationError(
-                "probeep_expert_slots_per_rank must be positive"
-            )
+        if self.probeep_nic_budget_by_dispatch is not None:
+            for scope, budgets in self.probeep_nic_budget_by_dispatch.items():
+                if (
+                    len(scope) != 2
+                    or scope[0] < 0
+                    or scope[0] >= self.model.micro_batches
+                    or scope[1] < 0
+                    or scope[1] >= self.model.num_layers
+                ):
+                    raise ValidationError(
+                        "ProbeEP Dispatch budget override has an invalid scope"
+                    )
+                if len(budgets) != self.placement.num_ranks:
+                    raise ValidationError(
+                        "ProbeEP budget override length must equal num_ranks"
+                    )
+                if any(value < 0 for value in budgets):
+                    raise ValidationError(
+                        "ProbeEP budget overrides must be non-negative"
+                    )
         if self.eplb_num_physical_experts < 0:
             raise ValidationError("eplb_num_physical_experts must be non-negative")
         if self.eplb_num_groups < 0:
@@ -155,29 +165,22 @@ def build_transformer_workload(
         algorithm_builder = ProbeEPBuilder(
             cost,
             ProbeEPConfig(
-                expert_slots_per_rank=(
-                    config.probeep_expert_slots_per_rank
-                ),
                 token_padding=config.token_padding,
                 chunk_tokens=config.chunk_tokens,
                 route_chunk_tokens=(
                     config.probeep_route_chunk_tokens or config.chunk_tokens
                 ),
                 weight_chunk_bytes=config.probeep_weight_chunk_bytes,
-                max_remote_replicas=config.probeep_max_remote_replicas,
                 nic_controller=ProbeNICControllerConfig(
                     initial_budget_bytes=(
                         config.probeep_initial_nic_budget_bytes
                     ),
-                    min_budget_bytes=config.probeep_min_nic_budget_bytes,
-                    max_budget_bytes=config.probeep_max_nic_budget_bytes,
-                    multiplicative_decrease=(
-                        config.probeep_multiplicative_decrease
+                    nic_line_rate_gbps=(
+                        config.probeep_nic_line_rate_gbps
                     ),
-                    additive_increase_bytes=(
-                        config.probeep_additive_increase_bytes
+                    target_overlap_ratio=(
+                        config.probeep_target_overlap_ratio
                     ),
-                    deadband_ratio=config.probeep_deadband_ratio,
                 ),
             ),
         )
@@ -190,6 +193,16 @@ def build_transformer_workload(
     algorithm_results: list[AlgorithmBuildResult] = []
     algorithm_metadata: list[dict[str, object]] = []
     microbatch_task_keys: list[tuple[str, ...]] = []
+    probeep_attention_reference = tuple(
+        cost.estimate(
+            _attention_flops(config.tokens_per_rank, config.model),
+            operation="attention",
+            overlaps_communication=True,
+            token_count=config.tokens_per_rank,
+        ).duration_us
+        for _ in range(config.placement.num_ranks)
+    )
+    probeep_moe_reference: dict[tuple[int, int], tuple[float, ...]] = {}
     for micro_batch in range(config.model.micro_batches):
         before_microbatch = len(graph.tasks)
         previous_rank_terminals: dict[int, frozenset[str]] = {}
@@ -262,9 +275,46 @@ def build_transformer_workload(
                 weight_dtype=config.weight_dtype,
                 assignments=gate_sample.assignments,
             )
-            algorithm_result = algorithm_builder.build(
-                graph, invocation, entry_keys=router_keys
-            )
+            if isinstance(algorithm_builder, ProbeEPBuilder):
+                pair_start = micro_batch - micro_batch % 2
+                # MB0 Weight+Dispatch overlaps MB1 Attention; MB1
+                # Weight+Dispatch overlaps MB0 Expert FFN. Combine is
+                # telemetry only and never enters ProbeEP admission control.
+                dispatch_overlap_kind = (
+                    "attention" if micro_batch % 2 == 0 else "moe"
+                )
+                moe_reference = probeep_moe_reference.get(
+                    (pair_start, layer)
+                )
+                algorithm_result = algorithm_builder.build(
+                    graph,
+                    invocation,
+                    entry_keys=router_keys,
+                    dispatch_overlap_compute_kind=dispatch_overlap_kind,
+                    attention_compute_us_by_rank=(
+                        probeep_attention_reference
+                    ),
+                    moe_compute_us_by_rank=moe_reference,
+                    nic_budget_override=(
+                        config.probeep_nic_budget_by_dispatch.get(
+                            (micro_batch, layer)
+                        )
+                        if config.probeep_nic_budget_by_dispatch is not None
+                        else None
+                    ),
+                )
+                if micro_batch % 2 == 0:
+                    final_compute = algorithm_result.metadata[
+                        "final_compute_us_by_rank"
+                    ]
+                    probeep_moe_reference[(pair_start, layer)] = tuple(
+                        float(final_compute[rank])
+                        for rank in range(config.placement.num_ranks)
+                    )
+            else:
+                algorithm_result = algorithm_builder.build(
+                    graph, invocation, entry_keys=router_keys
+                )
             for task in graph.tasks[before_layer:]:
                 task.metadata["micro_batch"] = micro_batch
                 task.metadata["layer"] = layer
@@ -310,46 +360,7 @@ def build_transformer_workload(
         },
         "tokens_per_rank": config.tokens_per_rank,
         "chunk_tokens": config.chunk_tokens,
-        "replicas_per_rank": config.replicas_per_rank,
         "token_padding": config.token_padding,
-        "probeep": {
-            "route_chunk_tokens": (
-                config.probeep_route_chunk_tokens or config.chunk_tokens
-            ),
-            "weight_chunk_bytes": config.probeep_weight_chunk_bytes,
-            "max_remote_replicas": config.probeep_max_remote_replicas,
-            "expert_slots_per_rank": (
-                config.probeep_expert_slots_per_rank
-            ),
-            "initial_nic_budget_bytes": (
-                config.probeep_initial_nic_budget_bytes
-            ),
-            "min_nic_budget_bytes": config.probeep_min_nic_budget_bytes,
-            "max_nic_budget_bytes": config.probeep_max_nic_budget_bytes,
-            "multiplicative_decrease": (
-                config.probeep_multiplicative_decrease
-            ),
-            "additive_increase_bytes": (
-                config.probeep_additive_increase_bytes
-            ),
-            "deadband_ratio": config.probeep_deadband_ratio,
-        },
-        "eplb": {
-            "num_physical_experts_requested": config.eplb_num_physical_experts,
-            "num_groups_requested": config.eplb_num_groups,
-            "load_source": config.eplb_load_source,
-            "estimated_loads": config.eplb_estimated_loads,
-            "effective_num_physical_experts": (
-                algorithm_results[0].metadata["num_physical_experts"]
-                if config.algorithm == "eplb"
-                else None
-            ),
-            "effective_num_groups": (
-                algorithm_results[0].metadata["num_groups"]
-                if config.algorithm == "eplb"
-                else None
-            ),
-        },
         "dtypes": {
             "dispatch": config.dispatch_dtype,
             "combine": config.combine_dtype,
@@ -375,4 +386,39 @@ def build_transformer_workload(
         },
         "micro_batch_algorithms": algorithm_metadata,
     }
+    if config.algorithm == "moonep":
+        metadata["replicas_per_rank"] = config.replicas_per_rank
+    if config.algorithm == "probeep":
+        metadata["probeep"] = {
+            "route_chunk_tokens": (
+                config.probeep_route_chunk_tokens or config.chunk_tokens
+            ),
+            "weight_chunk_bytes": config.probeep_weight_chunk_bytes,
+            "initial_nic_budget_bytes": (
+                config.probeep_initial_nic_budget_bytes
+            ),
+            "nic_line_rate_gbps": config.probeep_nic_line_rate_gbps,
+            "target_overlap_ratio": (
+                config.probeep_target_overlap_ratio
+            ),
+            "budget_override_dispatches": (
+                sorted(
+                    f"mb{scope[0]}.layer{scope[1]}"
+                    for scope in config.probeep_nic_budget_by_dispatch
+                )
+                if config.probeep_nic_budget_by_dispatch is not None
+                else []
+            ),
+        }
+    if config.algorithm == "eplb":
+        metadata["eplb"] = {
+            "num_physical_experts_requested": config.eplb_num_physical_experts,
+            "num_groups_requested": config.eplb_num_groups,
+            "load_source": config.eplb_load_source,
+            "estimated_loads": config.eplb_estimated_loads,
+            "effective_num_physical_experts": algorithm_results[0].metadata[
+                "num_physical_experts"
+            ],
+            "effective_num_groups": algorithm_results[0].metadata["num_groups"],
+        }
     return WorkloadBuildResult(graph, metadata, tuple(algorithm_results))

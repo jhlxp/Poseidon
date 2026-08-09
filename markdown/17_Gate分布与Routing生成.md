@@ -11,7 +11,7 @@ Gate（也称 MoE Router）决定每个 source token 选择哪些逻辑专家。
 ```
 
 输出必须能被 `MoEInvocation.assignments` 直接消费，并在 NCCL、DeepEP、
-EPLB 和 MoonEP 之间共享。算法可以改变 token 最终在哪个物理副本上
+EPLB、MoonEP 和 ProbeEP 之间共享。算法可以改变 token 最终在哪个物理副本上
 执行，但不得改变 Gate 已经选中的逻辑专家。
 
 本文档同时描述当前已经实现的数据语义、生成模式、可视化和验证契约。
@@ -98,7 +98,7 @@ realized_server_loads
 3. `expert_id` 在 `[0, E)` 内，不出现 physical replica slot ID。
 4. 每个 source rank 的 token 数与模型输入完全一致。
 5. 同一 seed 和配置必须产生完全一致的 assignments。
-6. 四个 MoE 算法在同一实验中必须复用同一份 GateSample，不得
+6. 五个 MoE 算法在同一实验中必须复用同一份 GateSample，不得
    分别采样。
 
 ## 5. Provider 模式
@@ -188,6 +188,10 @@ routing_fidelity = quota_matched_global_receive_histogram
 ```
 
 它保留每层逻辑专家的热度形状，但不是原始逐 token routing trace。
+同一个 raw layer 的不同 microbatch 使用相同的整数 expert quota，因此 realized
+logical-expert/rank/server histogram 可以完全相同；`microbatch_id` 会进入稳定随机种子，
+所以 token-to-expert assignment 和 `assignment_digest_sha256` 必须不同。这不是重复使用
+同一份 token trace。五算法对同一个 `(layer,microbatch)` 则必须得到完全相同的 digest。
 
 ## 6. `raw_data` 实际格式
 
@@ -394,7 +398,9 @@ after  = 当前算法选中的 physical expert instance / execution rank
 `before` 和 `after` 都记录 instance、logical expert、rank、server 的负载及
 `max/mean`。两者必须保持相同的 `total_routes` 和 `logical_expert_loads`；算法
 只允许改变执行位置和实例分流，不允许偷偷改变 Gate 结果。NCCL/DeepEP 没有
-专家副本重排，所以 before 和 after 相同；EPLB/MoonEP 才可能不同。
+专家副本重排，所以同一 invocation 的 before 和 after 相同；EPLB、MoonEP 和 ProbeEP
+可能通过 replica/execution placement 改变 after rank/server load，但不得改变 logical
+Gate histogram。
 
 ### 10.1 UltraEP profiler 与本项目的对应关系
 
@@ -431,10 +437,43 @@ gate_load/
 └── gate_load_profile_summary.json
 ```
 
-HTML 可选择 layer/microbatch，使用相同的 load 横轴并排显示 before/after 的
-32 个 rank；每个 rank 内按 logical expert 分段。下方另画 Gate logical-expert
-分布，并提供按 state/rank 筛选的 expert-instance 明细。该模块也会进入五算法
-可视化 ZIP，服务器 run 目录在 ZIP 校验成功后不保留散装 HTML。
+HTML 只选择 microbatch，不再单独选择 layer。对所选 MB 使用同一 load 横轴比较：
+
+```text
+Before = 第一层 raw Gate assignments 的 baseline placement
+After  = 最后一层经过 NIC budget admission 后真正进入 DAG 的 execution placement
+```
+
+因此 `After` 不是无网络约束的 planned placement，也不是第一层算法结果。标题必须
+直接标注首层/末层的 one-based layer 和内部 `layer_id`。页面先画每服务器 8 rank
+聚合负载及均值，再画 32 个 rank；每个 bar 内按 logical expert 分段。Gate 输入区域
+分别显示第一层和最后一层的 raw logical-expert histogram，它只说明输入偏斜，不代表
+after execution placement。实例明细的 Before/After 同样绑定首层 raw/末层 admitted。
+
+manifest 和 CSV/JSON 仍逐 `(layer,microbatch)` 保存各层自己的 profile；跨层比较只是
+HTML 展示口径，不覆盖或删除中间层数据。该模块会进入可视化 ZIP，服务器 run 目录
+在 ZIP 校验成功后不保留散装 HTML。
+
+页面的 migration intents planned/admitted/deferred、before/planned/admitted server
+padded routes、remote copies 和所有通信负载统一取该 MB 的最后一层，表示本次有限层数
+实验中最接近收敛的状态，不把不同层的迁移或 bytes 累加到一起。
+
+HTML 同时提供三个跨服务器区域：
+
+1. `Cross-server expert copies`：所选 microbatch 最后一层实际接纳的 remote
+   replica 数、distinct expert 数、expert IDs、完整权重字节和活跃 server-pair 数。
+2. `Directed server-pair load`：只取最后一层，以物理 `src_server -> dst_server` 为行画横向堆叠
+   柱状图，Dispatch、Combine 和 Expert Weight 使用三种独立颜色，共享字节横轴。
+   折叠明细表继续保留 token payloads、top-k expert routes、expert copies、moved
+   routes、expert IDs 和该方向的 TX/RX 总字节。
+3. `Per-NIC directed load`：只取最后一层，在每个有向 server pair 内按 rail/NIC 画同口径横向
+   堆叠柱状图，标签显式写出 source/destination server、NIC 和 rank。折叠明细表
+   保留 token payloads/routes/bytes、expert weight chunks/bytes 和经过该 NIC 的 expert IDs。
+
+`remote_replica_count` 只按完整 remote replica 计数；一个 expert 拆成 21 个权重
+chunks 仍是 1 个 copy。NIC 表的 `expert_weight_chunks` 只表示该 NIC 承载的分片数。
+`Dispatch tokens` 是 DeepEP 去冗余后真正走 fabric 的 payload 数；`Dispatch routes`
+保留 top-k multiplicity。Combine 按实际反向计入对应的有向 pair。
 
 ## 11. 验证和功能测试
 
@@ -457,6 +496,9 @@ python3 tests/run_gate_workload_visualization.py
 9. NCCL logical route 总数不变，DeepEP unique rank/server payload 随分布正确变化。
 10. 错误 layer 数、CSV 列数、负数 count、越界 expert ID 和少于 K 个正权重
     expert 必须显式失败。
+11. ProbeEP remote copy/weight bytes 必须与 manifest 守恒；所有有向 server-pair
+    的 Dispatch/Combine bytes 必须分别等于 hierarchy fabric bytes，每个 pair 下的
+    per-NIC token/weight bytes 必须反向求和回 pair。
 
 ## 12. 明确不建模的内容
 
@@ -487,5 +529,5 @@ GateProvider -> GateSample
 不会静默放宽算法约束，可通过 `--moonep-replicas-per-rank` 显式给出容量。当前
 raw layer 0/1 的 2-token smoke、seed 17 下，MoonEP 需要显式给足临时 replica 容量；
 相同 layer/seed 的 4096tpr MoonEP quota 曾使用 14 temporary replicas/rank。ProbeEP
-采用不同口径：`expert_slots_per_rank=40` 是 8 home + 最多 32 temporary 的总容量。
-当前 ProbeEP 实验假设显存充足，不用人为 slot cap 限制迁移。
+采用不同口径：当前实验不建模显存容量和 replica-count admission，也不提供虚假 slot
+参数。是否接纳跨机 expert 只取决于逐 NIC 动态迁移字节预算。

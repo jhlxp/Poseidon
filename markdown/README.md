@@ -132,8 +132,9 @@ python3 visualization/gate_load_profile.py \
   --output-dir <case-dir>/gate_load
 ```
 
-页面按 layer/microbatch 对比 baseline placement 与算法 execution placement 的
-rank/expert-instance load；分布语义和 provider 配置见
+页面以 microbatch 为选择单位：Before 固定画第一层 raw Gate baseline，After 固定画
+最后一层 admitted execution placement；专家迁移数量、server-pair 和 per-NIC 链路负载
+也只取最后一层，表示当前实验最接近收敛的状态。分布语义和 provider 配置见
 [17_Gate分布与Routing生成.md](17_Gate分布与Routing生成.md)。
 
 ## 运行 DSV3 两层五算法案例
@@ -154,3 +155,28 @@ before-after、GPU 0-31 完整可缩放 timeline 和 MpRail 链路负载图；�
 HTML，其他产物仍保留。参数、边界和验收条件见
 [14_专用测试拓扑-EP32-1Plane.md](14_专用测试拓扑-EP32-1Plane.md)，计算时间选择见
 [16_计算时间JSON配置.md](16_计算时间JSON配置.md)。
+
+ProbeEP ratio controller 的 2-layer 单进程动态 DAG 实验使用：
+
+```bash
+# 日常功能回归：2 tokens/rank
+python3 tests/run_probeep_2layer_ratio_full.py --gate-layer-map 0,1
+
+# 明确运行完整实验时：4096 tokens/rank
+python3 tests/run_probeep_2layer_ratio_full.py \
+  --full --gate-layer-map 0,1 \
+  --compute-config pysrc/compute_profiles/H20_DSV3_EP32_compute_4096tpr.json
+```
+
+该入口固定为 EP32、1 plane、400 Gbps/NIC、raw receive layers 0-1，只运行
+ProbeEP。它在同一 HTSim PID 内观测 `Weight+Dispatch` FCT、更新 0.90 目标
+预算并追加下一层 DAG，不使用 baseline/replay。预算更新使用全局
+`alpha*Cmax/Nmax` 缩放瓶颈 NIC 实际 Token+Weight 总字节，以
+`Cmax*400Gbps` 封顶，再扣除不可裁剪的 token Dispatch baseline；controller 只限制
+Expert Weight migration。完整实验默认读取
+`H20_DSV3_EP32_compute_4096tpr.json`；H100 只在显式传入对应 profile 时使用。
+`probeep_2layer_dynamic_visualization.zip` 保留 GPU 0-31 全部 timeline lanes、Gate、
+链路负载、4 个 Dispatch control observations 和 4 个 Combine telemetry 汇总；
+服务器目录不保留散装 HTML。专项入口会拒绝 A/M state-chain 串线或同 source rail 上
+Dispatch TX 早于 remote Weight RDMA TX 的结果，并分别报告 remote RDMA 与 local NVLink
+expert weight。

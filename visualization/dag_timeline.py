@@ -53,6 +53,13 @@ EXPERT_WEIGHT_PAYLOADS = frozenset(
         "expert_weight_gather",
     }
 )
+COMPUTE_MILESTONE_OPERATIONS = frozenset(
+    {
+        "router_projection",
+        "combine_reduce",
+        "combine_final_reduce",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -616,6 +623,7 @@ def write_html(
     lane_codes = {lane: index for index, lane in enumerate(LANES)}
     svg_height = top_height + len(rows) * row_height + 18
     x_scale = timeline_width / max(makespan, 1e-12)
+    marker_parts: list[str] = []
     svg_parts = [
         f"<svg class='timeline-svg' xmlns='http://www.w3.org/2000/svg' "
         f"width='{timeline_width:.3f}' "
@@ -632,20 +640,33 @@ def write_html(
             )
         for event in _lane_events(events, rank, lane):
             x = event.start_us * x_scale
-            width = max(event.actual_duration_us * x_scale, 1.2)
+            width = event.actual_duration_us * x_scale
             svg_parts.append(
-                f"<rect class='task' data-task-id='{event.task.task_id}' "
+                f"<rect class='task task-bar' data-task-id='{event.task.task_id}' "
                 f"data-lane='{lane_codes[lane]}' "
-                f"x='{x:.3f}' y='{y + 3}' width='{width:.3f}' "
+                f"x='{x:.6f}' y='{y + 3}' width='{width:.6f}' "
                 f"height='{row_height - 6}' rx='1.5' fill='{_task_color(event.task)}' "
                 "fill-opacity='0.86' stroke='#FFFFFF' stroke-width='0.35'/>"
             )
+            if (
+                lane == "Compute"
+                and event.task.operation in COMPUTE_MILESTONE_OPERATIONS
+            ):
+                marker_parts.append(
+                    f"<line class='task-marker' data-task-id='{event.task.task_id}' "
+                    f"x1='{x:.6f}' x2='{x:.6f}' y1='{y + 2}' "
+                    f"y2='{y + row_height - 2}' stroke='{_task_color(event.task)}' "
+                    "stroke-width='1.1' pointer-events='none'/>"
+                )
         if lane == "Network RX":
             svg_parts.append(
                 f"<line class='row-separator' x1='0' y1='{y + row_height}' "
                 f"x2='{timeline_width:.3f}' "
                 f"y2='{y + row_height}' stroke='#9AA5B1' stroke-width='0.8'/>"
             )
+    # Milestone lines are drawn after all bars so zero-gap successors cannot
+    # visually cover short Router/Reduce tasks in the fit-to-window view.
+    svg_parts.extend(marker_parts)
     svg_parts.append("</svg>")
 
     labels = [f"<div class='label-spacer'></div>"]
@@ -723,6 +744,7 @@ h1 {{ margin: 0 0 5px; font-size: 22px; font-weight: 650; }}
 .viewport {{ overflow: auto; }}
 .task:hover {{ fill-opacity: 1; stroke: #111827; stroke-width: 1; }}
 .task.selected {{ fill-opacity: 1; stroke: #111827; stroke-width: 1.4; }}
+.task-marker {{ shape-rendering: crispEdges; }}
 .hover-tooltip {{ position: fixed; z-index: 20; max-width: 440px; padding: 8px 10px; border: 1px solid #9DA8B5; background: #FFFFFF; box-shadow: 0 4px 14px rgba(23, 33, 43, 0.16); pointer-events: none; font-size: 11px; line-height: 1.45; }}
 .hover-tooltip strong {{ display: block; margin-bottom: 4px; overflow-wrap: anywhere; }}
 .hover-tooltip span {{ display: block; color: #4F5D6B; }}
@@ -813,6 +835,12 @@ td.key {{ max-width: 420px; overflow: hidden; text-overflow: ellipsis; }}
     return row[I.kind] === 'c' ? row[I.operation] : row[I.payload_kind];
   }}
 
+  function scope(row) {{
+    const match = /^mb(\\d+)\\.layer(\\d+)\\./.exec(row[I.key]);
+    if (!match) return '';
+    return `Layer ${{Number(match[2]) + 1}} (id ${{match[2]}}) · MB ${{match[1]}}`;
+  }}
+
   function formatBytes(value) {{
     let amount = Number(value);
     const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
@@ -825,6 +853,7 @@ td.key {{ max-width: 420px; overflow: hidden; text-overflow: ellipsis; }}
     const lines = [
       `<strong>Task ${{row[I.task_id]}}: ${{escapeHtml(row[I.key])}}</strong>`,
       `<span>${{escapeHtml(lane)}} · ${{number(row[I.start_us])}}-${{number(row[I.end_us])}} us · FCT ${{number(row[I.actual_duration_us])}} us</span>`,
+      ...(scope(row) ? [`<span>${{escapeHtml(scope(row))}}</span>`] : []),
       `<span>${{escapeHtml(endpoint(row))}} · ${{escapeHtml(category(row) || kind(row))}} · predecessors ${{row[I.predecessor_count]}}</span>`,
     ];
     if (row[I.kind] === 'n') lines.push(`<span>${{formatBytes(row[I.transfer_bytes])}} · ${{number(row[I.logical_throughput_gbps])}} Gbps</span>`);
@@ -836,6 +865,7 @@ td.key {{ max-width: 420px; overflow: hidden; text-overflow: ellipsis; }}
       ['Lane', lane],
       ['Kind', kind(row)],
       ['Endpoint', endpoint(row)],
+      ['Scope', scope(row)],
       ['Category', category(row) || ''],
       ['Start', `${{number(row[I.start_us])}} us`],
       ['End', `${{number(row[I.end_us])}} us`],
@@ -940,10 +970,16 @@ td.key {{ max-width: 420px; overflow: hidden; text-overflow: ellipsis; }}
     svg.setAttribute('viewBox', `0 0 ${{width}} ${{svgHeight}}`);
     svg.querySelectorAll('.row-background').forEach(item => item.setAttribute('width', String(width)));
     svg.querySelectorAll('.row-separator').forEach(item => item.setAttribute('x2', String(width)));
-    svg.querySelectorAll('.task').forEach(item => {{
+    svg.querySelectorAll('.task-bar').forEach(item => {{
       const row = tasks.get(Number(item.dataset.taskId));
       item.setAttribute('x', String(row[I.start_us] * scale));
-      item.setAttribute('width', String(Math.max(row[I.actual_duration_us] * scale, 1.2)));
+      item.setAttribute('width', String(row[I.actual_duration_us] * scale));
+    }});
+    svg.querySelectorAll('.task-marker').forEach(item => {{
+      const row = tasks.get(Number(item.dataset.taskId));
+      const x = row[I.start_us] * scale;
+      item.setAttribute('x1', String(x));
+      item.setAttribute('x2', String(x));
     }});
     drawRuler(width);
     readout.value = `100 px = ${{(100 / scale).toPrecision(6)}} us · visible ${{(viewport.clientWidth / scale).toPrecision(6)}} us · total ${{makespan.toPrecision(7)}} us`;
@@ -1035,6 +1071,18 @@ def write_overview_json(
     for event in network_events:
         key = event.task.payload_kind or "transfer"
         payload_fct[key] = payload_fct.get(key, 0.0) + event.actual_duration_us
+    expert_weight_logical_leg_bytes = sum(
+        event.task.transfer_bytes for event in expert_weight_events
+    )
+    expert_weight_rdma_bytes = payload_bytes.get("expert_weight_rdma", 0)
+    expert_weight_local_bytes = sum(
+        payload_bytes.get(payload, 0)
+        for payload in (
+            "expert_weight_scatter",
+            "expert_weight_gather",
+            "expert_weight_prefetch",
+        )
+    )
     selected = [summaries[rank] for rank in selected_ranks]
     payload = {
         "format_version": 1,
@@ -1046,9 +1094,12 @@ def write_overview_json(
         "task_count": len(events),
         "compute_task_count": len(compute_events),
         "expert_weight_task_count": len(expert_weight_events),
-        "expert_weight_bytes": sum(
-            event.task.transfer_bytes for event in expert_weight_events
-        ),
+        # Backward-compatible alias. This is the sum of logical task legs,
+        # not the amount of expert weight sent over RDMA.
+        "expert_weight_bytes": expert_weight_logical_leg_bytes,
+        "expert_weight_logical_leg_bytes": expert_weight_logical_leg_bytes,
+        "expert_weight_rdma_bytes": expert_weight_rdma_bytes,
+        "expert_weight_local_bytes": expert_weight_local_bytes,
         "expert_weight_active_us": _interval_duration(
             _merge_intervals(
                 (event.start_us, event.end_us)
@@ -1088,6 +1139,10 @@ def write_overview_json(
             "logical_throughput": "transfer_bytes divided by logical task FCT",
             "rank_network_activity": "union of logical transfers touching rank as src or dst",
             "overlap": "intersection of per-rank compute and network interval unions",
+            "expert_weight_bytes": (
+                "sum of scatter/RDMA/gather/prefetch logical task legs; "
+                "use expert_weight_rdma_bytes for scale-out migration"
+            ),
             "resource_model_warning": (
                 "timeline shows DAG concurrency; HTSim does not dynamically schedule GPU SMs"
             ),

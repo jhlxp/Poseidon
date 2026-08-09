@@ -243,7 +243,77 @@ compute task 中相等的 `src_rank`/`dst_rank` 用于校验和记录计算归�
 
 同一逻辑通信 phase 拆出的多条 flow 或 chunk 共享一次 20 SM 预留。这个归属记录在 manifest/task map 中，不增加 `.dag` 字段，HTSim 也不做动态 SM 恢复。
 
-## 7. 失败条件
+## 7. 单 HTSim 进程的动态 DAG
+
+ProbeEP 需要用已完成 `Weight+Dispatch` 的真实 FCT 决定后续层。
+这不是先跑 baseline 再重放，而是同一个 HTSim PID 内的增量执行：
+
+```text
+Python controller                         HTSim
+       |                                   |
+       | APPEND first body + observations  |
+       |---------------------------------->|
+       |                                   | execute current DAG fragment
+       |  OBSERVATION_READY(id, sim_time)  |
+       |<----------------------------------|
+       | update controller state           | simulated time is unchanged
+       | APPEND next fragment / CONTINUE   |
+       |---------------------------------->|
+       |                  ...              |
+       | CLOSE                             |
+       |---------------------------------->|
+       |                                   | drain all accepted tasks
+       |            DAG_SUMMARY            |
+```
+
+`-dag_control` 使用标准输入/输出的行协议。空 `.cm` 仍然通过 `-tm`
+提供 rank 数，不允许 controller 与 connection matrix 共用标准输入。一个提交为：
+
+```text
+DAG_APPEND_BEGIN batch0
+DAG_TASK 1 0 | 0 0 | 0 10 | -
+DAG_TASK 2 1 | 0 8 | 1048576 0 | 0
+DAG_OBSERVE 0 | 1
+DAG_APPEND_END batch0
+```
+
+控制响应只有三种：
+
+- `DAG_APPEND_BEGIN ... DAG_APPEND_END`：原子追加一批 task/barrier/observation；
+- `DAG_CONTINUE`：本次 observation 只更新控制器，暂不追加 task；
+- `DAG_CLOSE`：不再追加，已接受任务全部完成后输出唯一的 `DAG_SUMMARY`。
+
+`DAG_OBSERVE observation_id | predecessor_barriers...` 是控制观测点，不是
+task，不占用 compute/network 资源，也不增加仿真时间。它在所列
+barrier 全部完成后触发。HTSim 输出
+`DAG_OBSERVATION_READY observation=<id> time_us=<t>` 并同步等待一个控制
+响应；Python 的 wall-clock planner 时间不计入模拟时间。
+
+每个 append batch 必须满足：
+
+- batch ID、task ID、barrier ID 和 observation ID 在整个进程内唯一；
+- 新 barrier 只能依赖已存在 barrier 或同一 batch 的新 barrier；
+- 不能向已存在/已启动 barrier 追加 task，不能回写已提交 task 的前驱；
+- batch 内 barrier 子图必须无环；已完成前驱在提交时直接视为满足；
+- HTSim manager 在修改内部 DAG 前校验整个 batch；失败时不得留下半批任务；
+- Python emitter 本地校验失败时，不得消耗 task/barrier ID 或改写累计
+  `workload.dag`/`dynamic_batches.json` 快照。
+
+Python 与 HTSim 之间没有分布式 commit/rollback 协议。若 Python 已发出的 batch
+被 HTSim 的拓扑/路由校验拒绝，该仿真立即失败；发送侧累计快照保留作为失败
+现场，不能当作 HTSim 已接受 DAG。正常完成的实验必须同时校验每个 batch 的
+`DAG_APPEND_ACK`。
+
+动态 DAG 仍然只是动态追加任务和依赖。已启动的 UEC flow、queue、CC
+状态、MpRail 路由和 EventList 都保留在同一进程内，不重置模拟时钟。
+
+动态模式下，HTSim 的任务输入来自标准输入协议，不会读取或重新读取
+`workload.dag`。Python emitter 每次接受一个 append batch 时，同步把该批任务追加到
+`workload.dag` 审计快照；最后一个 batch 提交后，这个快照已经包含完整任务图，即使
+HTSim 仍在排空尚未完成的任务。进程退出后只会补齐/固化 `task_map.json`、
+`manifest.json` 等结果元数据，不会再生成一套不同的 DAG，也不会启动第二次 HTSim。
+
+## 8. 失败条件
 
 以下输入必须在仿真开始前失败：
 
@@ -258,5 +328,8 @@ compute task 中相等的 `src_rank`/`dst_rank` 用于校验和记录计算归�
 - 同一 barrier 的 task 声明不同前驱；
 - 前驱 barrier 不存在；
 - barrier 图存在环。
+- append 批次名为空、重复、首尾不匹配或控制命令不完整；
+- 动态模式在 `DAG_CLOSE` 前耗尽事件；
+- observation 引用不存在的 barrier 或重复 observation ID。
 
 事件循环结束时 DAG 尚未完成也必须返回失败。

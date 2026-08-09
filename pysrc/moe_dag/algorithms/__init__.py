@@ -17,12 +17,12 @@ from .moonep import MoonEPBuilder, MoonEPConfig, MoonEPPlan
 from .nccl import NCCLBuilder, NCCLConfig
 from .probeep import (
     ProbeControllerUpdate,
+    ProbeDispatchFeedback,
     ProbeEPBuilder,
     ProbeEPConfig,
     ProbeEPPlan,
     ProbeNICController,
     ProbeNICControllerConfig,
-    ProbeSampleFeedback,
 )
 
 __all__ = [
@@ -45,7 +45,7 @@ __all__ = [
     "ProbeEPPlan",
     "ProbeNICController",
     "ProbeNICControllerConfig",
-    "ProbeSampleFeedback",
+    "ProbeDispatchFeedback",
     "ProbeControllerUpdate",
     "destination_forward_route",
     "plan_token_payloads",

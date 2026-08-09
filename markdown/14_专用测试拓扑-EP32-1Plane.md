@@ -145,10 +145,10 @@ layer 1。这里是测试内逻辑编号，不是官方模型的物理层号。
 | 算法 | NCCL、DeepEP、EPLB、MoonEP、ProbeEP |
 | 功能回归 | 2 tokens/rank/microbatch，chunk 32 |
 | 完整测试 | 4096 tokens/rank/microbatch，chunk 4096 |
-| 完整测试 compute config | `pysrc/compute_profiles/H100_DSV3_EP32_compute_4096tpr.json` |
+| 完整测试 compute config | H100/H20 schema-v2 profile 显式二选一，默认 H20 |
 | ProbeEP migration planning | 离线生成决策，不进入 DAG；论文单独分析复杂度/实现开销 |
 | ProbeEP CPU runtime task | 0；`cpu_task_count=0`、`cpu_streams_global=0` |
-| ProbeEP expert slots | 40/rank 总槽位 = 8 home + 最多 32 temporary |
+| ProbeEP memory/slot admission | 关闭；ProbeEP 配置和 manifest 不包含 slot/replica-capacity 字段 |
 
 这里的 `4096` 是**每个 rank、每个 microbatch 的本地 token 数**，不是 32 rank
 合计值。32 rank 时，每个 microbatch 的全局 token 数为：
@@ -278,9 +278,19 @@ python3 tests/run_dsv3_2layer_algorithms.py --full --workers 4
 python3 tests/run_dsv3_2layer_algorithms.py \
   --gate-provider raw_receive_cdf --gate-layer-map 0,1 \
   --gate-seed 17 --moonep-replicas-per-rank 10 \
-  --probeep-expert-slots-per-rank 40 \
   --simulation-end-us 20000
+
+# ProbeEP 专用单进程动态 DAG；默认 2-token smoke
+python3 tests/run_probeep_2layer_ratio_full.py --gate-layer-map 0,1
+
+# 只有明确进行完整实验时使用 4096 tokens/rank
+python3 tests/run_probeep_2layer_ratio_full.py \
+  --full --gate-layer-map 0,1 \
+  --compute-config pysrc/compute_profiles/H20_DSV3_EP32_compute_4096tpr.json
 ```
+
+该入口不接受 baseline run；compute config 直接决定同一条动态时间线中
+所有计算 task 的时间。
 
 默认入口是 `2 tokens/rank/microbatch` smoke，用于日常功能回归。`--full`
 才使用 4096tpr JSON 和完整通信字节。五个算法分别使用独立进程，默认最多 4 个
@@ -330,10 +340,34 @@ timeline 和链路负载产物，不包含 workload 和 simulation 大文件。�
 偏斜分布在默认值 2 下无法满足 planner 的严格 rank 均衡时会明确失败，不会静默
 改变 Gate。通过 `--moonep-replicas-per-rank` 显式配置实验容量，并在 `配置.json`
 中记录。
-ProbeEP 不复用 MoonEP 的临时 replica 参数。它使用总容量
-`expert_slots_per_rank=40`，包含每 rank 原有的 8 个 home experts；当前测试假设显存
-足够，因此只保证容量不成为人为瓶颈。
-大量 MoonEP 权重预取也可能超过默认 smoke 的 `end=2000 us`；
+ProbeEP 不复用 MoonEP 的临时 replica 参数。当前测试假设显存足够，不建模 HBM
+capacity 或全局/per-server replica 数量上限，源码和配置中也不保留虚假 slot 参数。
+remote replica admission 只由每个 source NIC TX 和 destination NIC RX 的动态字节窗口
+约束。
+
+比例控制专项入口固定使用 raw receive layers 0-1 和两个 microbatch。
+默认是 2-token smoke；显式 `--full` 才使用 4096tpr JSON。最终累计
+`workload.dag` 快照包含
+`2 layers x 2 microbatches = 4` 个 MoE invocations、4 个 `Weight+Dispatch` control
+observations 和 4 个 Combine telemetry observations，整个 workload 只启动一次
+HTSim。所有 observations 共享同一条连续时间线和网络状态；GPU timeline 固定
+展示 rank 0-31 全部 32 条 lane。可视化写入
+`probeep_2layer_dynamic_visualization.zip`，服务器目录不保留散装 HTML。
+
+每层按四个主要 compute stage 解读：`Attention0`、
+`Attention1||Weight+Dispatch0`、`Expert0||Weight+Dispatch1`、
+`Expert1||Combine0`，尾部 `Combine1` 可与下一层 `Attention0` overlap。两个
+Weight+Dispatch 分别进入 Attention/MoE 独立反馈链。ProbeEP 不设置
+`prefetch -> dispatch` phase barrier；只保证同 source rail 的 remote Weight RDMA TX
+早于该 rail 的 Dispatch fabric TX。专项报告分别给出 remote RDMA 权重和 local NVLink
+权重，不能只看统一的 Expert Weight 颜色判断跨机迁移量。
+
+专项实验使用 `-dag_control` 在同一 HTSim PID 中逐层 append DAG fragment。
+MB0/MB1 `Weight+Dispatch` observation 完成时，controller 直接消费该进程的
+实测 task start/done 事件；MB1 observation 后生成下一层。不使用
+baseline run、external replay 或第二条仿真时间线。Combine 只作 telemetry，不进入
+controller。
+当前 smoke 默认 `end=5000 us`，用于容纳 ProbeEP/MoonEP 的本地权重预取；
 `--simulation-end-us` 只延长仿真截止时间，不改变 token 数或 workload。
 
 ZIP 内采用两级入口：

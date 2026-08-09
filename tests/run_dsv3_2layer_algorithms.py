@@ -26,8 +26,8 @@ TIMELINE = ROOT / "visualization" / "dag_timeline.py"
 LINK_LOAD = ROOT / "visualization" / "mprail_link_load.py"
 GATE_LOAD = ROOT / "visualization" / "gate_load_profile.py"
 COMPARISON = ROOT / "visualization" / "dsv3_algorithm_comparison.py"
-COMPUTE_CONFIG = (
-    PYSRC / "compute_profiles" / "H100_DSV3_EP32_compute_4096tpr.json"
+DEFAULT_COMPUTE_CONFIG = (
+    PYSRC / "compute_profiles" / "H20_DSV3_EP32_compute_4096tpr.json"
 )
 ALGORITHMS = ("nccl", "deepep", "eplb", "moonep", "probeep")
 sys.path.insert(0, str(PYSRC))
@@ -88,14 +88,14 @@ def mode_config(full: bool) -> RunMode:
             link_sample_us=100,
             simulation_end_us=1_000_000,
             timeout_seconds=1200,
-            compute_config=COMPUTE_CONFIG,
+            compute_config=DEFAULT_COMPUTE_CONFIG,
         )
     return RunMode(
         name="smoke",
         tokens_per_rank=2,
         chunk_tokens=32,
         link_sample_us=1,
-        simulation_end_us=2000,
+        simulation_end_us=5000,
         timeout_seconds=180,
         compute_config=None,
     )
@@ -125,6 +125,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated subset of nccl,deepep,eplb,moonep,probeep.",
     )
     parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=2,
+        help="Number of representative DSV3 layers; defaults to 2.",
+    )
+    parser.add_argument(
         "--gate-provider",
         choices=GATE_PROVIDER_NAMES,
         default="balanced_permuted",
@@ -148,12 +154,7 @@ def parse_args() -> argparse.Namespace:
         "--moonep-replicas-per-rank",
         type=int,
         default=2,
-        help="MoonEP/ProbeEP local replica capacity; skewed Gate inputs may need more than 2.",
-    )
-    parser.add_argument(
-        "--probeep-max-remote-replicas",
-        type=int,
-        default=8,
+        help="MoonEP local replica capacity; skewed Gate inputs may need more than 2.",
     )
     parser.add_argument(
         "--probeep-weight-chunk-bytes",
@@ -161,15 +162,15 @@ def parse_args() -> argparse.Namespace:
         default=4 * 1024 * 1024,
     )
     parser.add_argument(
-        "--probeep-expert-slots-per-rank",
-        type=int,
-        default=40,
-        help="Total home plus temporary expert slots per rank.",
-    )
-    parser.add_argument(
         "--simulation-end-us",
         type=int,
         help="Override the mode's HTSim end time without changing token count.",
+    )
+    parser.add_argument(
+        "--compute-config",
+        type=Path,
+        default=DEFAULT_COMPUTE_CONFIG,
+        help="Schema-v2 compute profile used by --full.",
     )
     return parser.parse_args()
 
@@ -274,6 +275,7 @@ def run_visualizations(
     log_path: Path,
     algorithm: str,
     mode: RunMode,
+    num_layers: int,
 ) -> None:
     timeline_dir = case_dir / "timeline"
     timeline_command = [
@@ -284,7 +286,7 @@ def run_visualizations(
         "--output-dir", str(timeline_dir),
         "--gpus-per-server", "8",
         "--ranks", "0-31",
-        "--title", f"{algorithm.upper()} / DSV3 2-layer / {mode.name}",
+        "--title", f"{algorithm.upper()} / DSV3 {num_layers}-layer / {mode.name}",
     ]
     timeline_result = subprocess.run(
         timeline_command,
@@ -307,7 +309,7 @@ def run_visualizations(
         "--metrics-dir", str(case_dir / "simulation" / "output_metrics"),
         "--output-dir", str(link_dir),
         "--planes", "1",
-        "--title", f"{algorithm.upper()} / DSV3 2-layer / {mode.name}",
+        "--title", f"{algorithm.upper()} / DSV3 {num_layers}-layer / {mode.name}",
     ]
     link_result = subprocess.run(
         link_command,
@@ -329,7 +331,7 @@ def run_visualizations(
         str(GATE_LOAD),
         "--workload-dir", str(workload_dir),
         "--output-dir", str(gate_dir),
-        "--title", f"{algorithm.upper()} / Gate load / {mode.name}",
+        "--title", f"{algorithm.upper()} / {num_layers}-layer Gate load / {mode.name}",
     ]
     gate_result = subprocess.run(
         gate_command,
@@ -352,6 +354,7 @@ def validate_case(
     log_path: Path,
     algorithm: str,
     mode: RunMode,
+    num_layers: int,
 ) -> dict[str, object]:
     manifest = json.loads(
         (workload_dir / "manifest.json").read_text(encoding="utf-8")
@@ -424,7 +427,7 @@ def validate_case(
     if mode.name == "full":
         compute_cost = manifest["metadata"]["compute_cost"]
         require(
-            Path(compute_cost["config_path"]) == COMPUTE_CONFIG.resolve(),
+            Path(compute_cost["config_path"]) == mode.compute_config.resolve(),
             "full run did not use the 4096tpr compute config",
         )
         require(
@@ -547,7 +550,10 @@ def validate_case(
             encoding="utf-8"
         )
     )
-    require(len(gate_summary["records"]) == 4, "Gate profile record count mismatch")
+    require(
+        len(gate_summary["records"]) == 2 * num_layers,
+        "Gate profile record count mismatch",
+    )
     gate_digests = [
         record["gate"]["assignment_digest_sha256"]
         for record in gate_summary["records"]
@@ -578,9 +584,8 @@ def run_algorithm(
     mode: RunMode,
     gate: GateRun,
     moonep_replicas_per_rank: int,
-    probeep_max_remote_replicas: int,
     probeep_weight_chunk_bytes: int,
-    probeep_expert_slots_per_rank: int,
+    num_layers: int,
 ) -> dict[str, object]:
     case_dir = root_dir / "algorithms" / algorithm
     case_dir.mkdir(parents=True)
@@ -595,7 +600,7 @@ def run_algorithm(
             num_experts=256,
             topk=8,
             sequence_length=4096,
-            num_layers=2,
+            num_layers=num_layers,
             micro_batches=2,
         )
         placement = Placement(
@@ -619,8 +624,6 @@ def run_algorithm(
                 token_padding=128,
                 probeep_route_chunk_tokens=mode.chunk_tokens,
                 probeep_weight_chunk_bytes=probeep_weight_chunk_bytes,
-                probeep_max_remote_replicas=probeep_max_remote_replicas,
-                probeep_expert_slots_per_rank=probeep_expert_slots_per_rank,
                 gate_provider=create_gate_provider(
                     gate.provider,
                     seed=gate.seed,
@@ -641,9 +644,21 @@ def run_algorithm(
         workload_dir = case_dir / "workload"
         emit_workload(result.graph, workload_dir, metadata=result.metadata)
         log_path = execute_htsim(case_dir, workload_dir, mode)
-        run_visualizations(case_dir, workload_dir, log_path, algorithm, mode)
+        run_visualizations(
+            case_dir,
+            workload_dir,
+            log_path,
+            algorithm,
+            mode,
+            num_layers,
+        )
         summary = validate_case(
-            case_dir, workload_dir, log_path, algorithm, mode
+            case_dir,
+            workload_dir,
+            log_path,
+            algorithm,
+            mode,
+            num_layers,
         )
         (case_dir / "结果.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
@@ -667,18 +682,21 @@ def run_algorithm(
 def write_report(
     run_dir: Path,
     mode: RunMode,
+    num_layers: int,
     results: list[dict[str, object]],
     comparison_member: str | None,
     visualization_zip: Path | None,
 ) -> None:
     passed = sum(item["status"] == "passed" for item in results)
     lines = [
-        "# DSV3 两层算法测试报告",
+        f"# DSV3 {num_layers} 层算法测试报告",
         "",
         f"- 模式：`{mode.name}`",
+        f"- layer：{num_layers}",
         f"- tokens/rank/microbatch：{mode.tokens_per_rank}",
         f"- chunk_tokens：{mode.chunk_tokens}",
         f"- link sample：{mode.link_sample_us} us",
+        f"- compute config：`{mode.compute_config or '内置 smoke 理论值'}`",
         f"- 通过：{passed}/{len(results)}",
         f"- ZIP 内总览 HTML：`{comparison_member or '未生成'}`",
         f"- 可视化 ZIP：`{visualization_zip.name if visualization_zip else '未生成'}`",
@@ -726,12 +744,10 @@ def main() -> int:
         raise SystemExit("--workers must be positive")
     if args.moonep_replicas_per_rank < 0:
         raise SystemExit("--moonep-replicas-per-rank must be non-negative")
-    if args.probeep_max_remote_replicas < 0:
-        raise SystemExit("--probeep-max-remote-replicas must be non-negative")
     if args.probeep_weight_chunk_bytes <= 0:
         raise SystemExit("--probeep-weight-chunk-bytes must be positive")
-    if args.probeep_expert_slots_per_rank <= 0:
-        raise SystemExit("--probeep-expert-slots-per-rank must be positive")
+    if args.num_layers < 2:
+        raise SystemExit("--num-layers must be at least 2")
     algorithms = tuple(
         value.strip() for value in args.algorithms.split(",") if value.strip()
     )
@@ -742,6 +758,11 @@ def main() -> int:
         raise SystemExit(f"unsupported algorithms: {sorted(unsupported)}")
 
     mode = mode_config(args.full)
+    if args.full:
+        compute_config = args.compute_config.resolve()
+        if not compute_config.is_file():
+            raise SystemExit(f"--compute-config does not exist: {compute_config}")
+        mode = replace(mode, compute_config=compute_config)
     if args.simulation_end_us is not None:
         if args.simulation_end_us <= 0:
             raise SystemExit("--simulation-end-us must be positive")
@@ -754,8 +775,10 @@ def main() -> int:
             )
         except ValueError as exc:
             raise SystemExit("--gate-layer-map must contain integers") from exc
-        if len(layer_map) != 2:
-            raise SystemExit("--gate-layer-map needs exactly two entries")
+        if len(layer_map) != args.num_layers:
+            raise SystemExit(
+                "--gate-layer-map needs exactly --num-layers entries"
+            )
     gate = GateRun(
         provider=args.gate_provider,
         seed=args.gate_seed,
@@ -771,7 +794,10 @@ def main() -> int:
     run_dir = (
         ROOT
         / "test_logs"
-        / f"run_{timestamp}_dsv3_2layer_{len(algorithms)}algo_{mode.name}"
+        / (
+            f"run_{timestamp}_dsv3_{args.num_layers}layer_"
+            f"{len(algorithms)}algo_{mode.name}"
+        )
     )
     run_dir.mkdir(parents=True)
     (run_dir / "配置.json").write_text(
@@ -780,15 +806,10 @@ def main() -> int:
                 "mode": asdict(mode),
                 "algorithms": algorithms,
                 "workers": min(args.workers, len(algorithms)),
+                "num_layers": args.num_layers,
                 "gate": asdict(gate),
                 "moonep_replicas_per_rank": args.moonep_replicas_per_rank,
-                "probeep_max_remote_replicas": (
-                    args.probeep_max_remote_replicas
-                ),
                 "probeep_weight_chunk_bytes": args.probeep_weight_chunk_bytes,
-                "probeep_expert_slots_per_rank": (
-                    args.probeep_expert_slots_per_rank
-                ),
                 "topology": {
                     "ranks": 32,
                     "servers": 4,
@@ -818,6 +839,7 @@ def main() -> int:
         write_report(
             run_dir,
             mode,
+            args.num_layers,
             [
                 {"algorithm": algorithm, "status": "failed", "error": str(exc)}
                 for algorithm in algorithms
@@ -841,9 +863,8 @@ def main() -> int:
                 mode,
                 gate,
                 args.moonep_replicas_per_rank,
-                args.probeep_max_remote_replicas,
                 args.probeep_weight_chunk_bytes,
-                args.probeep_expert_slots_per_rank,
+                args.num_layers,
             ): algorithm
             for algorithm in algorithms
         }
@@ -891,7 +912,7 @@ def main() -> int:
             [
                 "--title",
                 (
-                    f"DSV3 2-layer / EP32 / {mode.name} / "
+                    f"DSV3 {args.num_layers}-layer / EP32 / {mode.name} / "
                     f"{len(algorithms)} algorithms"
                 ),
             ]
@@ -973,7 +994,14 @@ def main() -> int:
             "successful run left loose HTML files outside the ZIP",
         )
 
-    write_report(run_dir, mode, results, comparison_member, visualization_zip)
+    write_report(
+        run_dir,
+        mode,
+        args.num_layers,
+        results,
+        comparison_member,
+        visualization_zip,
+    )
     passed = sum(item["status"] == "passed" for item in results)
     print(f"DSV3 algorithm tests: {passed}/{len(results)} passed ({mode.name})")
     print(f"log directory: {run_dir}")

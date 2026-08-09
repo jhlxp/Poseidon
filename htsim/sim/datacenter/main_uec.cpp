@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <memory>
 #include <sstream>
+#include <string>
 #include <string.h>
 
 #include <math.h>
@@ -54,6 +55,129 @@ uint32_t DEFAULT_NONTRIMMING_QUEUESIZE_FACTOR = 5;
 
 EventList eventlist;
 
+enum class DagControlAction {
+    APPEND,
+    CONTINUE,
+    CLOSE,
+};
+
+static string trim_control_line(const string& value) {
+    const size_t first = value.find_first_not_of(" \t\r");
+    if (first == string::npos) {
+        return "";
+    }
+    const size_t last = value.find_last_not_of(" \t\r");
+    return value.substr(first, last - first + 1);
+}
+
+static uint32_t parse_control_u32(const string& value, const string& field) {
+    try {
+        size_t consumed = 0;
+        const unsigned long long parsed = stoull(value, &consumed);
+        if (consumed != value.size()
+                || parsed > numeric_limits<uint32_t>::max()) {
+            throw invalid_argument("outside uint32 range");
+        }
+        return static_cast<uint32_t>(parsed);
+    } catch (const exception&) {
+        throw invalid_argument("invalid " + field + ": " + value);
+    }
+}
+
+static DagControlAction read_dag_control_response(
+        istream& input, OxcDagManager& manager) {
+    string line;
+    while (getline(input, line)) {
+        line = trim_control_line(line);
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        if (line == "DAG_CONTINUE") {
+            cout << "DAG_CONTROL_CONTINUE time_us="
+                 << timeAsUs(eventlist.now()) << endl;
+            return DagControlAction::CONTINUE;
+        }
+        if (line == "DAG_CLOSE") {
+            manager.close_dynamic();
+            return DagControlAction::CLOSE;
+        }
+
+        const string begin_prefix = "DAG_APPEND_BEGIN ";
+        if (line.rfind(begin_prefix, 0) != 0) {
+            throw invalid_argument("unexpected DAG control command: " + line);
+        }
+        const string batch_id = trim_control_line(line.substr(begin_prefix.size()));
+        if (batch_id.empty() || batch_id.find_first_of(" \t|") != string::npos) {
+            throw invalid_argument("invalid DAG append batch ID: " + batch_id);
+        }
+
+        vector<string> task_lines;
+        vector<OxcDagObservation> observations;
+        bool ended = false;
+        while (getline(input, line)) {
+            line = trim_control_line(line);
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+            const string task_prefix = "DAG_TASK ";
+            const string observation_prefix = "DAG_OBSERVE ";
+            const string end_prefix = "DAG_APPEND_END ";
+            if (line.rfind(task_prefix, 0) == 0) {
+                task_lines.push_back(line.substr(task_prefix.size()));
+                continue;
+            }
+            if (line.rfind(observation_prefix, 0) == 0) {
+                const string specification = line.substr(observation_prefix.size());
+                const size_t separator = specification.find('|');
+                if (separator == string::npos
+                        || specification.find('|', separator + 1) != string::npos) {
+                    throw invalid_argument(
+                            "DAG_OBSERVE requires 'observation_id | barriers'");
+                }
+                OxcDagObservation observation;
+                observation.id = parse_control_u32(
+                        trim_control_line(specification.substr(0, separator)),
+                        "DAG observation ID");
+                istringstream predecessors(
+                        trim_control_line(specification.substr(separator + 1)));
+                string predecessor;
+                while (predecessors >> predecessor) {
+                    try {
+                        size_t consumed = 0;
+                        const int value = stoi(predecessor, &consumed);
+                        if (consumed != predecessor.size()) {
+                            throw invalid_argument("trailing characters");
+                        }
+                        observation.predecessor_barriers.push_back(value);
+                    } catch (const exception&) {
+                        throw invalid_argument(
+                                "invalid DAG observation barrier: " + predecessor);
+                    }
+                }
+                observations.push_back(std::move(observation));
+                continue;
+            }
+            if (line.rfind(end_prefix, 0) == 0) {
+                const string end_id = trim_control_line(line.substr(end_prefix.size()));
+                if (end_id != batch_id) {
+                    throw invalid_argument(
+                            "DAG append begin/end batch IDs differ: "
+                            + batch_id + " vs " + end_id);
+                }
+                ended = true;
+                break;
+            }
+            throw invalid_argument("unexpected command inside DAG append: " + line);
+        }
+        if (!ended) {
+            throw invalid_argument("standard input ended inside DAG append batch " + batch_id);
+        }
+        manager.append_batch(batch_id, task_lines, observations);
+        return DagControlAction::APPEND;
+    }
+    throw invalid_argument("standard input ended while HTSim awaited DAG control");
+}
+
 uint32_t parse_positive_u32_arg(const char* option, const char* value) {
     try {
         size_t consumed = 0;
@@ -70,7 +194,7 @@ uint32_t parse_positive_u32_arg(const char* option, const char* value) {
 }
 
 void exit_error(char* progr) {
-    cout << "Usage " << progr << " [-nodes N]\n\t[-cwnd cwnd_size]\n\t[-q queue_size]\n\t[-queue_type composite|random|lossless|lossless_input|]\n\t[-tm traffic_matrix_file]\n\t[-dag task_file]\n\t[-topology mprail]\n\t[-strat route_strategy (single,rand,perm,pull,ecmp,\n\tecmp_host path_count,ecmp_ar,ecmp_rr,\n\tecmp_host_ar ar_thresh)]\n\t[-log log_level]\n\t[-seed random_seed]\n\t[-end end_time_in_usec]\n\t[-mtu MTU]\n\t[-hop_latency x] per hop wire latency in us,default 1\n\t[-target_q_delay x] target_queuing_delay in us, default is 6us \n\t[-switch_latency x] switching latency in us, default 0\n\t[-host_queue_type  swift|prio|fair_prio]\n\t[-logtime dt] sample time for sinklogger, etc\n\t[-conn_reuse] enable connection reuse" << endl;
+    cout << "Usage " << progr << " [-nodes N]\n\t[-cwnd cwnd_size]\n\t[-q queue_size]\n\t[-queue_type composite|random|lossless|lossless_input|]\n\t[-tm traffic_matrix_file]\n\t[-dag task_file | -dag_control]\n\t[-topology mprail]\n\t[-strat route_strategy (single,rand,perm,pull,ecmp,\n\tecmp_host path_count,ecmp_ar,ecmp_rr,\n\tecmp_host_ar ar_thresh)]\n\t[-log log_level]\n\t[-seed random_seed]\n\t[-end end_time_in_usec]\n\t[-mtu MTU]\n\t[-hop_latency x] per hop wire latency in us,default 1\n\t[-target_q_delay x] target_queuing_delay in us, default is 6us \n\t[-switch_latency x] switching latency in us, default 0\n\t[-host_queue_type  swift|prio|fair_prio]\n\t[-logtime dt] sample time for sinklogger, etc\n\t[-conn_reuse] enable connection reuse" << endl;
     cout << "\t[-local_tray_size N] rank group size for direct intra-server routing\n"
          << "\t[-local_linkspeed Mbps] direct intra-server link/injection speed, MpRail default 7200000\n"
          << "\t[-local_latency_ns ns] direct intra-server one-way latency, default 200ns\n"
@@ -447,6 +571,7 @@ int main(int argc, char **argv) {
     filename << "logout.dat";
     string goal_filename = "";
     string dag_file = "";
+    bool dag_control = false;
     int end_time = 1000;//in microseconds
     bool force_disable_oversubscribed_cc = false;
     bool enable_accurate_base_rtt = false;
@@ -777,6 +902,9 @@ int main(int argc, char **argv) {
             dag_file = argv[i+1];
             cout << "DAG input file: " << dag_file << endl;
             i++;
+        } else if (!strcmp(argv[i],"-dag_control")){
+            dag_control = true;
+            cout << "Dynamic DAG control enabled on standard input" << endl;
         } else if (!strcmp(argv[i],"-topology")){
             const string topology = argv[i+1];
             if (topology != "mprail") {
@@ -1134,6 +1262,10 @@ int main(int argc, char **argv) {
         }
     }
     else if (goal_filename.size() == 0){
+        if (dag_control) {
+            cerr << "-dag_control requires an explicit empty matrix via -tm" << endl;
+            exit(1);
+        }
         cout << "Loading connection matrix from  standard input" << endl;        
         conns->load(cin);
     }
@@ -1150,17 +1282,22 @@ int main(int argc, char **argv) {
         exit(1);
     }
     const bool fabric_mode = mprail_mode || oxc_mode;
-    if (!dag_file.empty()) {
+    if (!dag_file.empty() && dag_control) {
+        cerr << "-dag and -dag_control are mutually exclusive" << endl;
+        exit(1);
+    }
+    const bool dag_enabled = !dag_file.empty() || dag_control;
+    if (dag_enabled) {
         if (!fabric_mode) {
-            cerr << "-dag requires -topology mprail or an Oxc topology" << endl;
+            cerr << "DAG mode requires -topology mprail or an Oxc topology" << endl;
             exit(1);
         }
         if (conn_reuse) {
-            cerr << "-dag does not support -conn_reuse" << endl;
+            cerr << "DAG mode does not support -conn_reuse" << endl;
             exit(1);
         }
         if (!goal_filename.empty()) {
-            cerr << "-dag cannot be combined with -goal" << endl;
+            cerr << "DAG mode cannot be combined with -goal" << endl;
             exit(1);
         }
     }
@@ -1944,29 +2081,35 @@ int main(int argc, char **argv) {
     map<flowid_t, pair<UecSrc*, UecSink*>> flowmap;
     map<flowid_t, UecPdcSes*> flow_pdc_map;
     unique_ptr<OxcDagManager> oxc_dag_manager;
-    if (!dag_file.empty()) {
+    if (dag_enabled) {
         if (!all_conns->empty()) {
-            cerr << "-dag requires a traffic matrix with zero static connections"
+            cerr << "DAG mode requires a traffic matrix with zero static connections"
                  << endl;
             exit(1);
         }
 
+        const auto validate_dag_network = [&](const OxcDagTask& task) {
+            if (!task.route.has_value()) {
+                return;
+            }
+            if (!mprail_topology) {
+                throw invalid_argument(
+                        "DAG route fields are supported only by MpRail topology");
+            }
+            mprail_topology->validate_route_spec(
+                    static_cast<uint32_t>(task.src_rank),
+                    static_cast<uint32_t>(task.dst_rank),
+                    task.route.value());
+        };
         try {
             oxc_dag_manager = make_unique<OxcDagManager>(eventlist, no_of_nodes);
-            oxc_dag_manager->load_from_file(dag_file);
-            oxc_dag_manager->validate_network_tasks([&](const OxcDagTask& task) {
-                if (!task.route.has_value()) {
-                    return;
-                }
-                if (!mprail_topology) {
-                    throw invalid_argument(
-                            "DAG route fields are supported only by MpRail topology");
-                }
-                mprail_topology->validate_route_spec(
-                        static_cast<uint32_t>(task.src_rank),
-                        static_cast<uint32_t>(task.dst_rank),
-                        task.route.value());
-            });
+            oxc_dag_manager->set_network_validator(validate_dag_network);
+            if (dag_control) {
+                oxc_dag_manager->enable_dynamic();
+            } else {
+                oxc_dag_manager->load_from_file(dag_file);
+                oxc_dag_manager->validate_network_tasks(validate_dag_network);
+            }
         } catch (const exception& e) {
             cerr << "Failed to load DAG: " << e.what() << endl;
             exit(1);
@@ -2573,6 +2716,29 @@ int main(int argc, char **argv) {
             + (oxc_dag_manager ? oxc_dag_manager->network_task_count() : 0);
     UecSrc::initProgressLogging(expected_flows);
     if (oxc_dag_manager) {
+        if (dag_control) {
+            oxc_dag_manager->set_observation_handler(
+                    [&](uint32_t observation_id, double time_us) {
+                        cout << "DAG_OBSERVATION_READY observation="
+                             << observation_id << " time_us=" << time_us << endl;
+                        cout.flush();
+                        read_dag_control_response(cin, *oxc_dag_manager);
+                    });
+            cout << "DAG_CONTROL_READY time_us="
+                 << timeAsUs(eventlist.now()) << endl;
+            cout.flush();
+            try {
+                const DagControlAction initial = read_dag_control_response(
+                        cin, *oxc_dag_manager);
+                if (initial != DagControlAction::APPEND) {
+                    throw invalid_argument(
+                            "dynamic DAG must start with an append batch");
+                }
+            } catch (const exception& e) {
+                cerr << "Failed to initialize dynamic DAG: " << e.what() << endl;
+                return 2;
+            }
+        }
         oxc_dag_manager->start();
     }
     // Record the setup
@@ -2584,7 +2750,12 @@ int main(int argc, char **argv) {
     
     // GO!
     cout << "Starting simulation" << endl;
-    while (eventlist.doNextEvent()) {
+    try {
+        while (eventlist.doNextEvent()) {
+        }
+    } catch (const exception& e) {
+        cerr << "DAG execution failed: " << e.what() << endl;
+        return 2;
     }
 
     if (oxc_dag_manager && !oxc_dag_manager->finished()) {

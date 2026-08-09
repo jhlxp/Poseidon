@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 import heapq
 from typing import Any, Literal
@@ -140,6 +141,22 @@ class TaskGraph:
 
     def add_dependency(self, task_key: str, predecessor_key: str) -> None:
         self.task(task_key).predecessors.add(predecessor_key)
+
+    def add_task_copy(self, task: Task) -> Task:
+        """Import a task while preserving its logical fields and metadata."""
+        self._validate_new_key(task.key)
+        if task.kind == "compute":
+            if task.rank is None:
+                raise ValidationError("compute task is missing rank")
+            self._validate_rank(task.rank)
+        else:
+            if task.src_rank is None or task.dst_rank is None:
+                raise ValidationError("transfer task is missing endpoints")
+            self._validate_rank(task.src_rank)
+            self._validate_rank(task.dst_rank)
+        imported = deepcopy(task)
+        self._tasks[imported.key] = imported
+        return imported
 
     def validate(self) -> None:
         for task in self._tasks.values():

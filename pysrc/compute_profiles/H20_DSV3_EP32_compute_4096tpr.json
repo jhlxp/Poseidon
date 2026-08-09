@@ -1,0 +1,42 @@
+{
+  "schema_version": 2,
+  "hardware": "H20_SXM",
+  "profile_scope": "DSV3 EP32 per-token linear cost; hidden=7168; ffn_hidden=2048; sequence_length=4096; topk=8; theoretical dense BF16=148 TFLOP/s; 78 SM; 20 communication SM",
+  "selected_source": "theoretical",
+  "time_unit": "us",
+  "scaling": "duration_us = token_count * selected_us_per_token",
+  "total_sms": 78,
+  "communication_sms": 20,
+  "modules": {
+    "attention": {
+      "token_kind": "source_token",
+      "theoretical_us_per_token": 3.5708263783783784,
+      "profiled_us_per_token": null
+    },
+    "router_projection": {
+      "token_kind": "source_token",
+      "theoretical_us_per_token": 0.024797405405405405,
+      "profiled_us_per_token": null
+    },
+    "expert_ffn": {
+      "token_kind": "routed_expert_token",
+      "theoretical_us_per_token": 0.8003576365330848,
+      "profiled_us_per_token": null
+    },
+    "combine_reduce": {
+      "token_kind": "source_token_with_topk8",
+      "theoretical_us_per_token": 0.0007749189189189189,
+      "profiled_us_per_token": null
+    },
+    "combine_final_reduce": {
+      "token_kind": "source_token_with_topk8",
+      "theoretical_us_per_token": 0.0007749189189189189,
+      "profiled_us_per_token": null
+    },
+    "per_server_planning_proxy": {
+      "token_kind": "server_routed_expert_token",
+      "theoretical_us_per_token": 0.00000012162162162162163,
+      "profiled_us_per_token": null
+    }
+  }
+}

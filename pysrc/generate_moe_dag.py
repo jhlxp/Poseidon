@@ -68,45 +68,19 @@ def parse_args() -> argparse.Namespace:
         default=4 * 1024 * 1024,
     )
     parser.add_argument(
-        "--probeep-max-remote-replicas",
-        type=int,
-        default=64,
-    )
-    parser.add_argument(
-        "--probeep-expert-slots-per-rank",
-        type=int,
-        default=40,
-        help="Total home plus temporary expert slots available on each rank.",
-    )
-    parser.add_argument(
         "--probeep-initial-nic-budget-bytes",
         type=int,
         default=16 * 1024 * 1024,
     )
     parser.add_argument(
-        "--probeep-min-nic-budget-bytes",
-        type=int,
-        default=0,
-    )
-    parser.add_argument(
-        "--probeep-max-nic-budget-bytes",
-        type=int,
-        default=128 * 1024 * 1024,
-    )
-    parser.add_argument(
-        "--probeep-multiplicative-decrease",
+        "--probeep-nic-line-rate-gbps",
         type=float,
-        default=0.9,
+        default=400.0,
     )
     parser.add_argument(
-        "--probeep-additive-increase-bytes",
-        type=int,
-        default=1024 * 1024,
-    )
-    parser.add_argument(
-        "--probeep-deadband-ratio",
+        "--probeep-target-overlap-ratio",
         type=float,
-        default=0.05,
+        default=0.90,
     )
     parser.add_argument(
         "--eplb-num-physical-experts",
@@ -251,28 +225,15 @@ def main() -> int:
                     args.probeep_route_chunk_tokens
                 ),
                 probeep_weight_chunk_bytes=args.probeep_weight_chunk_bytes,
-                probeep_max_remote_replicas=(
-                    args.probeep_max_remote_replicas
-                ),
-                probeep_expert_slots_per_rank=(
-                    args.probeep_expert_slots_per_rank
-                ),
                 probeep_initial_nic_budget_bytes=(
                     args.probeep_initial_nic_budget_bytes
                 ),
-                probeep_min_nic_budget_bytes=(
-                    args.probeep_min_nic_budget_bytes
+                probeep_nic_line_rate_gbps=(
+                    args.probeep_nic_line_rate_gbps
                 ),
-                probeep_max_nic_budget_bytes=(
-                    args.probeep_max_nic_budget_bytes
+                probeep_target_overlap_ratio=(
+                    args.probeep_target_overlap_ratio
                 ),
-                probeep_multiplicative_decrease=(
-                    args.probeep_multiplicative_decrease
-                ),
-                probeep_additive_increase_bytes=(
-                    args.probeep_additive_increase_bytes
-                ),
-                probeep_deadband_ratio=args.probeep_deadband_ratio,
                 eplb_num_physical_experts=args.eplb_num_physical_experts,
                 eplb_num_groups=args.eplb_num_groups,
                 eplb_estimated_loads=eplb_loads,

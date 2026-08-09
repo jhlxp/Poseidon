@@ -13,6 +13,7 @@ from .common import (
     HierarchicalTransferSummary,
     build_hierarchical_combine,
     build_hierarchical_dispatch,
+    hierarchical_token_server_pair_profile,
     plan_hierarchical_token_payloads,
 )
 
@@ -436,6 +437,11 @@ class MoonEPBuilder:
                 ),
                 "server_forward_task_count": 0,
                 "hierarchical_transfer": transfer_summary.manifest(),
+                "token_server_pair_transport": (
+                    hierarchical_token_server_pair_profile(
+                        invocation, payload_plan
+                    )
+                ),
                 "expert_weight_prefetch_bytes": transfer_bytes.get(
                     "expert_weight_prefetch", 0
                 ),

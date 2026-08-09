@@ -106,6 +106,87 @@ class HierarchicalTransferSummary:
         }
 
 
+def hierarchical_token_server_pair_profile(
+    invocation: MoEInvocation,
+    plan: HierarchicalPayloadPlan,
+) -> list[dict[str, object]]:
+    """Summarize physical fabric token traffic by directed server pair and rail."""
+    placement = invocation.placement
+    rows: dict[tuple[int, int], dict[str, object]] = {}
+
+    def row_for(source_server: int, destination_server: int) -> dict[str, object]:
+        key = (source_server, destination_server)
+        if key not in rows:
+            rows[key] = {
+                "source_server": source_server,
+                "destination_server": destination_server,
+                "dispatch_token_payloads": 0,
+                "dispatch_expert_routes": 0,
+                "dispatch_bytes": 0,
+                "combine_token_payloads": 0,
+                "combine_expert_routes": 0,
+                "combine_bytes": 0,
+                "nics": {
+                    rail: {
+                        "rail": rail,
+                        "source_rank": placement.server_rank(source_server, rail),
+                        "destination_rank": placement.server_rank(
+                            destination_server, rail
+                        ),
+                        "dispatch_token_payloads": 0,
+                        "dispatch_expert_routes": 0,
+                        "dispatch_bytes": 0,
+                        "combine_token_payloads": 0,
+                        "combine_expert_routes": 0,
+                        "combine_bytes": 0,
+                    }
+                    for rail in range(placement.gpus_per_server)
+                },
+            }
+        return rows[key]
+
+    for (source_rank, destination_server), payloads in (
+        plan.server_payloads_by_pair.items()
+    ):
+        source_server = placement.rank_server(source_rank)
+        if source_server == destination_server:
+            continue
+        token_count = len(payloads)
+        route_count = sum(len(payload.routes) for payload in payloads)
+        rail = placement.rank_local(source_rank)
+
+        dispatch_row = row_for(source_server, destination_server)
+        dispatch_nic = dispatch_row["nics"][rail]
+        dispatch_bytes = token_count * invocation.dispatch_token_bytes
+        for target in (dispatch_row, dispatch_nic):
+            target["dispatch_token_payloads"] += token_count
+            target["dispatch_expert_routes"] += route_count
+            target["dispatch_bytes"] += dispatch_bytes
+
+        combine_row = row_for(destination_server, source_server)
+        combine_nic = combine_row["nics"][rail]
+        combine_bytes = token_count * invocation.combine_token_bytes
+        for target in (combine_row, combine_nic):
+            target["combine_token_payloads"] += token_count
+            target["combine_expert_routes"] += route_count
+            target["combine_bytes"] += combine_bytes
+
+    result: list[dict[str, object]] = []
+    for row in rows.values():
+        nic_rows = list(row.pop("nics").values())
+        for nic in nic_rows:
+            nic["token_bytes_total"] = (
+                nic["dispatch_bytes"] + nic["combine_bytes"]
+            )
+        row["token_bytes_total"] = row["dispatch_bytes"] + row["combine_bytes"]
+        row["nics"] = nic_rows
+        result.append(row)
+    return sorted(
+        result,
+        key=lambda item: (item["source_server"], item["destination_server"]),
+    )
+
+
 def plan_token_payloads(
     assignments: Iterable[RoutingAssignment],
     destination_rank: Callable[[RoutingAssignment], int],

@@ -112,14 +112,15 @@ ProbeEP planner 是离线决策，不生成 task，因此 ProbeEP timeline 只�
 权重使用独立的青色，hover/Inspector 继续显示具体 payload、endpoint、bytes 和 FCT；
 Python route lowering 耗时不计入 makespan。
 
-每 rank 的 communication stream 顺序固定为：
+每个 ProbeEP invocation 的 Weight 与 Dispatch 属于同一 communication stage。对每条
+source rail，只保证：
 
 ```text
-expert weight prefetch/scatter/RDMA/gather -> token dispatch -> token combine
+same-source remote Weight RDMA TX -> Dispatch fabric TX
 ```
 
-因此同一 rank 先完成本轮需要的权重传输，再启动 token dispatch。不同 rank 的通信仍
-允许并行，不增加全局 weight barrier。这样 timeline 直接呈现每张 NIC 的实际顺序，
+它不等待 local prefetch、目的 RX/gather、其他 rail 或全局 Weight 完成。这样 timeline
+直接呈现每张 NIC 的实际顺序，
 也不会把同一 weight task 在全局 lane 和 TX/RX lane 重复画两次。
 
 主类别固定使用七种不同色相，不使用同色系深浅表达不同语义：
@@ -139,8 +140,51 @@ expert weight prefetch/scatter/RDMA/gather -> token dispatch -> token combine
 
 ProbeEP 单算法 Dashboard 另有 `Cross-server expert migration` 表，逐 layer/microbatch
 展示 planned、admitted、deferred remote experts、moved routes 和 RDMA weight bytes；
-同时报告每个 sample 的 peak-used/total expert slots。总 Dashboard 的算法摘要显示
+不展示没有进入算法决策的虚假 slot/capacity 指标。总 Dashboard 的算法摘要显示
 admitted expert 总数和权重总量。
+
+`gate_load_profile.html` 的跨服务器区域按所选 microbatch 的最后一层展示 remote
+copy 数与 expert IDs，再将最后一层的 Dispatch/Combine token 和 Expert Weight 按有向
+`src_server -> dst_server -> rail/NIC` 展开。这个区域用于观察空间负载，不代替
+timeline 的 FCT 和时间序列。
+
+ProbeEP 2-layer ratio-control 实验生成一张总 Dashboard，展示同一次 HTSim 中 4 个
+`Weight+Dispatch` control observations 的 `Cref`、`Nmax`、planned/admitted replica
+及 Expert Weight RDMA 字节，并把 local NVLink Weight 与 remote RDMA Weight 分列；
+同时把 4 个 Combine phases 作为 telemetry 单独展示。
+Combine 不进入迁移 controller。Dashboard 链接同一 workload 的 GPU
+0-31 完整 timeline、Gate before-after 和链路负载。32 张 GPU 的 lane 必须全部保留，
+不得聚合或只画 rank 0-7。Dashboard 同时显示瓶颈 NIC 的实际 Token+Weight 总字节、
+按 `0.9*Cmax/Nmax` 得到的 probe total、`Cmax*400Gbps` 理论 total，以及更新前后的
+Expert Weight migration budget。这些列必须区分“实际字节”“总字节上限”和“扣除
+token 后的专家预算”，不能把链路图中的实际 MB 解释成 budget；页面不展示 replay
+字段。`probeep_dispatch_observations.json` 在每个
+observation 中保留全部 rank 的 compute/communication 时间；其中
+`weight_dispatch_us_by_rank` 是从配对 compute start 到该 rank 最后一个
+Weight/Dispatch TX/RX task 完成的 stage elapsed time，不是 NIC active time。
+`migration_tx_bytes_by_rank` 和 `migration_rx_bytes_by_rank` 分别记录方向字节；
+`migration_endpoint_bytes_by_rank=max(TX,RX)` 是 controller 的 full-duplex endpoint
+footprint。只能使用 `remote_weight_rdma_bytes=sum(TX)=sum(RX)` 表示实际跨机权重字节，
+不能把 endpoint footprint 跨 rank 求和后当作 RDMA 总量。
+
+Gate 页的 `Per-NIC directed load` 是整次 invocation 的空间流量汇总，柱中包含
+`Dispatch + Combine + Expert Weight`；它不是 controller 的 migration budget，也不是
+`Weight+Dispatch` observation 的 `Bsample`。例如
+`run_20260809_225300_474846_probeep_2layer_dynamic_full` 最后一层 MB1：
+
+```text
+Per-NIC directed total max（含 Combine） = 102.025 MiB
+controller Bsample（仅 Weight+Dispatch） = 90.05 MiB
+实际 Expert Weight endpoint max         = 44 MiB
+probe total max                         = 157.77 MiB
+下一 Expert Weight migration budget     = 79.16 MiB/NIC（均值）
+```
+
+这些数值回答不同问题，不能直接互相比较大小来判断功能是否正确。
+`probeep_combine_telemetry.json` 则保存 Combine active/compute/overlap 的 per-rank 数组；
+Dashboard 的 max 值只是摘要。Expert Weight 使用同一主色仅表示数据
+类别一致，判断 controller 是否减少跨机迁移必须查看 `remote_weight_rdma_bytes`，
+不能把 `expert_weight_prefetch/scatter/gather` 的 local NVLink 字节计作 remote migration。
 
 ## 4. 输出
 
@@ -159,7 +203,13 @@ admitted expert 总数和权重总量。
 | `dag_gpu_timeline.html` | 自包含交互时间线；Fit/缩放、hover 摘要、点击 Inspector 和按需展开依赖 |
 | `dag_task_timeline.csv` | 每个 task 的 start/end/FCT/bytes/logical throughput |
 | `dag_rank_overlap_summary.csv` | 每 GPU compute/network active、overlap、TX/RX 字节 |
-| `dag_timeline_summary.json` | makespan、task 数、逐 payload 字节/FCT、expert-weight 汇总和统计语义 |
+| `dag_timeline_summary.json` | makespan、task 数、逐 payload 字节/FCT、expert-weight RDMA/local/logical-leg 分项和统计语义 |
+
+`expert_weight_logical_leg_bytes` 会把 scatter、RDMA、gather 和 prefetch 等逻辑 task
+leg 全部相加，只用于解释 timeline 工作量，不能代表跨机迁移量。跨机口径使用
+`expert_weight_rdma_bytes`；服务器内部权重 leg 汇总使用
+`expert_weight_local_bytes`。兼容字段 `expert_weight_bytes` 与 logical-leg 总量相同，
+新分析不得再把它解释为 RDMA bytes。
 
 HTML 下方的 `Task details` 默认收起，只在首次展开时生成逐 task
 明细表。大量 task 在同一 network lane 并发时，bar 可能视觉重合；hover、
@@ -193,7 +243,7 @@ Inspector 中按需恢复；文件大小以当次 ZIP 和 task 数为准，不�
 `visualization/gate_load_profile.py` 是独立于时间线的第二个 HTML 模块。它参考
 [UltraEP profiler/viewer](https://dots-infra.github.io/UltraEP/zh/#4-效果可视化追踪每个-microbatch-的均衡收益)
 的层次化观察方法：先看所有 rank 的总体不均衡，再下钻到
-指定 layer、microbatch 和 expert instance。UltraEP 采集运行时 reroute 前后的
+指定 microbatch 和 expert instance。UltraEP 采集运行时 reroute 前后的
 真实负载；本项目直接读取 workload `manifest.json` 中生成器已经确定的：
 
 ```text
@@ -202,17 +252,30 @@ micro_batch_algorithms[*].expert_load_profile.before
 micro_batch_algorithms[*].expert_load_profile.after
 ```
 
-两种状态的准确含义是：
+页面以 microbatch 为唯一选择维度。对所选 MB，比较两端快照：
 
 | 状态 | 含义 |
 |---|---|
-| `before` | Gate logical assignments 按原始 expert placement 聚合 |
-| `after` | 算法把相同 logical assignments 分给实际 physical instance/execution rank 后聚合 |
+| `before` | 第一层 raw Gate logical assignments 按 baseline expert placement 聚合 |
+| `after` | 最后一层经过算法 admission 后的 physical instance/execution rank 负载 |
+
+这是“首层输入偏斜到末层最接近收敛 placement”的跨层观察，不是同一层算法前后
+对照。标题必须同时写出 `Layer N (id n)` 和 MB；页面不提供独立 Layer 选择器，避免
+不同模块把第一层和最后一层混用。算法仍在 manifest 中为每个
+`(layer,microbatch)` 保留完整 before/after profile，CSV/JSON 不丢失逐层原始数据。
 
 页面的 before/after rank 图强制使用相同 load 横轴，不能分别 autoscale 后制造
 “看起来一样均衡”的错觉。rank bar 内按 logical expert 分段，hover 可查看 instance、
-expert、rank 和 load；下方另画不受副本放置影响的 Gate logical-expert 分布，并提供
-可按 before/after 和 rank 筛选的实例明细。
+expert、rank 和 load；server 聚合图必须先于 rank 图并标出均值。Gate 输入分布分别
+展示第一层和最后一层 raw logical-expert histogram；它不表示算法 after placement。
+实例明细中的 Before/After 也分别绑定首层 raw 和末层 admitted 快照。
+
+迁移与网络模块统一绑定最后一层：
+
+- `Cross-server expert copies` 只统计最后一层真正 admitted 的完整 remote replicas；
+- planned/admitted/deferred 和 server padded routes 只报告最后一层；
+- directed server-pair 与 per-NIC 图只画最后一层的 Dispatch、Combine 和 Expert Weight；
+- 不跨层累计 bytes 或 replica 数，因为这些模块用于观察当前实验最接近收敛的状态。
 
 输出为：
 
@@ -223,8 +286,9 @@ expert、rank 和 load；下方另画不受副本放置影响的 Gate logical-ex
 └── gate_load_profile_summary.json
 ```
 
-它不是 HTSim 时间结果，也不表示真实 GPU kernel profiler。load 单位是 logical
-token route 数；页面负责回答“Gate 有多偏、算法把执行负载搬到哪里”，DAG timeline
+它不是 HTSim 时间结果，也不表示真实 GPU kernel profiler。load 单位是 TopK 展开后的
+logical expert-token route 数，不是 unique input tokens，也不是执行时间。页面负责回答
+“首层 raw Gate 有多偏、末层算法把执行负载搬到哪里”，DAG timeline
 负责回答“任务实际何时开始/结束”，链路图负责回答“物理网络何时有多少流量”。
 
 ## 5. 使用方法
@@ -320,7 +384,7 @@ ZIP 不包含 workload、HTSim log、`htsim.dat` 或原始 `output_metrics`。ZI
 
 - 不解析单条 flow 内 packet 进度；一个 DAG network task 是一根完整 FCT bar。
 - `server_forward` relay 使用现有 TX/RX lane，但首版不拆出 subflow 子区间。
-- 不根据重叠 bar 推导真实 SM occupancy；stream 顺序来自生成器的静态 DAG edges。
+- 不根据重叠 bar 推导真实 SM occupancy；stream 顺序来自生成器提交的不可变 DAG edges，可以是静态文件或动态 append batch。
 - 不用逻辑 throughput 替代物理链路 sampler。
 - 当前不画 predecessor 箭头；完整依赖保留在点击后的 Inspector 和 task
   CSV 中，避免 EP32 图被大量连线覆盖。
@@ -353,6 +417,7 @@ python3 tests/run_gate_workload_visualization.py
   页面可恢复 GPU 00 到 GPU 31，服务器 run 目录不保留散装 HTML。
 - Gate 测试验证 raw `32 x 58 x 9` physical receive 数据向 256 logical experts
   折叠守恒、五种 provider 可复现、before/after 逻辑路由守恒，以及 HTML/CSV/JSON
-  三种产物完整生成。
+  三种产物完整生成；HTML 只按 MB 选择，首层 raw/末层 admitted 比较和末层
+  migration/server-pair/per-NIC 数据绑定必须同时成立。
 - 五算法 runner 验证五份 manifest 的 Gate assignment digest 序列完全相同；ZIP
   同时包含五个完整算法 dashboard、各算法 Gate/timeline HTML 和一个总 dashboard。

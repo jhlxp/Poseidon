@@ -26,6 +26,7 @@ from moe_dag.models import (  # noqa: E402
     TransformerWorkloadConfig,
     build_transformer_workload,
 )
+from moe_dag.cost import ComputeEstimate  # noqa: E402
 from workload.gate import (  # noqa: E402
     GATE_PROVIDER_NAMES,
     RawReceiveDataset,
@@ -47,6 +48,37 @@ class Result:
     name: str
     status: str
     detail: str
+
+
+class SlowVisualizationCostModel:
+    communication_sms = 20
+
+    def estimate(
+        self,
+        operation_flops: int,
+        *,
+        operation: str,
+        overlaps_communication: bool = False,
+        token_count: int | None = None,
+    ) -> ComputeEstimate:
+        tokens = token_count or 1
+        return ComputeEstimate(
+            operation_flops=operation_flops,
+            duration_us=max(1.0, tokens * 1000.0),
+            overlaps_communication=overlaps_communication,
+            available_sms=112 if overlaps_communication else 132,
+            peak_flops_per_second=1.0,
+            source="gate_transport_test_slow_compute",
+            token_count=token_count,
+            us_per_token=1000.0,
+            token_kind=operation,
+        )
+
+    def manifest(self) -> dict[str, object]:
+        return {
+            "model": "gate_transport_test_slow_compute",
+            "communication_sms": self.communication_sms,
+        }
 
 
 def require(condition: bool, message: str) -> None:
@@ -204,15 +236,169 @@ def main() -> int:
         require((output_dir / "gate_load_profile.csv").is_file(), "expert instance CSV is missing")
         require(
             all(marker in html for marker in (
-                "Rank load before / after",
+                "Rank MoE expert-token load before / after",
+                "Server MoE expert-token load before / after",
+                "MoE expert-token load definition",
+                "Before: first-layer raw distribution",
+                "After: final-layer ProbeEP placement",
+                "TopK-expanded expert-token count",
+                "final server mean",
+                "serverChart",
                 "Gate logical-expert distribution",
+                "First-layer Gate",
+                "Final-layer Gate",
                 "Expert instance details",
+                "data-comparison-scope",
+                "currentComparison",
+                "Layer ${c.beforeRecord.layer + 1} before -> Layer ${c.afterRecord.layer + 1} after",
             )),
             "HTML controls or modules are incomplete",
         )
-        results.append(Result("before_after_html", "passed", "EPLB 2 layer x 2 microbatch 生成同尺度 before/after rank 图、Gate expert 图和实例明细"))
+        require('id="layer"' not in html, "HTML must compare layers within one microbatch")
+        results.append(Result("before_after_html", "passed", "每个 microbatch 固定比较首层 before 与末层 after，并生成同尺度 server/rank、Gate expert 图和实例明细"))
     except Exception as exc:
         results.append(Result("before_after_html", "failed", str(exc)))
+
+    try:
+        probe_provider = create_gate_provider(
+            "raw_receive_cdf",
+            seed=17,
+            raw_placement_json=RAW_PLACEMENT,
+            layer_map=(0, 1),
+        )
+        probe_built = build_transformer_workload(
+            TransformerWorkloadConfig(
+                model=model,
+                placement=placement,
+                tokens_per_rank=2,
+                algorithm="probeep",
+                chunk_tokens=32,
+                gate_provider=probe_provider,
+            ),
+            cost_model=SlowVisualizationCostModel(),
+        )
+        probe_workload = run_dir / "probeep_workload"
+        emit_workload(
+            probe_built.graph, probe_workload, metadata=probe_built.metadata
+        )
+        probe_output = run_dir / "probeep_gate_load"
+        command = [
+            sys.executable,
+            str(VISUALIZER),
+            "--workload-dir",
+            str(probe_workload),
+            "--output-dir",
+            str(probe_output),
+            "--title",
+            "ProbeEP directed transport visualization test",
+        ]
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        (run_dir / "ProbeEP可视化.log").write_text(
+            completed.stdout, encoding="utf-8"
+        )
+        require(
+            completed.returncode == 0,
+            f"ProbeEP visualizer returned {completed.returncode}",
+        )
+        html = (probe_output / "gate_load_profile.html").read_text(
+            encoding="utf-8"
+        )
+        summary = json.loads(
+            (probe_output / "gate_load_profile_summary.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        require(
+            all(
+                marker in html
+                for marker in (
+                    "Cross-server expert copies",
+                    "Directed server-pair load",
+                    "Per-NIC directed load",
+                    "Directed server-pair data table",
+                    "Per-NIC directed data table",
+                    "directedLoadChart",
+                    "After: final-layer ProbeEP placement",
+                    "Final migration P/A/D",
+                    "Final-layer server padded routes",
+                    "Remote expert copies",
+                    "Source TX total",
+                    "Expert IDs",
+                )
+            ),
+            "ProbeEP transport HTML modules are incomplete",
+        )
+        total_remote_copies = 0
+        source_records = sorted(
+            probe_built.metadata["micro_batch_algorithms"],
+            key=lambda item: (item["layer"], item["micro_batch"]),
+        )
+        for source, rendered in zip(source_records, summary["records"]):
+            transport = rendered["transport"]
+            planning = rendered["planning"]
+            remote_replicas = source["remote_replicas"]
+            total_remote_copies += len(remote_replicas)
+            require(
+                planning["planned_intent_count"]
+                == len(source["planned_migration_intents"])
+                and planning["admitted_intent_count"]
+                == len(source["admitted_migration_intents"])
+                and planning["deferred_intent_count"]
+                == len(source["deferred_migration_intents"]),
+                "rendered planning/admission counts do not match manifest",
+            )
+            require(
+                transport["remote_replica_count"] == len(remote_replicas),
+                "remote expert copies do not match manifest replicas",
+            )
+            require(
+                transport["expert_weight_bytes"]
+                == sum(int(item["weight_bytes"]) for item in remote_replicas),
+                "remote expert bytes do not match manifest replicas",
+            )
+            pair_rows = transport["server_pairs"]
+            transfer = source["hierarchical_transfer"]["bytes_by_leg"]
+            require(
+                sum(int(item["dispatch_bytes"]) for item in pair_rows)
+                == int(transfer.get("dispatch_fabric", 0)),
+                "directed pair Dispatch bytes are not conserved",
+            )
+            require(
+                sum(int(item["combine_bytes"]) for item in pair_rows)
+                == int(transfer.get("combine_fabric", 0)),
+                "directed pair Combine bytes are not conserved",
+            )
+            for pair in pair_rows:
+                nics = pair["nics"]
+                require(
+                    sum(int(item["dispatch_bytes"]) for item in nics)
+                    == int(pair["dispatch_bytes"])
+                    and sum(int(item["combine_bytes"]) for item in nics)
+                    == int(pair["combine_bytes"])
+                    and sum(int(item["expert_weight_bytes"]) for item in nics)
+                    == int(pair["expert_weight_bytes"]),
+                    "per-NIC bytes do not sum to their directed server pair",
+                )
+        require(total_remote_copies > 0, "ProbeEP transport test has no remote copies")
+        results.append(
+            Result(
+                "probeep_directed_transport_html",
+                "passed",
+                f"{total_remote_copies} 个 remote copies；server-pair 与 per-NIC Dispatch/Combine/Weight bytes 守恒",
+            )
+        )
+    except Exception as exc:
+        results.append(
+            Result("probeep_directed_transport_html", "failed", str(exc))
+        )
 
     passed = sum(item.status == "passed" for item in results)
     summary_payload = {

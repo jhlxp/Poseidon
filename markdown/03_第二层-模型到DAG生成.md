@@ -415,7 +415,7 @@ TP=1, PP=1, EP=32
 H=7168, E=256, top-k=8
 连续 expert placement
 seed 0 的 balanced-permuted router assignment
-NCCL、DeepEP、EPLB 与 MoonEP 四种输出
+NCCL、DeepEP、EPLB、MoonEP 与 ProbeEP 五种输出
 ```
 
 该配置使用 plane=1、8 Leaf、4 Spine、400 Gbps RDMA 的专用测试拓扑。NCCL 验证
@@ -423,7 +423,8 @@ rank-direct All-to-All 和 Spine 流量；DeepEP 验证 rank/server 两级去冗
 RDMA/NVLink hierarchy legs；EPLB 验证持久 hierarchical placement 和稳态 DeepEP
 transport；MoonEP 在每个 expert home server 内独立规划 replica，并复用 DeepEP
 跨服务器 transport。该 MoonEP 组合是本项目的核心算法抽象，不声称官方实现提供
-多节点 RDMA。
+多节点 RDMA。ProbeEP 在 MoonEP/DeepEP 语义上增加跨服务器临时专家迁移和
+单进程 HTSim 内的 Dispatch FCT 闭环反馈。
 
 ## 12. 硬件规格来源
 

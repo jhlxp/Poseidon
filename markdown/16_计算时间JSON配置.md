@@ -26,11 +26,25 @@ profiled    -> profiled_us_per_token
 
 ```text
 pysrc/compute_profiles/H100_DSV3_EP32_compute_4096tpr.json
+pysrc/compute_profiles/H20_DSV3_EP32_compute_4096tpr.json
 ```
+
+ProbeEP 两层 full 和五算法 full runner 的默认完整实验 profile 为
+`H20_DSV3_EP32_compute_4096tpr.json`。H100 profile 保留为显式对照，不再是默认。
 
 文件名中的 `4096tpr` 表示它服务于标准 DSV3 4096 tokens/rank 实验，并不表示
 JSON 内保存 4096 tokens 的固定总时间。Attention 的单 token 时间仍与固定的
 sequence length、hidden shape 和 kernel 定义有关，因此配置不是跨模型通用常数。
+
+H20 理论 profile 固定使用 `148 TFLOP/s` dense BF16、78 个 SM、通信
+预留 20 个 SM；因此 Expert FFN 的 overlap 计算峰值为
+`148 * (78-20) / 78 = 110.0513 TFLOP/s`。该数值是理论占位，不是
+H20 上的 grouped-GEMM profiling 结果。
+
+| profile | dense BF16 | total SM | communication SM | overlap compute peak |
+|---|---:|---:|---:|---:|
+| H100 SXM | 989 TFLOP/s | 132 | 20 | 839.1515 TFLOP/s |
+| H20 SXM | 148 TFLOP/s | 78 | 20 | 110.0513 TFLOP/s |
 
 ## 3. Schema v2
 
@@ -134,6 +148,17 @@ python3 pysrc/generate_moe_dag.py \
   --compute-config pysrc/compute_profiles/H100_DSV3_EP32_compute_4096tpr.json \
   --compute-time-source theoretical
 ```
+
+完整 H20 ProbeEP 动态闭环实验显式传入 profile：
+
+```bash
+python3 tests/run_probeep_2layer_ratio_full.py \
+  --full --gate-layer-map 0,1 \
+  --compute-config pysrc/compute_profiles/H20_DSV3_EP32_compute_4096tpr.json
+```
+
+不再有 baseline/replay 两份 profile 的混用问题。同一份 JSON 用于单个
+HTSim 进程中所有动态追加的 compute task。
 
 ## 7. Manifest 和 task 审计
 

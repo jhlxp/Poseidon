@@ -317,6 +317,17 @@ def artifacts_case(output_dir: Path) -> str:
             "SVG 仍在重复内联 tooltip 或 predecessor 文本")
     require("data-task-id='2'" in html and "class=\"hover-tooltip\"" in html,
             "SVG bar 没有使用 task_id 动态 tooltip")
+    require(
+        "Math.max(row[I.actual_duration_us] * scale, 1.2)" not in html
+        and "item.setAttribute('width', String(row[I.actual_duration_us] * scale))"
+        in html,
+        "HTML 仍用最小像素宽度伪造短 task 持续时间",
+    )
+    require(
+        "class='task-marker' data-task-id='3'" in html
+        and "Layer ${Number(match[2]) + 1}" in html,
+        "HTML 缺少短 compute milestone 或 Layer/MB scope",
+    )
     columns_match = re.search(
         r'<script type="application/json" id="task-columns">(.*?)</script>',
         html,
@@ -380,6 +391,17 @@ def artifacts_case(output_dir: Path) -> str:
             "overview 缺少 expert weight 计数")
     require(overview["expert_weight_bytes"] == 2_000_000,
             "overview expert weight 字节错误")
+    require(
+        overview["expert_weight_logical_leg_bytes"] == 2_000_000
+        and overview["expert_weight_rdma_bytes"] == 2_000_000
+        and overview["expert_weight_local_bytes"] == 0,
+        "overview 没有区分 expert weight 逻辑 leg、RDMA 和 local bytes",
+    )
+    require(
+        "use expert_weight_rdma_bytes"
+        in overview["semantics"]["expert_weight_bytes"],
+        "overview 缺少 expert weight 字节口径说明",
+    )
     require(overview["expert_weight_active_us"] == 2.0,
             "overview expert weight active 时间错误")
     require(math.isclose(
@@ -463,11 +485,6 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
                                         }
                                     ],
                                     "remote_weight_rdma_bytes": 88_080_384,
-                                    "expert_slots_per_rank": 40,
-                                    "total_expert_slots_used_by_rank": {
-                                        "0": 39,
-                                        "1": 12,
-                                    },
                                 }
                             ]
                         }
@@ -543,8 +560,7 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
     require(
         "Cross-server expert migration" in probeep_dashboard
         and "1 cross-server expert moves" in probeep_dashboard
-        and "84 MiB" in probeep_dashboard
-        and "39/40 peak slots" in probeep_dashboard,
+        and "84 MiB" in probeep_dashboard,
         "ProbeEP dashboard 缺少跨机 expert 数和权重字节",
     )
     return "单算法完整 dashboard 和多算法总 dashboard 均正确打包"

@@ -20,6 +20,7 @@ sys.path.insert(0, str(PYSRC))
 
 from moe_dag import (  # noqa: E402
     ComputeEstimate,
+    DynamicDagEmitter,
     H100CostModel,
     JsonComputeCostModel,
     ModelSpec,
@@ -29,6 +30,7 @@ from moe_dag import (  # noqa: E402
     TaskGraph,
     ValidationError,
     emit_workload,
+    probeep_weight_dispatch_observations,
 )
 from moe_dag.algorithms import (  # noqa: E402
     DeepEPBuilder,
@@ -43,12 +45,13 @@ from moe_dag.algorithms import (  # noqa: E402
     ProbeEPConfig,
     ProbeNICController,
     ProbeNICControllerConfig,
-    ProbeSampleFeedback,
+    ProbeDispatchFeedback,
     TokenPayloadPolicy,
     plan_hierarchical_placement,
     plan_token_payloads,
 )
 from moe_dag.models import (  # noqa: E402
+    IncrementalTransformerWorkloadBuilder,
     TransformerWorkloadConfig,
     build_transformer_workload,
 )
@@ -216,6 +219,46 @@ def json_compute_cost_case(run_dir: Path) -> str:
         theoretical.manifest()["selected_source"] == "theoretical",
         "JSON cost manifest 没有记录 theoretical 选择",
     )
+    h20_config_path = (
+        PYSRC
+        / "compute_profiles"
+        / "H20_DSV3_EP32_compute_4096tpr.json"
+    )
+    h20 = JsonComputeCostModel.from_path(h20_config_path)
+    h20_attention = h20.estimate(
+        1_000_000,
+        operation="attention",
+        overlaps_communication=True,
+        token_count=4096,
+    )
+    h20_expert = h20.estimate(
+        6 * 7168 * 2048,
+        operation="expert_ffn",
+        overlaps_communication=True,
+        token_count=1,
+    )
+    require(
+        h20.hardware == "H20_SXM"
+        and h20.total_sms == 78
+        and h20.overlap_sms == 58,
+        "H20 profile 的硬件或 SM 划分错误",
+    )
+    require(
+        math.isclose(
+            h20_attention.duration_us,
+            4096 * 3.5708263783783784,
+            rel_tol=1e-12,
+        ),
+        "H20 Attention 理论单价错误",
+    )
+    require(
+        math.isclose(
+            h20_expert.duration_us,
+            6 * 7168 * 2048 / (148e12 * 58 / 78) * 1e6,
+            rel_tol=1e-12,
+        ),
+        "H20 Expert FFN 没有按 58 SM overlap 峰值换算",
+    )
     profile_payload = json.loads(config_path.read_text(encoding="utf-8"))
     legacy_payload = dict(profile_payload)
     legacy_payload["schema_version"] = 1
@@ -310,7 +353,7 @@ def json_compute_cost_case(run_dir: Path) -> str:
         )
     else:
         raise AssertionError("选中的 profiled_us_per_token 为空时应拒绝生成")
-    return "JSON per-token theoretical/profiled 二选一正确；实际 FFN task 按 7:1 routed tokens 缩放"
+    return "H100/H20 JSON per-token theoretical/profiled 口径正确；实际 FFN task 按 7:1 routed tokens 缩放"
 
 
 def emitter_case(run_dir: Path) -> str:
@@ -678,6 +721,19 @@ def algorithm_cli_case(run_dir: Path) -> str:
         )
         require(manifest["metadata"]["algorithm"] == algorithm,
                 f"{algorithm} CLI manifest 算法记录错误")
+        metadata = manifest["metadata"]
+        require(
+            ("replicas_per_rank" in metadata) == (algorithm == "moonep"),
+            f"{algorithm} manifest 错误携带 MoonEP replica capacity",
+        )
+        require(
+            ("probeep" in metadata) == (algorithm == "probeep"),
+            f"{algorithm} manifest 的 ProbeEP 配置边界错误",
+        )
+        require(
+            ("eplb" in metadata) == (algorithm == "eplb"),
+            f"{algorithm} manifest 的 EPLB 配置边界错误",
+        )
         if algorithm == "eplb":
             algorithm_metadata = manifest["metadata"]["micro_batch_algorithms"][0]
             require(
@@ -909,17 +965,12 @@ def probeep_cross_server_case(run_dir: Path) -> str:
     result = ProbeEPBuilder(
         LinearTokenCostModel(),
         ProbeEPConfig(
-            expert_slots_per_rank=3,
             token_padding=1,
             chunk_tokens=8,
             route_chunk_tokens=8,
             weight_chunk_bytes=8192,
-            max_remote_replicas=8,
             nic_controller=ProbeNICControllerConfig(
-                initial_budget_bytes=16 * 1024,
-                min_budget_bytes=0,
-                max_budget_bytes=64 * 1024,
-                additive_increase_bytes=1024,
+                initial_budget_bytes=64 * 1024,
             ),
         ),
     ).build(graph, invocation)
@@ -977,10 +1028,32 @@ def probeep_cross_server_case(run_dir: Path) -> str:
     require(0 not in used_rails,
             "已知 token fabric 热点 rail 0 不应优先承载 weight chunks")
     require(
-        result.metadata["predicted_token_tx_bytes"][0] > 0
-        and result.metadata["predicted_token_rx_bytes"][8] > 0,
+        result.metadata["predicted_dispatch_tx_bytes"][0] > 0
+        and result.metadata["predicted_dispatch_rx_bytes"][8] > 0,
         "ProbeEP 没有记录 layout 推导的 token NIC 基线负载",
     )
+    for rank in range(placement.num_ranks):
+        require(
+            result.metadata["assigned_migration_tx_bytes"][rank]
+            <= min(
+                result.metadata["nic_budget_before"][rank],
+                max(
+                    0,
+                    result.metadata["nic_theoretical_max_bytes"]
+                    - result.metadata["predicted_dispatch_tx_bytes"][rank],
+                ),
+            )
+            and result.metadata["assigned_migration_rx_bytes"][rank]
+            <= min(
+                result.metadata["nic_budget_before"][rank],
+                max(
+                    0,
+                    result.metadata["nic_theoretical_max_bytes"]
+                    - result.metadata["predicted_dispatch_rx_bytes"][rank],
+                ),
+            ),
+            f"rank {rank} 的 migration 超过 Dispatch-window TX/RX budget",
+        )
     remote_destinations = {
         int(item["destination_rank"]) for item in remote_replicas
     }
@@ -1003,6 +1076,17 @@ def probeep_cross_server_case(run_dir: Path) -> str:
     )
     require(result.metadata["planner_runtime_model"] == "not_in_dag",
             "ProbeEP manifest 没有声明 planner 开销不进入 DAG")
+    pair_rows = result.metadata[
+        "assigned_migration_bytes_by_server_pair"
+    ]
+    require(len(pair_rows) == 1, "ProbeEP 缺少 server-pair rail 负载")
+    require(
+        pair_rows[0]["source_server"] == 0
+        and pair_rows[0]["destination_server"] == 1
+        and sum(pair_rows[0]["bytes_by_rail"])
+        == invocation.expert_weight_bytes,
+        "ProbeEP server-pair rail 字节不守恒",
+    )
     local_prefetches = result.metadata["local_prefetches"]
     require(
         any(item["scope"] == "remote_server" for item in local_prefetches),
@@ -1021,67 +1105,426 @@ def probeep_cross_server_case(run_dir: Path) -> str:
     )
 
 
+def probeep_pair_aware_chunk_case() -> str:
+    placement = Placement(24, 8, (0,))
+    invocation = MoEInvocation(
+        "probeep_pair_aware_chunks",
+        placement,
+        (1,) * placement.num_ranks,
+        64,
+        128,
+        1,
+        "fp8",
+        "bf16",
+        "bf16",
+        tuple(
+            RoutingAssignment(rank, 0, 0, 0)
+            for rank in range(placement.num_ranks)
+        ),
+    )
+    chunk_bytes = 8192
+    builder = ProbeEPBuilder(
+        LinearTokenCostModel(),
+        ProbeEPConfig(
+            token_padding=1,
+            chunk_tokens=1,
+            route_chunk_tokens=1,
+            weight_chunk_bytes=chunk_bytes,
+        ),
+    )
+    budgets = (1 << 30,) * placement.num_ranks
+    dispatch = (0,) * placement.num_ranks
+    assigned_tx = [0] * placement.num_ranks
+    assigned_rx = [0] * placement.num_ranks
+    pair_loads: dict[tuple[int, int], tuple[int, ...]] = {}
+    for source_server, destination_server in ((0, 1), (0, 2), (0, 1)):
+        pair = (source_server, destination_server)
+        schedule = builder._schedule_weight_chunks(
+            invocation,
+            source_server,
+            destination_server,
+            budgets,
+            1 << 30,
+            assigned_tx,
+            assigned_rx,
+            dispatch,
+            dispatch,
+            pair_loads.get(pair, (0,) * placement.gpus_per_server),
+        )
+        require(schedule is not None, f"server pair {pair} 无法调度")
+        _chunks, assigned_tx, assigned_rx, pair_loads[pair] = schedule
+
+    require(set(pair_loads) == {(0, 1), (0, 2)},
+            "不同 destination 没有维护独立 pair load")
+    require(
+        sum(pair_loads[(0, 1)]) == 2 * invocation.expert_weight_bytes
+        and sum(pair_loads[(0, 2)]) == invocation.expert_weight_bytes,
+        "server-pair load 混入了其他 destination 的字节",
+    )
+    for pair, loads in pair_loads.items():
+        require(
+            max(loads) - min(loads) <= chunk_bytes,
+            f"server pair {pair} 的 rail spread 超过一个 chunk: {loads}",
+        )
+    require(
+        sum(assigned_tx[:8]) == 3 * invocation.expert_weight_bytes
+        and sum(assigned_rx[8:16]) == 2 * invocation.expert_weight_bytes
+        and sum(assigned_rx[16:24]) == invocation.expert_weight_bytes,
+        "物理 endpoint total 与 pair load 求和不一致",
+    )
+    return "0->1 与 0->2 独立 water-fill；pair spread <= 1 chunk，endpoint totals 守恒"
+
+
+def probeep_global_quota_case() -> str:
+    placement = Placement(
+        num_ranks=16,
+        gpus_per_server=4,
+        expert_to_rank=(0, 1, 4, 5, 8, 9, 12, 13),
+    )
+    expert_counts = (48, 16, 32, 16, 16, 16, 8, 8)
+    assignments: list[RoutingAssignment] = []
+    sequence = 0
+    for expert_id, count in enumerate(expert_counts):
+        for _ in range(count):
+            src_rank = sequence % placement.num_ranks
+            token_id = sequence // placement.num_ranks
+            assignments.append(
+                RoutingAssignment(src_rank, token_id, 0, expert_id)
+            )
+            sequence += 1
+    invocation = MoEInvocation(
+        "probeep_global_quota",
+        placement,
+        (10,) * placement.num_ranks,
+        64,
+        128,
+        1,
+        "fp8",
+        "bf16",
+        "bf16",
+        tuple(assignments),
+    )
+    builder = ProbeEPBuilder(
+        LinearTokenCostModel(),
+        ProbeEPConfig(
+            token_padding=1,
+            chunk_tokens=8,
+            route_chunk_tokens=8,
+            weight_chunk_bytes=8192,
+            nic_controller=ProbeNICControllerConfig(
+                initial_budget_bytes=1024 * 1024,
+            ),
+        ),
+    )
+    plan = builder.plan(
+        invocation,
+        moe_compute_us_by_rank=(1000.0,) * placement.num_ranks,
+    )
+    require(
+        plan.baseline_server_routes == {0: 64, 1: 48, 2: 32, 3: 16},
+        f"全局配额测试基线错误: {plan.baseline_server_routes}",
+    )
+    require(plan.server_target_routes == {0: 40, 1: 40, 2: 40, 3: 40},
+            f"全局目标不是 40/server: {plan.server_target_routes}")
+    require(plan.donor_surplus_routes == {0: 24, 1: 8, 2: 0, 3: 0},
+            f"donor surplus 错误: {plan.donor_surplus_routes}")
+    require(plan.receiver_deficit_routes == {0: 0, 1: 0, 2: 8, 3: 24},
+            f"receiver deficit 错误: {plan.receiver_deficit_routes}")
+    require(
+        {intent.source_server for intent in plan.planned_intents} == {0, 1}
+        and {intent.destination_server for intent in plan.planned_intents}
+        == {2, 3},
+        "并非所有 donor/receiver server 都参与全局谈判",
+    )
+    require(plan.planned_intents[0].expert_id == 0,
+            "全局谈判没有优先迁移最热点 expert")
+    require(plan.planned_server_routes == plan.server_target_routes,
+            "全局谈判后的 route 数没有到达目标")
+    return "4 servers 同时完成 64/48/32/16 -> 40/40/40/40，热点 expert 优先"
+
+
+def probeep_padding_aware_global_balance_case() -> str:
+    placement = Placement(
+        num_ranks=8,
+        gpus_per_server=2,
+        expert_to_rank=(0, 1, 0, 2, 4, 6),
+    )
+    expert_counts = (6, 1, 1, 8, 8, 8)
+    assignments: list[RoutingAssignment] = []
+    sequence = 0
+    for expert_id, count in enumerate(expert_counts):
+        for _ in range(count):
+            assignments.append(
+                RoutingAssignment(
+                    sequence % placement.num_ranks,
+                    sequence // placement.num_ranks,
+                    0,
+                    expert_id,
+                )
+            )
+            sequence += 1
+    invocation = MoEInvocation(
+        "probeep_padding_aware_global_balance",
+        placement,
+        (4,) * placement.num_ranks,
+        64,
+        128,
+        1,
+        "fp8",
+        "bf16",
+        "bf16",
+        tuple(assignments),
+    )
+    plan = ProbeEPBuilder(
+        LinearTokenCostModel(),
+        ProbeEPConfig(
+            token_padding=4,
+            chunk_tokens=4,
+            route_chunk_tokens=4,
+            weight_chunk_bytes=8192,
+            nic_controller=ProbeNICControllerConfig(
+                initial_budget_bytes=1024 * 1024,
+            ),
+        ),
+    ).plan(
+        invocation,
+        moe_compute_us_by_rank=(1000.0,) * placement.num_ranks,
+    )
+
+    require(
+        plan.baseline_server_routes == {0: 8, 1: 8, 2: 8, 3: 8},
+        f"raw server load 反例不正确: {plan.baseline_server_routes}",
+    )
+    require(
+        plan.baseline_server_padded_routes == {0: 16, 1: 8, 2: 8, 3: 8},
+        "padding server load 反例不正确",
+    )
+    require(
+        max(plan.planned_server_padded_routes.values())
+        < max(plan.baseline_server_padded_routes.values()),
+        "跨机 refinement 没有降低全局最慢 server padding load",
+    )
+    require(
+        plan.planned_server_routes != plan.server_target_routes,
+        "padding refinement 被错误限制为 raw-route 100% 相等",
+    )
+    require(plan.planned_intents, "padding refinement 没有生成跨机 intent")
+    require(
+        plan.admitted_intents == plan.planned_intents
+        and plan.admitted_server_padded_routes
+        == plan.planned_server_padded_routes,
+        "高预算 admission 没有保留全局 padding refinement 方案",
+    )
+    for server in range(placement.num_servers):
+        ranks = range(server * placement.gpus_per_server, (server + 1) * placement.gpus_per_server)
+        padded = [plan.final_padded_routes_by_rank[rank] for rank in ranks]
+        require(
+            max(padded) - min(padded) <= 4,
+            f"server {server} 本地 padding-aware packing 差超过一个 block: {padded}",
+        )
+    return (
+        "raw routes 均为 8/server 时，跨机 refinement 仍将 padded max "
+        "从 16 降至 12；本地 capacity packing spread <= 1 block"
+    )
+
+
 def probeep_controller_case() -> str:
     mib = 1024 * 1024
     controller = ProbeNICController(
         4,
         ProbeNICControllerConfig(
             initial_budget_bytes=10 * mib,
-            min_budget_bytes=1 * mib,
-            max_budget_bytes=20 * mib,
-            multiplicative_decrease=0.9,
-            additive_increase_bytes=1 * mib,
-            deadband_ratio=0.05,
+            nic_line_rate_gbps=400.0,
+            target_overlap_ratio=0.90,
         ),
     )
-    decrease = controller.update(
-        ProbeSampleFeedback(
-            sample_id=0,
-            compute_us_by_rank=(100.0,) * 4,
-            nic_us_by_rank=(125.0, 60.0, 55.0, 50.0),
-            migration_bytes_by_rank=(8 * mib, 4 * mib, 4 * mib, 4 * mib),
+    attention_update = controller.update(
+        ProbeDispatchFeedback(
+            observation_id=0,
+            attention_compute_us_by_rank=(1000.0,) * 4,
+            moe_compute_us_by_rank=(800.0,) * 4,
+            dispatch_overlap_compute_kind="attention",
+            weight_dispatch_us_by_rank=(500.0, 2000.0, 1000.0, 850.0),
+            dispatch_baseline_bytes_by_rank=(0,) * 4,
+            migration_bytes_by_rank=(10 * mib,) * 4,
+            migration_tx_bytes_by_rank=(10 * mib,) * 4,
+            migration_rx_bytes_by_rank=(10 * mib,) * 4,
             pending_migration_exists=True,
         )
     )
-    require(decrease.action == "multiplicative_decrease",
-            "NIC 瓶颈没有触发 multiplicative decrease")
-    require(decrease.bottleneck_ranks == (0,),
-            f"错误的 bottleneck ranks: {decrease.bottleneck_ranks}")
-    require(controller.budgets == (9 * mib, 10 * mib, 10 * mib, 10 * mib),
-            "0.9 NIC budget 更新错误")
+    require(attention_update.action == "ratio_decrease",
+            "global barrier ratio controller 没有统一减窗")
+    require(attention_update.bottleneck_ranks == (1,),
+            f"错误的 bottleneck ranks: {attention_update.bottleneck_ranks}")
+    require(
+        controller.budgets_for("attention") == (int(4.5 * mib),) * 4,
+        "0.90*Cmax/Nmax 没有向所有 NIC 应用同一比例",
+    )
+    require(
+        abs(attention_update.global_network_to_compute_ratio - 2.0) < 1e-12
+        and abs(attention_update.global_adjustment_factor - 0.45) < 1e-12,
+        "global Cmax/Nmax telemetry 错误",
+    )
+    require(controller.budgets_for("moe") == (10 * mib,) * 4,
+            "Attention feedback 污染了 MoE budget")
+    require(
+        attention_update.manifest()["migration_bytes_semantics"]
+        == "max_tx_rx_per_rank_full_duplex_endpoint"
+        and attention_update.migration_tx_bytes_by_rank == (10 * mib,) * 4
+        and attention_update.migration_rx_bytes_by_rank == (10 * mib,) * 4,
+        "ProbeEP controller 丢失了方向 TX/RX 或 endpoint 字节语义",
+    )
 
-    increase = controller.update(
-        ProbeSampleFeedback(
-            sample_id=1,
-            compute_us_by_rank=(120.0,) * 4,
-            nic_us_by_rank=(50.0, 45.0, 40.0, 35.0),
-            migration_bytes_by_rank=(0, 0, 0, 0),
+    moe_update = controller.update(
+        ProbeDispatchFeedback(
+            observation_id=1,
+            attention_compute_us_by_rank=(1000.0,) * 4,
+            moe_compute_us_by_rank=(2000.0,) * 4,
+            dispatch_overlap_compute_kind="moe",
+            weight_dispatch_us_by_rank=(1000.0,) * 4,
+            dispatch_baseline_bytes_by_rank=(0,) * 4,
+            migration_bytes_by_rank=(10 * mib,) * 4,
+            migration_tx_bytes_by_rank=(10 * mib,) * 4,
+            migration_rx_bytes_by_rank=(10 * mib,) * 4,
             pending_migration_exists=True,
         )
     )
-    require(increase.action == "additive_increase",
-            "compute bottleneck 没有触发 additive increase")
-    require(controller.budgets == (10 * mib, 11 * mib, 11 * mib, 11 * mib),
-            "additive NIC budget 更新错误")
+    require(moe_update.action == "ratio_increase",
+            "MoE ratio feedback 没有直接增窗")
+    require(
+        controller.budgets_for("moe") == (18 * mib,) * 4,
+        "N=0.5*C 时没有按 beta=0.90 一步调整到 1.8 倍",
+    )
+    require(
+        controller.budgets_for("attention") == (int(4.5 * mib),) * 4,
+        "MoE feedback 污染了 Attention budget",
+    )
+
+    capped_controller = ProbeNICController(
+        4,
+        ProbeNICControllerConfig(
+            initial_budget_bytes=10 * mib,
+        ),
+    )
+    capped = capped_controller.update(
+        ProbeDispatchFeedback(
+            observation_id=2,
+            attention_compute_us_by_rank=(100.0,) * 4,
+            moe_compute_us_by_rank=(1200.0,) * 4,
+            dispatch_overlap_compute_kind="attention",
+            weight_dispatch_us_by_rank=(50.0,) * 4,
+            dispatch_baseline_bytes_by_rank=(1_000_000,) * 4,
+            migration_bytes_by_rank=(10 * mib,) * 4,
+            migration_tx_bytes_by_rank=(10 * mib,) * 4,
+            migration_rx_bytes_by_rank=(10 * mib,) * 4,
+            pending_migration_exists=True,
+        )
+    )
+    require(capped.nic_theoretical_max_bytes == 5_000_000,
+            "400 Gbps * 100 us 理论上限错误")
+    require(capped.hard_migration_cap_by_rank == (4_000_000,) * 4,
+            "Dispatch baseline 后 Bhard 错误")
+    require(capped_controller.budgets_for("attention") == (4_000_000,) * 4,
+            "有效 budget 没有被 Bhard 截断")
 
     hold = controller.update(
-        ProbeSampleFeedback(
-            sample_id=2,
-            compute_us_by_rank=(120.0,) * 4,
-            nic_us_by_rank=(50.0,) * 4,
+        ProbeDispatchFeedback(
+            observation_id=3,
+            attention_compute_us_by_rank=(1000.0,) * 4,
+            moe_compute_us_by_rank=(2000.0,) * 4,
+            dispatch_overlap_compute_kind="moe",
+            weight_dispatch_us_by_rank=(100.0,) * 4,
+            dispatch_baseline_bytes_by_rank=(0,) * 4,
             migration_bytes_by_rank=(0, 0, 0, 0),
+            migration_tx_bytes_by_rank=(0, 0, 0, 0),
+            migration_rx_bytes_by_rank=(0, 0, 0, 0),
             pending_migration_exists=False,
         )
     )
-    require(hold.action == "hold", "无 pending migration 时错误增加 budget")
-    require(controller.budgets == (10 * mib, 11 * mib, 11 * mib, 11 * mib),
-            "无迁移 sample 错误把 budget 改为实际发送字节")
-    return "AIMD controller 完成 0.9 decrease、1 MiB increase 和无迁移 hold"
+    require(hold.action == "hold", "零字节 observation 没有保持 budget")
+    require(controller.budgets_for("moe") == (18 * mib,) * 4,
+            "零字节 Dispatch observation 错误改变 budget")
+
+    byte_controller = ProbeNICController(
+        4,
+        ProbeNICControllerConfig(
+            initial_budget_bytes=100 * mib,
+            nic_line_rate_gbps=400.0,
+            target_overlap_ratio=0.90,
+        ),
+    )
+    byte_update = byte_controller.update(
+        ProbeDispatchFeedback(
+            observation_id=4,
+            attention_compute_us_by_rank=(10_000.0,) * 4,
+            moe_compute_us_by_rank=(8_000.0,) * 4,
+            dispatch_overlap_compute_kind="attention",
+            weight_dispatch_us_by_rank=(5_000.0,) * 4,
+            dispatch_baseline_bytes_by_rank=(80 * mib,) * 4,
+            migration_bytes_by_rank=(10 * mib,) * 4,
+            migration_tx_bytes_by_rank=(10 * mib,) * 4,
+            migration_rx_bytes_by_rank=(10 * mib,) * 4,
+            pending_migration_exists=True,
+            dispatch_tx_bytes_by_rank=(80 * mib,) * 4,
+            dispatch_rx_bytes_by_rank=(80 * mib,) * 4,
+        )
+    )
+    require(
+        byte_update.bottleneck_observed_total_bytes == 90 * mib
+        and byte_update.probed_total_nic_max_bytes == 162 * mib,
+        "controller 没有用 alpha*Cmax/Nmax 缩放实际 Token+Weight 字节",
+    )
+    require(
+        byte_controller.budgets_for("attention") == (82 * mib,) * 4,
+        "controller 没有从总 NIC 字节窗口扣除 80 MiB Token baseline",
+    )
+    require(
+        byte_update.nic_theoretical_max_bytes == 500_000_000
+        and byte_update.effective_total_nic_max_bytes == 162 * mib,
+        "实际字节探测结果或 400 Gbps 理论封顶错误",
+    )
+    require(
+        byte_update.dispatch_baseline_bytes_by_rank == (80 * mib,) * 4,
+        "controller 错误修改了 Token Dispatch baseline",
+    )
+
+    directional_controller = ProbeNICController(
+        4,
+        ProbeNICControllerConfig(initial_budget_bytes=100 * mib),
+    )
+    directional = directional_controller.update(
+        ProbeDispatchFeedback(
+            observation_id=5,
+            attention_compute_us_by_rank=(10_000.0,) * 4,
+            moe_compute_us_by_rank=(8_000.0,) * 4,
+            dispatch_overlap_compute_kind="attention",
+            weight_dispatch_us_by_rank=(5_000.0,) * 4,
+            dispatch_baseline_bytes_by_rank=(80 * mib,) * 4,
+            migration_bytes_by_rank=(60 * mib,) * 4,
+            migration_tx_bytes_by_rank=(0,) * 4,
+            migration_rx_bytes_by_rank=(60 * mib,) * 4,
+            pending_migration_exists=True,
+            dispatch_tx_bytes_by_rank=(80 * mib,) * 4,
+            dispatch_rx_bytes_by_rank=(20 * mib,) * 4,
+        )
+    )
+    require(
+        directional.bottleneck_observed_total_bytes == 80 * mib,
+        "full-duplex endpoint bytes 错误使用 max(Token)+max(Weight)",
+    )
+    require(
+        directional_controller.budgets_for("attention") == (64 * mib,) * 4,
+        "方向 endpoint 总字节缩放或 Token baseline 扣减错误",
+    )
+    return (
+        "controller 完成全局 Cmax/Nmax 实际字节探测、A/M 双状态链、"
+        "Token baseline 扣减和 Bhard clamp"
+    )
 
 
-def probeep_sample_sequence_case() -> str:
+def probeep_dispatch_observation_sequence_case() -> str:
     model = ModelSpec(
-        name="probeep_four_samples",
+        name="probeep_four_dispatch_observations",
         hidden=128,
         ffn_hidden=256,
         num_attention_heads=1,
@@ -1101,18 +1544,96 @@ def probeep_sample_sequence_case() -> str:
             algorithm="probeep",
             chunk_tokens=2,
             replicas_per_rank=2,
-            probeep_expert_slots_per_rank=3,
             token_padding=1,
         ),
         cost_model=FixedOperationCostModel(),
     )
     result.graph.validate()
-    sample_ids = [
-        item["sample_id"]
+    stage_tasks = [
+        task
+        for task in result.graph.tasks
+        if task.metadata.get("algorithm") == "probeep"
+        and task.metadata.get("stream_phase") in {"prefetch", "dispatch"}
+    ]
+    require(stage_tasks, "ProbeEP 测试没有 Weight/Dispatch communication tasks")
+    for task in stage_tasks:
+        require(
+            task.metadata.get("communication_stage_id", "").endswith(
+                ".weight_dispatch"
+            ),
+            f"ProbeEP task {task.key} 没有进入合并 Weight+Dispatch stage",
+        )
+    for task in stage_tasks:
+        if task.metadata.get("stream_phase") != "dispatch":
+            continue
+        stage_id = task.metadata["communication_stage_id"]
+        same_stage_weight_predecessors = [
+            result.graph.task(key)
+            for key in task.predecessors
+            if result.graph.task(key).metadata.get("communication_stage_id")
+            == stage_id
+            and result.graph.task(key).metadata.get("stream_phase")
+            == "prefetch"
+        ]
+        require(
+            all(
+                task.metadata.get("hierarchical_leg") == "dispatch_fabric"
+                and predecessor.payload_kind == "expert_weight_rdma"
+                and predecessor.src_rank == task.src_rank
+                for predecessor in same_stage_weight_predecessors
+            ),
+            f"ProbeEP Dispatch {task.key} 仍等待无关 Weight tasks",
+        )
+        if task.metadata.get("hierarchical_leg") != "dispatch_fabric":
+            continue
+        expected = {
+            predecessor.key
+            for predecessor in stage_tasks
+            if predecessor.metadata.get("communication_stage_id") == stage_id
+            and predecessor.payload_kind == "expert_weight_rdma"
+            and predecessor.src_rank == task.src_rank
+        }
+        require(
+            expected <= task.predecessors,
+            f"ProbeEP Dispatch TX {task.key} 没有等待同 source rail Weight TX",
+        )
+    invocation_indices = [
+        item["invocation_index"]
         for item in result.metadata["micro_batch_algorithms"]
     ]
-    require(sample_ids == [0, 1, 2, 3],
-            f"2 layer x 2 microbatch sample IDs 错误: {sample_ids}")
+    require(invocation_indices == [0, 1, 2, 3],
+            f"2 layer x 2 microbatch invocation index 错误: {invocation_indices}")
+    invocations = result.metadata["micro_batch_algorithms"]
+    logical_dispatches = sorted(
+        invocations, key=lambda item: (item["layer"], item["micro_batch"])
+    )
+    require(
+        [
+            item["dispatch_overlap_compute_kind"]
+            for item in logical_dispatches
+        ]
+        == ["attention", "moe", "attention", "moe"],
+        "双 microbatch 的 Dispatch observation 顺序不是 L0(A,M),L1(A,M)",
+    )
+    require(
+        all(
+            item["controlled_communication_phase"] == "dispatch"
+            and item["control_observation_scope"]
+            == "expert_weight_plus_dispatch"
+            and item["combine_controller_role"] == "telemetry_only"
+            for item in invocations
+        ),
+        "ProbeEP manifest 没有把 Combine 排除在 controller 之外",
+    )
+    for layer in range(2):
+        require(
+            invocations[2 + layer]["moe_compute_us_by_rank"]
+            == [
+                invocations[layer]["final_compute_us_by_rank"][rank]
+                for rank in range(8)
+            ],
+            f"layer {layer} 的 MoE 窗口没有复用前一 microbatch 实际负载",
+        )
     require(result.metadata["stream_schedule"]["cpu_task_count"] == 0,
             "ProbeEP 不应把离线 planner 放入 DAG")
     require(result.metadata["stream_schedule"]["cpu_streams_global"] == 0,
@@ -1127,9 +1648,35 @@ def probeep_sample_sequence_case() -> str:
             item["planner_runtime_model"] == "not_in_dag"
             for item in result.metadata["micro_batch_algorithms"]
         ),
-        "ProbeEP sample manifest 的 planner runtime 口径不一致",
+        "ProbeEP invocation manifest 的 planner runtime 口径不一致",
     )
-    return "2 layer x 2 microbatch 生成 4 个 sample，离线 planner 不进入 DAG/timeline"
+    override_result = build_transformer_workload(
+        TransformerWorkloadConfig(
+            model=model,
+            placement=Placement(8, 4, tuple(range(8))),
+            tokens_per_rank=2,
+            algorithm="probeep",
+            chunk_tokens=2,
+            token_padding=1,
+            probeep_nic_budget_by_dispatch={(0, 1): (0,) * 8},
+        ),
+        cost_model=FixedOperationCostModel(),
+    )
+    overridden = next(
+        item
+        for item in override_result.metadata["micro_batch_algorithms"]
+        if item["micro_batch"] == 0 and item["layer"] == 1
+    )
+    require(overridden["nic_budget_source"] == "in_process_dynamic_budget_override",
+            "Dispatch budget override 没有写入 manifest")
+    require(overridden["nic_budget_before"] == [0] * 8,
+            "Dispatch budget override 没有实际进入 admission")
+    require(not overridden["remote_replicas"],
+            "零预算 Dispatch observation 错误接纳了 remote replica")
+    return (
+        "2 layer x 2 microbatch 生成 4 个 Dispatch control observations；"
+        "A/M latest-state、Combine 排除和 Dispatch budget override 正确"
+    )
 
 
 def model_pipeline_case(run_dir: Path) -> str:
@@ -1420,6 +1967,167 @@ def multi_layer_group_schedule_case() -> str:
     return (
         "2 层 x 4 microbatch 按 pair 分组；同 MB 跨层依赖、"
         "MB0 wavefront 和组间全局 drain 正确"
+    )
+
+
+def dynamic_probeep_wavefront_case(run_dir: Path) -> str:
+    model = ModelSpec(
+        name="dynamic_probeep_wavefront",
+        hidden=128,
+        ffn_hidden=256,
+        num_attention_heads=1,
+        num_kv_heads=1,
+        head_dim=128,
+        num_experts=8,
+        topk=2,
+        sequence_length=16,
+        num_layers=2,
+        micro_batches=2,
+    )
+    placement = Placement(8, 4, tuple(range(8)))
+    builder = IncrementalTransformerWorkloadBuilder(
+        TransformerWorkloadConfig(
+            model=model,
+            placement=placement,
+            tokens_per_rank=2,
+            algorithm="probeep",
+            chunk_tokens=2,
+            token_padding=1,
+            probeep_route_chunk_tokens=2,
+        ),
+        cost_model=FixedOperationCostModel(),
+    )
+    budgets = {0: (0,) * 8, 1: (0,) * 8}
+    layer0 = builder.build_next_layer(budgets)
+    emitter = DynamicDagEmitter(
+        run_dir / "generated" / "dynamic_probeep_wavefront", 8
+    )
+    first_keys = tuple(
+        key
+        for key in layer0.new_task_keys
+        if key not in layer0.deferred_final_keys
+    )
+    first = emitter.append_tasks(
+        builder.graph,
+        batch_id="layer0_body",
+        layer=0,
+        task_keys=first_keys,
+        observations=probeep_weight_dispatch_observations(builder.graph, 0),
+    )
+    require(
+        not (set(layer0.deferred_final_keys) & emitter.committed_task_keys),
+        "中间层 MB1 Final 被过早提交",
+    )
+    require(
+        first.protocol.count("DAG_OBSERVE") == 2,
+        "Layer 0 batch 没有两个 Dispatch observations",
+    )
+
+    layer1 = builder.build_next_layer(budgets)
+    committed_before = dict(emitter.task_ids)
+    barriers_before = dict(emitter.barrier_ids)
+    dag_before = (emitter.output_dir / "workload.dag").read_text(
+        encoding="utf-8"
+    )
+    batches_before = (emitter.output_dir / "dynamic_batches.json").read_text(
+        encoding="utf-8"
+    )
+    invalid_cases = (
+        (
+            "invalid_observation_task",
+            {2: ("missing.dynamic.task",)},
+            "references uncommitted tasks",
+        ),
+        (
+            "duplicate_observation_id",
+            {
+                0: probeep_weight_dispatch_observations(
+                    builder.graph, 1
+                )[2]
+            },
+            "observation IDs are not globally unique",
+        ),
+    )
+    second_task_keys = layer0.deferred_final_keys + layer1.new_task_keys
+    for batch_id, observations, expected in invalid_cases:
+        try:
+            emitter.append_tasks(
+                builder.graph,
+                batch_id=batch_id,
+                layer=1,
+                task_keys=second_task_keys,
+                observations=observations,
+            )
+        except ValidationError as exc:
+            require(expected in str(exc), f"动态 batch 拒绝原因错误: {exc}")
+        else:
+            raise AssertionError(f"动态 emitter 错误接受 {batch_id}")
+        require(
+            emitter.task_ids == committed_before
+            and emitter.barrier_ids == barriers_before
+            and (emitter.output_dir / "workload.dag").read_text(
+                encoding="utf-8"
+            ) == dag_before
+            and (emitter.output_dir / "dynamic_batches.json").read_text(
+                encoding="utf-8"
+            ) == batches_before,
+            f"拒绝 {batch_id} 后动态 emitter 状态被部分修改",
+        )
+    second = emitter.append_tasks(
+        builder.graph,
+        batch_id="layer0_tail_layer1_body",
+        layer=1,
+        task_keys=second_task_keys,
+        observations=probeep_weight_dispatch_observations(builder.graph, 1),
+    )
+    require(
+        set(layer0.deferred_final_keys) <= emitter.committed_task_keys,
+        "第二批没有提交上一层暂留 Final",
+    )
+    require(
+        second.protocol.count("DAG_OBSERVE") == 2,
+        "Layer 1 batch 没有两个 Dispatch observations",
+    )
+    try:
+        emitter.append_tasks(
+            builder.graph,
+            batch_id="layer0_tail_layer1_body",
+            layer=1,
+            task_keys=(),
+            observations={},
+        )
+    except ValidationError as exc:
+        require("batch ID is not unique" in str(exc),
+                f"重复 batch ID 拒绝原因错误: {exc}")
+    else:
+        raise AssertionError("动态 emitter 错误接受重复 batch ID")
+    for rank in range(8):
+        final0 = builder.graph.task(f"mb0.layer0.moe.combine_reduce.rank{rank}")
+        final1 = builder.graph.task(f"mb1.layer0.moe.combine_reduce.rank{rank}")
+        attention0 = builder.graph.task(f"mb0.layer1.attention.rank{rank}")
+        router0 = builder.graph.task(f"mb0.layer1.router.rank{rank}")
+        attention1 = builder.graph.task(f"mb1.layer1.attention.rank{rank}")
+        require(final0.key in attention0.predecessors,
+                "下一层 MB0 Attention 没等待上一层 MB0 Final")
+        require(router0.key in final1.predecessors,
+                "上一层 MB1 Final 没排在下一层 MB0 Front 后")
+        require(final1.key in attention1.predecessors,
+                "下一层 MB1 Attention 没等待上一层 MB1 Final")
+        require(
+            attention0.overlaps_communication and attention0.available_sms == 112,
+            "跨层 Attention 没使用 overlap compute 口径",
+        )
+    emitter.finalize(graph_name=model.name, metadata=builder.metadata())
+    manifest = json.loads(
+        (emitter.output_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    require(manifest["dag_mode"] == "dynamic_append_v1",
+            "动态 emitter manifest 模式错误")
+    require(len(manifest["dynamic_batches"]) == 2,
+            "动态 emitter batch 数错误")
+    return (
+        "2-layer ProbeEP 使用 2 个 immutable append batches；中间层 MB1 Final "
+        "延迟到下一批，跨层 compute/comm wavefront 依赖正确"
     )
 
 
@@ -1966,9 +2674,22 @@ def main() -> int:
     suite.run("moonep_balanced_replica", lambda: moonep_case(run_dir))
     suite.run("moonep_deepep_scaleout", lambda: moonep_scaleout_case(run_dir))
     suite.run("probeep_cross_server", lambda: probeep_cross_server_case(run_dir))
+    suite.run("probeep_pair_aware_chunks", probeep_pair_aware_chunk_case)
+    suite.run("probeep_global_quota", probeep_global_quota_case)
+    suite.run(
+        "probeep_padding_aware_global_balance",
+        probeep_padding_aware_global_balance_case,
+    )
     suite.run("probeep_nic_controller", probeep_controller_case)
-    suite.run("probeep_sample_sequence", probeep_sample_sequence_case)
+    suite.run(
+        "probeep_dispatch_observation_sequence",
+        probeep_dispatch_observation_sequence_case,
+    )
     suite.run("two_microbatch_overlap", lambda: model_pipeline_case(run_dir))
+    suite.run(
+        "dynamic_probeep_wavefront",
+        lambda: dynamic_probeep_wavefront_case(run_dir),
+    )
     suite.run("relay_stream_participant", relay_stream_participant_case)
     suite.run("multi_layer_group_schedule", multi_layer_group_schedule_case)
     try:
