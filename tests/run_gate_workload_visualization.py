@@ -236,11 +236,11 @@ def main() -> int:
         require((output_dir / "gate_load_profile.csv").is_file(), "expert instance CSV is missing")
         require(
             all(marker in html for marker in (
-                "Rank MoE expert-token load before / after",
-                "Server MoE expert-token load before / after",
+                "Rank MoE expert-token load: baseline / placement",
+                "Server MoE expert-token load: baseline / placement",
                 "MoE expert-token load definition",
-                "Before: first-layer raw distribution",
-                "After: final-layer ProbeEP placement",
+                "Baseline: first-layer raw distribution",
+                "Final-layer EPLB physical placement",
                 "TopK-expanded expert-token count",
                 "final server mean",
                 "serverChart",
@@ -250,14 +250,104 @@ def main() -> int:
                 "Expert instance details",
                 "data-comparison-scope",
                 "currentComparison",
-                "Layer ${c.beforeRecord.layer + 1} before -> Layer ${c.afterRecord.layer + 1} after",
+                "const algorithm = 'eplb'",
+                "Final physical instances",
+                "Final replicas",
             )),
             "HTML controls or modules are incomplete",
         )
+        require(
+            '<h2>Cross-server expert copies</h2>' not in html
+            and '<i style="background:#1098a3"></i>Expert Weight' not in html,
+            "EPLB HTML exposed ProbeEP-only migration modules",
+        )
         require('id="layer"' not in html, "HTML must compare layers within one microbatch")
-        results.append(Result("before_after_html", "passed", "每个 microbatch 固定比较首层 before 与末层 after，并生成同尺度 server/rank、Gate expert 图和实例明细"))
+        results.append(Result("before_after_html", "passed", "EPLB 每个 microbatch 比较首层 baseline 与末层 physical placement，不混入 ProbeEP migration 模块"))
     except Exception as exc:
         results.append(Result("before_after_html", "failed", str(exc)))
+
+    try:
+        expectations = {
+            "nccl": (
+                "Final-layer execution load",
+                "NCCL uses the original logical expert placement",
+            ),
+            "deepep": (
+                "Final-layer execution load",
+                "DeepEP changes token payload aggregation",
+            ),
+            "moonep": (
+                "Final-layer MoonEP local replica placement",
+                "MoonEP final-layer load uses server-local master/replica placement",
+            ),
+        }
+        for algorithm, markers in expectations.items():
+            algorithm_provider = create_gate_provider(
+                "raw_receive_cdf",
+                seed=17,
+                raw_placement_json=RAW_PLACEMENT,
+                layer_map=(0, 1),
+            )
+            algorithm_built = build_transformer_workload(
+                TransformerWorkloadConfig(
+                    model=model,
+                    placement=placement,
+                    tokens_per_rank=2,
+                    algorithm=algorithm,
+                    chunk_tokens=32,
+                    gate_provider=algorithm_provider,
+                    replicas_per_rank=(10 if algorithm == "moonep" else 0),
+                )
+            )
+            algorithm_workload = run_dir / f"{algorithm}_workload"
+            emit_workload(
+                algorithm_built.graph,
+                algorithm_workload,
+                metadata=algorithm_built.metadata,
+            )
+            algorithm_output = run_dir / f"{algorithm}_gate_load"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(VISUALIZER),
+                    "--workload-dir",
+                    str(algorithm_workload),
+                    "--output-dir",
+                    str(algorithm_output),
+                    "--title",
+                    f"{algorithm.upper()} Gate visualization test",
+                ],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            require(completed.returncode == 0, f"{algorithm} visualizer failed")
+            algorithm_html = (
+                algorithm_output / "gate_load_profile.html"
+            ).read_text(encoding="utf-8")
+            require(
+                f"const algorithm = '{algorithm}'" in algorithm_html
+                and all(marker in algorithm_html for marker in markers),
+                f"{algorithm} HTML does not use its own placement semantics",
+            )
+            require(
+                '<h2>Cross-server expert copies</h2>' not in algorithm_html
+                and '<i style="background:#1098a3"></i>Expert Weight'
+                not in algorithm_html,
+                f"{algorithm} HTML exposed ProbeEP-only modules",
+            )
+        results.append(
+            Result(
+                "algorithm_specific_html",
+                "passed",
+                "NCCL/DeepEP 只展示原始执行负载；MoonEP 展示服务器内 replica placement；均无 ProbeEP 专属列",
+            )
+        )
+    except Exception as exc:
+        results.append(Result("algorithm_specific_html", "failed", str(exc)))
 
     try:
         probe_provider = create_gate_provider(
@@ -326,7 +416,7 @@ def main() -> int:
                     "Directed server-pair data table",
                     "Per-NIC directed data table",
                     "directedLoadChart",
-                    "After: final-layer ProbeEP placement",
+                    "Final-layer ProbeEP admitted placement",
                     "Final migration P/A/D",
                     "Final-layer server padded routes",
                     "Remote expert copies",

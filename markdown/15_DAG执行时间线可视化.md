@@ -252,16 +252,26 @@ micro_batch_algorithms[*].expert_load_profile.before
 micro_batch_algorithms[*].expert_load_profile.after
 ```
 
-页面以 microbatch 为唯一选择维度。对所选 MB，比较两端快照：
+页面以 microbatch 为唯一选择维度。底层 summary 统一保存两端快照：
 
 | 状态 | 含义 |
 |---|---|
 | `before` | 第一层 raw Gate logical assignments 按 baseline expert placement 聚合 |
-| `after` | 最后一层经过算法 admission 后的 physical instance/execution rank 负载 |
+| `after` | 最后一层的实际 physical instance/execution rank 负载 |
 
-这是“首层输入偏斜到末层最接近收敛 placement”的跨层观察，不是同一层算法前后
-对照。标题必须同时写出 `Layer N (id n)` 和 MB；页面不提供独立 Layer 选择器，避免
-不同模块把第一层和最后一层混用。算法仍在 manifest 中为每个
+页面展示必须按算法解释这两端：
+
+| 算法 | HTML 负载语义 | 专属内容 |
+|---|---|---|
+| NCCL | first/final layer 原始 expert execution load | 无去重直达的 Dispatch/Combine |
+| DeepEP | first/final layer 原始 expert execution load | 去重后的分层 token transport |
+| EPLB | first-layer baseline / final-layer physical placement | primary/replica instances |
+| MoonEP | first-layer baseline / final-layer server-local replica placement | master/local replica instances |
+| ProbeEP | first-layer baseline / final-layer admitted placement | P/A/D、remote copies、Expert Weight |
+
+因此 NCCL/DeepEP 页不显示“migration 0/0/0”或重复的算法 before/after；
+Cross-server expert copies 和 Expert Weight 列只存在于 ProbeEP。标题必须同时写出
+`Layer N (id n)` 和 MB；页面不提供独立 Layer 选择器。算法仍在 manifest 中为每个
 `(layer,microbatch)` 保留完整 before/after profile，CSV/JSON 不丢失逐层原始数据。
 
 页面的 before/after rank 图强制使用相同 load 横轴，不能分别 autoscale 后制造
@@ -270,11 +280,12 @@ expert、rank 和 load；server 聚合图必须先于 rank 图并标出均值。
 展示第一层和最后一层 raw logical-expert histogram；它不表示算法 after placement。
 实例明细中的 Before/After 也分别绑定首层 raw 和末层 admitted 快照。
 
-迁移与网络模块统一绑定最后一层：
+网络模块统一绑定最后一层：
 
 - `Cross-server expert copies` 只统计最后一层真正 admitted 的完整 remote replicas；
 - planned/admitted/deferred 和 server padded routes 只报告最后一层；
-- directed server-pair 与 per-NIC 图只画最后一层的 Dispatch、Combine 和 Expert Weight；
+- directed server-pair 与 per-NIC 图对所有算法画最后一层的
+  Dispatch/Combine；仅 ProbeEP 再加 Expert Weight；
 - 不跨层累计 bytes 或 replica 数，因为这些模块用于观察当前实验最接近收敛的状态。
 
 输出为：
@@ -335,20 +346,20 @@ python3 tests/run_probeep_2layer_ratio_full.py --full
 ```
 
 第一个入口为四个静态算法生成独立的 `algorithm_dashboard.html`；第二个入口
-在单个持续 HTSim PID 中生成动态 ProbeEP dashboard。单算法页面完整
-包含可折叠 Gate/expert before-after、独立可缩放 timeline、MpRail 链路负载图、
-makespan/task/bytes/overlap 摘要和相关 CSV 下载。直接打开任一算法页面，不需要
-再回到五算法总览才能查看该算法的完整信息。
+在单个持续 HTSim PID 中生成动态 ProbeEP dashboard。单算法页面保留
+makespan/task/bytes/overlap 摘要和 Gate、timeline、link-load 三个独立入口。
+这个导航页不嵌入任何重量 HTML 或 PNG。
 
 聚合步骤再生成 `dsv3_algorithm_comparison.html`：NCCL、DeepEP、EPLB、MoonEP 和
-动态 ProbeEP 各有一个可折叠区域，页头支持全部展开/收起；每个区域嵌入对应的
-完整算法 dashboard，并提供单独打开链接。五个 timeline 都固定包含 GPU 0-31；
+动态 ProbeEP 各有一个摘要行和单一 dashboard 链接。总览不使用 iframe，不默认
+打开第一个算法，也不同时请求任何 Gate/timeline/link-load 资源。
+五个 timeline 都固定包含 GPU 0-31；
 `selected_ranks` 和 overlap 汇总也必须覆盖全部 32 rank。
 通用静态 runner 的默认列表中虽然有静态 ProbeEP，但该页面只能用于结构回归，
 有效性能聚合必须替换为动态入口的页面。
 
-合并页通过相对路径引用各算法的 HTML、PNG 和 CSV，不把大文件重复内联到
-一个文件。同时生成 `dsv3_visualization_bundle.zip`，其内只包含：
+三级页面通过相对路径逐级跳转，不把大文件重复内联或预加载到
+导航页。同时生成 `dsv3_visualization_bundle.zip`，其内只包含：
 
 ```text
 dsv3_algorithm_comparison.html
@@ -365,7 +376,8 @@ ZIP 不包含 workload、HTSim log、`htsim.dat` 或原始 `output_metrics`。ZI
 服务器目录中应有 `0` 个散装 HTML。
 
 下载 ZIP 后解压：打开根目录的 `dsv3_algorithm_comparison.html` 查看五算法总览；
-打开 `algorithms/<algorithm>/algorithm_dashboard.html` 只查看一个算法的完整信息。
+点击某个算法后进入 `algorithms/<algorithm>/algorithm_dashboard.html`，再点击
+Gate、timeline 或 link-load 才加载对应的唯一重量资源。
 
 ## 6. 应当观察什么
 
@@ -415,14 +427,14 @@ python3 tests/run_gate_workload_visualization.py
 - task data 只内联一份，SVG 不含重复 `<title>`，完整 predecessor gzip 可恢复；
 - HTML hover、点击 Inspector、Fit/缩放控件、动态尺度、可折叠 Task details、逐 task CSV、
   逐 rank CSV 和总览 JSON 完整生成；
-- 两个伪算法 case 能合成可折叠总览页，并生成仅含 timeline 和链路图的
-  可解压 ZIP。
+- 两个伪算法 case 能合成三级导航页，根页和单算法页不包含 iframe/预加载图片，
+  并生成可解压 ZIP。
 - 有效 EP32 smoke/full 聚合的五个 timeline summary 均报告 `selected_ranks=0..31`，ZIP 内
   页面可恢复 GPU 00 到 GPU 31，服务器 run 目录不保留散装 HTML。
 - Gate 测试验证 raw `32 x 58 x 9` physical receive 数据向 256 logical experts
   折叠守恒、五种 provider 可复现、before/after 逻辑路由守恒，以及 HTML/CSV/JSON
-  三种产物完整生成；HTML 只按 MB 选择，首层 raw/末层 admitted 比较和末层
-  migration/server-pair/per-NIC 数据绑定必须同时成立。
+  三种产物完整生成；五个算法必须生成各自的 execution/placement 标题和列，
+  ProbeEP-only migration/Expert Weight 不得出现在其他算法的可见模块中。
 - 静态 runner 先验证四份 manifest 的 Gate assignment digest，聚合时再验证动态
   ProbeEP 的 digest 序列完全相同；ZIP
   同时包含五个完整算法 dashboard、各算法 Gate/timeline HTML 和一个总 dashboard。

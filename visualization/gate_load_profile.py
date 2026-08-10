@@ -296,12 +296,45 @@ def write_html(
         or gpus_per_server <= 0
     ):
         raise ValueError("placement.gpus_per_server must be a positive integer")
+    algorithm = str(metadata.get("algorithm", "unknown")).lower()
+    if algorithm not in {"nccl", "deepep", "eplb", "moonep", "probeep"}:
+        raise ValueError(f"unsupported algorithm for Gate visualization: {algorithm}")
+    algorithm_label = {
+        "nccl": "NCCL",
+        "deepep": "DeepEP",
+        "eplb": "EPLB",
+        "moonep": "MoonEP",
+        "probeep": "ProbeEP",
+    }[algorithm]
+    placement_label = {
+        "eplb": "EPLB physical placement",
+        "moonep": "MoonEP local replica placement",
+        "probeep": "ProbeEP admitted placement",
+    }.get(algorithm, "original placement")
+    has_placement = algorithm in {"eplb", "moonep", "probeep"}
+    if has_placement:
+        load_title = "MoE expert-token load: baseline / placement"
+        first_load_title = "Baseline: first-layer raw distribution"
+        final_load_title = f"Final-layer {placement_label}"
+        first_state_title = "Baseline"
+        final_state_title = f"{algorithm_label} placement"
+    else:
+        load_title = "MoE expert-token execution load by layer"
+        first_load_title = "First-layer execution load"
+        final_load_title = "Final-layer execution load"
+        first_state_title = "First layer"
+        final_state_title = "Final layer"
     subtitle = (
-        f"{str(metadata.get('algorithm', 'unknown')).upper()} | "
+        f"{algorithm.upper()} | "
         f"{placement.get('num_ranks', '?')} ranks | "
         f"{gpus_per_server} ranks/server | "
         f"{model.get('num_experts', '?')} logical experts"
     )
+    migration_panel = ""
+    expert_weight_legend = ""
+    if algorithm == "probeep":
+        migration_panel = """<section class="panel"><h2>Cross-server expert copies</h2><div class="copy-summary" id="copySummary"></div><div class="migration-note" id="copyExperts"></div></section>"""
+        expert_weight_legend = """<span><i style="background:#1098a3"></i>Expert Weight</span>"""
     document = """<!doctype html>
 <html lang="en">
 <head>
@@ -373,14 +406,14 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
   <div class="provider" id="provider"></div>
 </section>
 <section class="metrics" id="metrics"></section>
-<section class="panel"><h2>Cross-server expert copies</h2><div class="copy-summary" id="copySummary"></div><div class="migration-note" id="copyExperts"></div></section>
-<details class="panel" open><summary>Directed server-pair load</summary><div class="transport-legend"><span><i style="background:#e28200"></i>Dispatch</span><span><i style="background:#ca4057"></i>Combine</span><span><i style="background:#1098a3"></i>Expert Weight</span></div><div class="transport-chart" id="pairLoadChart"></div><details class="transport-details"><summary>Directed server-pair data table</summary><div class="table-wrap" id="pairLoadTable"></div></details></details>
-<details class="panel" open><summary>Per-NIC directed load</summary><div class="transport-legend"><span><i style="background:#e28200"></i>Dispatch</span><span><i style="background:#ca4057"></i>Combine</span><span><i style="background:#1098a3"></i>Expert Weight</span></div><div class="transport-chart" id="nicLoadChart"></div><details class="transport-details"><summary>Per-NIC directed data table</summary><div class="table-wrap" id="nicLoadTable"></div></details></details>
+__MIGRATION_PANEL__
+<details class="panel" open><summary>Directed server-pair load</summary><div class="transport-legend"><span><i style="background:#e28200"></i>Dispatch</span><span><i style="background:#ca4057"></i>Combine</span>__EXPERT_WEIGHT_LEGEND__</div><div class="transport-chart" id="pairLoadChart"></div><details class="transport-details"><summary>Directed server-pair data table</summary><div class="table-wrap" id="pairLoadTable"></div></details></details>
+<details class="panel" open><summary>Per-NIC directed load</summary><div class="transport-legend"><span><i style="background:#e28200"></i>Dispatch</span><span><i style="background:#ca4057"></i>Combine</span>__EXPERT_WEIGHT_LEGEND__</div><div class="transport-chart" id="nicLoadChart"></div><details class="transport-details"><summary>Per-NIC directed data table</summary><div class="table-wrap" id="nicLoadTable"></div></details></details>
 <section class="panel"><h2>MoE expert-token load definition <span class="scope-title" data-comparison-scope></span></h2><div class="load-definition" id="loadDefinition"></div></section>
-<section class="panel"><h2>Server MoE expert-token load before / after <span class="scope-title" data-comparison-scope></span></h2><div class="charts"><div class="chart"><h3>Before: first-layer raw distribution <span class="scope-title" data-before-scope></span></h3><div id="serverBefore"></div></div><div class="chart"><h3>After: final-layer ProbeEP placement <span class="scope-title" data-after-scope></span></h3><div id="serverAfter"></div></div></div></section>
-<section class="panel"><h2>Rank MoE expert-token load before / after <span class="scope-title" data-comparison-scope></span></h2><div class="placement-note" id="placementNote"></div><div class="charts"><div class="chart"><h3>Before: first-layer raw distribution <span class="scope-title" data-before-scope></span></h3><div id="before"></div></div><div class="chart"><h3>After: final-layer ProbeEP placement <span class="scope-title" data-after-scope></span></h3><div id="after"></div></div></div></section>
+<section class="panel"><h2>Server __LOAD_TITLE__ <span class="scope-title" data-comparison-scope></span></h2><div class="charts"><div class="chart"><h3>__FIRST_LOAD_TITLE__ <span class="scope-title" data-before-scope></span></h3><div id="serverBefore"></div></div><div class="chart"><h3>__FINAL_LOAD_TITLE__ <span class="scope-title" data-after-scope></span></h3><div id="serverAfter"></div></div></div></section>
+<section class="panel"><h2>Rank __LOAD_TITLE__ <span class="scope-title" data-comparison-scope></span></h2><div class="placement-note" id="placementNote"></div><div class="charts"><div class="chart"><h3>__FIRST_LOAD_TITLE__ <span class="scope-title" data-before-scope></span></h3><div id="before"></div></div><div class="chart"><h3>__FINAL_LOAD_TITLE__ <span class="scope-title" data-after-scope></span></h3><div id="after"></div></div></div></section>
 <section class="panel"><h2>Gate logical-expert distribution <span class="scope-title" data-comparison-scope></span></h2><div class="charts"><div class="chart"><h3>First-layer Gate <span class="scope-title" data-before-scope></span></h3><div class="logical" id="logicalBefore"></div></div><div class="chart"><h3>Final-layer Gate <span class="scope-title" data-after-scope></span></h3><div class="logical" id="logicalAfter"></div></div></div></section>
-<details class="panel"><summary>Expert instance details</summary><div class="details-controls"><label>State<select id="state"><option value="before">Before</option><option value="after">After</option></select></label><label>Rank<select id="rank"><option value="all">All ranks</option></select></label></div><div class="table-wrap" id="table"></div></details>
+<details class="panel"><summary>Expert instance details</summary><div class="details-controls"><label>State<select id="state"><option value="before">__FIRST_STATE_TITLE__</option><option value="after">__FINAL_STATE_TITLE__</option></select></label><label>Rank<select id="rank"><option value="all">All ranks</option></select></label></div><div class="table-wrap" id="table"></div></details>
 </main>
 <script>
 const records = __PAYLOAD__;
@@ -389,6 +422,11 @@ const rankSelect = document.getElementById('rank');
 const stateSelect = document.getElementById('state');
 const NS = 'http://www.w3.org/2000/svg';
 const gpusPerServer = __GPUS_PER_SERVER__;
+const algorithm = '__ALGORITHM__';
+const algorithmLabel = '__ALGORITHM_LABEL__';
+const hasPlacement = __HAS_PLACEMENT__;
+const hasRemoteMigration = __HAS_REMOTE_MIGRATION__;
+const placementLabel = '__PLACEMENT_LABEL__';
 const colors = ['#3574b9','#e28200','#4e946c','#ca4057','#8167a9','#1098a3','#bc7438','#607d3b','#ad4d91','#63788c','#d0a21d','#3f8c88'];
 const microbatches = [...new Set(records.map(r => r.micro_batch))].sort((a,b)=>a-b);
 for (const value of microbatches) mbSelect.add(new Option(`MB ${value}`, value));
@@ -399,7 +437,7 @@ function currentComparison() {
   return {beforeRecord:selected[0],afterRecord:selected[selected.length-1]};
 }
 function layerLabel(r) { return `Layer ${r.layer + 1} (id ${r.layer}) / MB ${r.micro_batch}`; }
-function comparisonLabel(c) { return `· MB ${c.beforeRecord.micro_batch}: Layer ${c.beforeRecord.layer + 1} before -> Layer ${c.afterRecord.layer + 1} after`; }
+function comparisonLabel(c) { return hasPlacement ? `· MB ${c.beforeRecord.micro_batch}: Layer ${c.beforeRecord.layer + 1} baseline -> Layer ${c.afterRecord.layer + 1} ${placementLabel}` : `· MB ${c.beforeRecord.micro_batch}: Layer ${c.beforeRecord.layer + 1} execution -> Layer ${c.afterRecord.layer + 1} execution`; }
 function fmt(value, digits=3) { return Number(value).toLocaleString(undefined, {maximumFractionDigits: digits}); }
 function fmtBytes(value) { const n=Number(value); if(n>=1024**3)return `${fmt(n/1024**3,2)} GiB`; if(n>=1024**2)return `${fmt(n/1024**2,2)} MiB`; if(n>=1024)return `${fmt(n/1024,2)} KiB`; return `${fmt(n,0)} B`; }
 function ids(values) { return values && values.length ? values.map(value=>`E${value}`).join(', ') : '-'; }
@@ -434,7 +472,8 @@ function logicalChart(loads) {
   return svg;
 }
 function directedLoadChart(rows, labelFor) {
-  const components=[['dispatch_bytes','#e28200','Dispatch'],['combine_bytes','#ca4057','Combine'],['expert_weight_bytes','#1098a3','Expert Weight']];
+  const components=[['dispatch_bytes','#e28200','Dispatch'],['combine_bytes','#ca4057','Combine']];
+  if(hasRemoteMigration)components.push(['expert_weight_bytes','#1098a3','Expert Weight']);
   const rowH=23, left=220, right=88, top=25, width=980, inner=width-left-right, height=top+Math.max(1,rows.length)*rowH+25;
   const max=Math.max(1,...rows.map(row=>Number(row.total_bytes)||0));
   const svg=svgElement('svg',{viewBox:`0 0 ${width} ${height}`,width:'100%',height,role:'img','aria-label':'Directed communication byte load'});
@@ -450,18 +489,18 @@ function renderTable() {
 }
 function renderTransport(r) {
   const t=r.transport;
-  const copyMetrics=[['Remote expert copies',fmt(t.remote_replica_count,0)],['Distinct experts',fmt(t.distinct_expert_count,0)],['Expert weight',fmtBytes(t.expert_weight_bytes)],['Expert server pairs',fmt(t.expert_server_pair_count,0)],['All directed pairs',fmt(t.server_pairs.length,0)]];
-  document.getElementById('copySummary').innerHTML=copyMetrics.map(([k,v])=>`<div class="metric"><span>${k}</span><strong>${v}</strong></div>`).join('');
-  document.getElementById('copyExperts').innerHTML=`Copied expert IDs: <span class="expert-ids">${ids(t.expert_ids)}</span>`;
+  if(hasRemoteMigration){const copyMetrics=[['Remote expert copies',fmt(t.remote_replica_count,0)],['Distinct experts',fmt(t.distinct_expert_count,0)],['Expert weight',fmtBytes(t.expert_weight_bytes)],['Expert server pairs',fmt(t.expert_server_pair_count,0)],['All directed pairs',fmt(t.server_pairs.length,0)]];document.getElementById('copySummary').innerHTML=copyMetrics.map(([k,v])=>`<div class="metric"><span>${k}</span><strong>${v}</strong></div>`).join('');document.getElementById('copyExperts').innerHTML=`Copied expert IDs: <span class="expert-ids">${ids(t.expert_ids)}</span>`;}
   if(!t.server_pairs.length){document.getElementById('pairLoadChart').innerHTML='<div class="empty">No cross-server fabric traffic in this invocation.</div>';document.getElementById('nicLoadChart').innerHTML='<div class="empty">No active cross-server NICs in this invocation.</div>';document.getElementById('pairLoadTable').replaceChildren();document.getElementById('nicLoadTable').replaceChildren();return;}
   document.getElementById('pairLoadChart').replaceChildren(directedLoadChart(t.server_pairs,x=>`S${x.source_server} -> S${x.destination_server}`));
-  let pair='<table class="transport-table"><thead><tr><th>Direction</th><th>Dispatch tokens</th><th>Dispatch routes</th><th>Dispatch data</th><th>Combine tokens</th><th>Combine routes</th><th>Combine data</th><th>Expert copies</th><th>Moved routes</th><th>Expert data</th><th class="ids">Expert IDs</th><th>Source TX total</th><th>Destination RX total</th></tr></thead><tbody>';
-  for(const x of t.server_pairs)pair+=`<tr><td>S${x.source_server} -> S${x.destination_server}</td><td>${fmt(x.dispatch_token_payloads,0)}</td><td>${fmt(x.dispatch_expert_routes,0)}</td><td>${fmtBytes(x.dispatch_bytes)}</td><td>${fmt(x.combine_token_payloads,0)}</td><td>${fmt(x.combine_expert_routes,0)}</td><td>${fmtBytes(x.combine_bytes)}</td><td>${fmt(x.expert_replica_count,0)}</td><td>${fmt(x.moved_expert_routes,0)}</td><td>${fmtBytes(x.expert_weight_bytes)}</td><td class="ids">${ids(x.expert_ids)}</td><td>${fmtBytes(x.total_bytes)}</td><td>${fmtBytes(x.total_bytes)}</td></tr>`;
+  const pairExpertHeaders=hasRemoteMigration?'<th>Expert copies</th><th>Moved routes</th><th>Expert data</th><th class="ids">Expert IDs</th>':'';
+  let pair=`<table class="transport-table"><thead><tr><th>Direction</th><th>Dispatch tokens</th><th>Dispatch routes</th><th>Dispatch data</th><th>Combine tokens</th><th>Combine routes</th><th>Combine data</th>${pairExpertHeaders}<th>Source TX total</th><th>Destination RX total</th></tr></thead><tbody>`;
+  for(const x of t.server_pairs){const expertCells=hasRemoteMigration?`<td>${fmt(x.expert_replica_count,0)}</td><td>${fmt(x.moved_expert_routes,0)}</td><td>${fmtBytes(x.expert_weight_bytes)}</td><td class="ids">${ids(x.expert_ids)}</td>`:'';pair+=`<tr><td>S${x.source_server} -> S${x.destination_server}</td><td>${fmt(x.dispatch_token_payloads,0)}</td><td>${fmt(x.dispatch_expert_routes,0)}</td><td>${fmtBytes(x.dispatch_bytes)}</td><td>${fmt(x.combine_token_payloads,0)}</td><td>${fmt(x.combine_expert_routes,0)}</td><td>${fmtBytes(x.combine_bytes)}</td>${expertCells}<td>${fmtBytes(x.total_bytes)}</td><td>${fmtBytes(x.total_bytes)}</td></tr>`;}
   document.getElementById('pairLoadTable').innerHTML=pair+'</tbody></table>';
   const nics=t.server_pairs.flatMap(pair=>pair.nics.filter(nic=>nic.total_bytes>0).map(nic=>({...nic,source_server:pair.source_server,destination_server:pair.destination_server}))).sort((a,b)=>a.source_server-b.source_server||a.destination_server-b.destination_server||a.rail-b.rail);
   document.getElementById('nicLoadChart').replaceChildren(directedLoadChart(nics,x=>`S${x.source_server}->S${x.destination_server} / NIC${x.rail} / R${x.source_rank}->R${x.destination_rank}`));
-  let nic='<table class="transport-table"><thead><tr><th>Direction</th><th>Rail / NIC</th><th>Source rank</th><th>Destination rank</th><th>Dispatch tokens</th><th>Dispatch routes</th><th>Dispatch data</th><th>Combine tokens</th><th>Combine routes</th><th>Combine data</th><th>Expert chunks</th><th>Expert data</th><th class="ids">Expert IDs</th><th>NIC TX total</th><th>Peer RX total</th></tr></thead><tbody>';
-  for(const x of nics)nic+=`<tr><td>S${x.source_server} -> S${x.destination_server}</td><td>NIC ${x.rail}</td><td>R${x.source_rank}</td><td>R${x.destination_rank}</td><td>${fmt(x.dispatch_token_payloads,0)}</td><td>${fmt(x.dispatch_expert_routes,0)}</td><td>${fmtBytes(x.dispatch_bytes)}</td><td>${fmt(x.combine_token_payloads,0)}</td><td>${fmt(x.combine_expert_routes,0)}</td><td>${fmtBytes(x.combine_bytes)}</td><td>${fmt(x.expert_weight_chunks,0)}</td><td>${fmtBytes(x.expert_weight_bytes)}</td><td class="ids">${ids(x.expert_ids)}</td><td>${fmtBytes(x.total_bytes)}</td><td>${fmtBytes(x.total_bytes)}</td></tr>`;
+  const nicExpertHeaders=hasRemoteMigration?'<th>Expert chunks</th><th>Expert data</th><th class="ids">Expert IDs</th>':'';
+  let nic=`<table class="transport-table"><thead><tr><th>Direction</th><th>Rail / NIC</th><th>Source rank</th><th>Destination rank</th><th>Dispatch tokens</th><th>Dispatch routes</th><th>Dispatch data</th><th>Combine tokens</th><th>Combine routes</th><th>Combine data</th>${nicExpertHeaders}<th>NIC TX total</th><th>Peer RX total</th></tr></thead><tbody>`;
+  for(const x of nics){const expertCells=hasRemoteMigration?`<td>${fmt(x.expert_weight_chunks,0)}</td><td>${fmtBytes(x.expert_weight_bytes)}</td><td class="ids">${ids(x.expert_ids)}</td>`:'';nic+=`<tr><td>S${x.source_server} -> S${x.destination_server}</td><td>NIC ${x.rail}</td><td>R${x.source_rank}</td><td>R${x.destination_rank}</td><td>${fmt(x.dispatch_token_payloads,0)}</td><td>${fmt(x.dispatch_expert_routes,0)}</td><td>${fmtBytes(x.dispatch_bytes)}</td><td>${fmt(x.combine_token_payloads,0)}</td><td>${fmt(x.combine_expert_routes,0)}</td><td>${fmtBytes(x.combine_bytes)}</td>${expertCells}<td>${fmtBytes(x.total_bytes)}</td><td>${fmtBytes(x.total_bytes)}</td></tr>`;}
   document.getElementById('nicLoadTable').innerHTML=nic+'</tbody></table>';
 }
 function render() {
@@ -470,12 +509,19 @@ function render() {
   document.querySelectorAll('[data-before-scope]').forEach(node=>{node.textContent=`\u00b7 ${layerLabel(first)}`;});
   document.querySelectorAll('[data-after-scope]').forEach(node=>{node.textContent=`\u00b7 ${layerLabel(final)}`;});
   const beforeTotal=before.rank_loads.reduce((sum,value)=>sum+Number(value),0),afterTotal=after.rank_loads.reduce((sum,value)=>sum+Number(value),0),rankMean=afterTotal/after.rank_loads.length,serverCount=Math.ceil(after.rank_loads.length/gpusPerServer),serverMean=afterTotal/serverCount;
-  document.getElementById('loadDefinition').textContent=`Load is TopK-expanded expert-token count, not unique input-token count and not execution time. Before uses the first layer of the selected microbatch; After uses its final layer. Totals: before ${fmt(beforeTotal,0)}, after ${fmt(afterTotal,0)} expert-tokens; final rank mean ${fmt(rankMean,1)}; server load is the sum of ${gpusPerServer} ranks; final server mean ${fmt(serverMean,1)}.`;
-  document.getElementById('provider').textContent=`Before ${layerLabel(first)}: ${first.gate.name} | After ${layerLabel(final)}: ${final.gate.name}`;
+  const scope=hasPlacement?`Baseline uses the first layer; ${algorithmLabel} placement uses the final layer.`:`${algorithmLabel} does not remap expert execution; the charts show its first- and final-layer execution loads.`;
+  document.getElementById('loadDefinition').textContent=`Load is TopK-expanded expert-token count, not unique input-token count and not execution time. ${scope} Totals: first ${fmt(beforeTotal,0)}, final ${fmt(afterTotal,0)} expert-tokens; final rank mean ${fmt(rankMean,1)}; server load is the sum of ${gpusPerServer} ranks; final server mean ${fmt(serverMean,1)}.`;
+  document.getElementById('provider').textContent=`First ${layerLabel(first)}: ${first.gate.name} | Final ${layerLabel(final)}: ${final.gate.name}`;
   const p=final.planning; const admission=`${p.planned_intent_count}/${p.admitted_intent_count}/${p.deferred_intent_count}`;
-  const metrics=[['Before logical routes',fmt(before.total_routes,0)],['Before rank max/mean',fmt(beforeI)],['Final rank max/mean',fmt(afterI)],['First -> final delta',`${afterI-beforeI>=0?'+':''}${fmt(afterI-beforeI)}`],['Final migration P/A/D',admission]];
+  const metrics=[['First logical routes',fmt(before.total_routes,0)],['First rank max/mean',fmt(beforeI)],['Final rank max/mean',fmt(afterI)],['First -> final delta',`${afterI-beforeI>=0?'+':''}${fmt(afterI-beforeI)}`]];
+  if(algorithm==='eplb'||algorithm==='moonep'){metrics.push(['Final physical instances',fmt(after.instances.length,0)],['Final replicas',fmt(after.instances.filter(item=>String(item.kind).includes('replica')).length,0)]);}
+  if(hasRemoteMigration)metrics.push(['Final migration P/A/D',admission]);
   document.getElementById('metrics').innerHTML=metrics.map(([k,v])=>`<div class="metric"><span>${k}</span><strong>${v}</strong></div>`).join('');
-  document.getElementById('placementNote').textContent=`Final-layer server padded routes | before ${serverVector(p.baseline_server_padded_routes)} | planned ${serverVector(p.planned_server_padded_routes)} | admitted/after ${serverVector(p.admitted_server_padded_routes)}. The left chart is the first-layer original placement; the right chart is the final-layer admitted placement.`;
+  if(hasRemoteMigration)document.getElementById('placementNote').textContent=`Final-layer server padded routes | before ${serverVector(p.baseline_server_padded_routes)} | planned ${serverVector(p.planned_server_padded_routes)} | admitted/after ${serverVector(p.admitted_server_padded_routes)}.`;
+  else if(algorithm==='eplb')document.getElementById('placementNote').textContent='EPLB final-layer load uses persistent physical primary/replica placement.';
+  else if(algorithm==='moonep')document.getElementById('placementNote').textContent='MoonEP final-layer load uses server-local master/replica placement.';
+  else if(algorithm==='deepep')document.getElementById('placementNote').textContent='DeepEP changes token payload aggregation and hierarchical transport, not expert execution placement.';
+  else document.getElementById('placementNote').textContent='NCCL uses the original logical expert placement without payload deduplication or expert replication.';
   renderTransport(final);
   document.getElementById('serverBefore').replaceChildren(serverChart(before,serverMax)); document.getElementById('serverAfter').replaceChildren(serverChart(after,serverMax));
   document.getElementById('before').replaceChildren(rankChart(before,commonMax)); document.getElementById('after').replaceChildren(rankChart(after,commonMax)); document.getElementById('logicalBefore').replaceChildren(logicalChart(first.gate.logical_expert_loads)); document.getElementById('logicalAfter').replaceChildren(logicalChart(final.gate.logical_expert_loads));
@@ -490,6 +536,24 @@ mbSelect.addEventListener('change',render); stateSelect.addEventListener('change
     document = document.replace("__SUBTITLE__", escape(subtitle))
     document = document.replace("__PAYLOAD__", payload)
     document = document.replace("__GPUS_PER_SERVER__", str(gpus_per_server))
+    document = document.replace("__ALGORITHM__", algorithm)
+    document = document.replace("__ALGORITHM_LABEL__", algorithm_label)
+    document = document.replace(
+        "__HAS_PLACEMENT__", str(has_placement).lower()
+    )
+    document = document.replace(
+        "__HAS_REMOTE_MIGRATION__", str(algorithm == "probeep").lower()
+    )
+    document = document.replace("__PLACEMENT_LABEL__", placement_label)
+    document = document.replace("__LOAD_TITLE__", load_title)
+    document = document.replace("__FIRST_LOAD_TITLE__", first_load_title)
+    document = document.replace("__FINAL_LOAD_TITLE__", final_load_title)
+    document = document.replace("__FIRST_STATE_TITLE__", first_state_title)
+    document = document.replace("__FINAL_STATE_TITLE__", final_state_title)
+    document = document.replace("__MIGRATION_PANEL__", migration_panel)
+    document = document.replace(
+        "__EXPERT_WEIGHT_LEGEND__", expert_weight_legend
+    )
     path.write_text(document, encoding="utf-8")
 
 

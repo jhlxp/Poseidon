@@ -23,7 +23,6 @@
 | [15_DAG执行时间线可视化.md](15_DAG执行时间线可视化.md) | GPU 0-31 可缩放 timeline、Gate/expert before-after、折叠明细和五算法合并页 |
 | [16_计算时间JSON配置.md](16_计算时间JSON配置.md) | 模块级 theoretical/profiled 固定时间、二选一规则、文件格式和适用边界 |
 | [17_Gate分布与Routing生成.md](17_Gate分布与Routing生成.md) | Gate provider、UltraEP/FAST 合成分布、raw receive 精确 quota 和 routing fidelity |
-| [18_历史遗留代码盘点.md](18_历史遗留代码盘点.md) | 可删候选、兼容路径、旧命名活动代码和建议清理顺序 |
 
 ## 仿真器的两种输入模式
 
@@ -158,7 +157,9 @@ EP32 单 plane/400 Gbps 拓扑。默认为 `2 tokens/rank/microbatch` smoke；
 `--full` 才是 `4096 tokens/rank/microbatch`。有效五算法性能对比必须聚合四个
 静态结果和一个单 HTSim PID 动态 ProbeEP 结果；通用 runner 默认生成的静态
 ProbeEP 只能做结构回归。聚合后每个算法都有完整 dashboard，ZIP 根目录的
-`dsv3_algorithm_comparison.html` 提供五算法总览。参数、边界和验收条件见
+`dsv3_algorithm_comparison.html` 只提供五算法摘要与导航。点击算法后再选择
+Gate、timeline 或 link-load，根页和单算法页都不会一次加载所有重量资源。
+参数、边界和验收条件见
 [14_专用测试拓扑-EP32-1Plane.md](14_专用测试拓扑-EP32-1Plane.md)，计算时间选择见
 [16_计算时间JSON配置.md](16_计算时间JSON配置.md)。
 

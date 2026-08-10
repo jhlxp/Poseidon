@@ -341,8 +341,8 @@ test_logs/run_<timestamp>_dsv3_2layer_<N>algo_<smoke|full>/
 ```
 
 EP32 smoke/full 的 timeline 必须展示 rank 0-31，也就是四台服务器的全部 32 张
-GPU，不能只截取 server 0。有效聚合 ZIP 中的五算法区域和每个
-`Task details` 均可折叠；
+GPU，不能只截取 server 0。有效聚合 ZIP 的根页只列出五个算法导航入口；
+真正 timeline 中的 `Task details` 仍可折叠；
 每条 timeline 默认
 Fit 全局，可水平缩放并实时显示 `100 px` 对应的微秒数。
 `dsv3_visualization_bundle.zip` 只打包总览 HTML、五算法 Gate/expert before-after、
@@ -382,16 +382,20 @@ controller。
 当前 smoke 默认 `end=5000 us`，用于容纳 ProbeEP/MoonEP 的本地权重预取；
 `--simulation-end-us` 只延长仿真截止时间，不改变 token 数或 workload。
 
-ZIP 内采用两级入口：
+ZIP 内采用三级按需导航：
 
 ```text
 dsv3_algorithm_comparison.html
-algorithms/<algorithm>/algorithm_dashboard.html
+  -> algorithms/<algorithm>/algorithm_dashboard.html
+       -> gate_load/gate_load_profile.html
+       -> timeline/dag_gpu_timeline.html
+       -> link_load/mprail_link_load_by_layer.png
 ```
 
 单算法 dashboard 已包含该算法的 Gate、timeline、link-load 和 CSV 入口；根页面
-再统一嵌入五个算法 dashboard。两级页面都依赖 ZIP 中的相对路径资源，因此必须
-先完整解压 ZIP。
+只展示五个算法摘要和 dashboard 链接。根页和单算法页都不包含 iframe，
+也不预加载 Gate、timeline 或 PNG；只有点击对应入口后才加载一个重量模块。
+所有页面依赖 ZIP 中的相对路径资源，因此必须先完整解压 ZIP。
 
 ## 12. DSV3 两层验收条件
 
@@ -416,10 +420,11 @@ algorithms/<algorithm>/algorithm_dashboard.html
    必须实际出现 `L1 MB0 Attention || L0 MB1 Combine` 跨层窗口。
 9. 每个算法的 task CSV、rank overlap CSV、timeline summary、Gate load CSV/JSON、
    链路负载 PNG 和链路/endpoint summary 必须在服务器 run 目录中保留。
-10. ZIP 必须包含五个单算法完整 dashboard 和一个总 dashboard；总览包含五个
-    可折叠算法区域，单算法页面能进入覆盖 rank 0-31 的 Gate before-after、
+10. ZIP 必须包含五个单算法 dashboard 和一个总 dashboard；总览包含五个
+    算法导航入口，单算法页面能再进入覆盖 rank 0-31 的 Gate before-after、
     可缩放 timeline 和 MpRail 链路负载图；五份
-    timeline summary 的 `selected_ranks` 必须均为完整 `0..31`。
+    timeline summary 的 `selected_ranks` 必须均为完整 `0..31`；总览和单算法
+    dashboard 不得包含 iframe 或预加载图片。
 11. 可视化 ZIP 必须可完整解压，包含总览页和所有被引用资源，且不得
     包含 workload 或 simulation 目录。
 12. ZIP 校验通过后，服务器 run 目录中不得留下任何 `*.html`。

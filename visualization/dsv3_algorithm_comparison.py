@@ -8,6 +8,7 @@ from html import escape
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import zipfile
 
 
@@ -107,6 +108,40 @@ def load_case(algorithm: str, case_dir: Path, output: Path) -> dict[str, object]
                     ),
                 }
             )
+    gate_summary_path = gate_dir / "gate_load_profile_summary.json"
+    if (
+        algorithm == "probeep"
+        and not migration_rows
+        and gate_summary_path.is_file()
+    ):
+        gate_summary = json.loads(gate_summary_path.read_text(encoding="utf-8"))
+        for index, record in enumerate(gate_summary.get("records", [])):
+            planning = record.get("planning", {})
+            transport = record.get("transport", {})
+            server_pairs = transport.get("server_pairs", [])
+            migration_rows.append(
+                {
+                    "layer": int(record["layer"]),
+                    "micro_batch": int(record["micro_batch"]),
+                    "invocation_index": index,
+                    "planned_experts": int(
+                        planning.get("planned_intent_count", 0)
+                    ),
+                    "admitted_experts": int(
+                        transport.get("remote_replica_count", 0)
+                    ),
+                    "deferred_experts": int(
+                        planning.get("deferred_intent_count", 0)
+                    ),
+                    "moved_routes": sum(
+                        int(pair.get("moved_expert_routes", 0))
+                        for pair in server_pairs
+                    ),
+                    "weight_bytes": int(
+                        transport.get("expert_weight_bytes", 0)
+                    ),
+                }
+            )
     bundle_files: list[tuple[Path, str]] = []
     for directory in (timeline_dir, gate_dir, case_dir / "link_load"):
         for artifact in sorted(directory.iterdir()):
@@ -164,10 +199,22 @@ def format_bytes(value: int) -> str:
 
 def write_algorithm_dashboard(
     path: Path,
+    comparison_path: Path,
     title: str,
     case: dict[str, object],
 ) -> None:
     algorithm = str(case["algorithm"])
+    context_title = re.sub(
+        r"\s*/\s*\d+\s+algorithms\s*$", "", title, flags=re.IGNORECASE
+    )
+    page_title = f"{algorithm.upper()} / {context_title}"
+    gate_title = {
+        "nccl": "NCCL Gate / direct expert execution",
+        "deepep": "DeepEP Gate / hierarchical token transport",
+        "eplb": "EPLB expert placement",
+        "moonep": "MoonEP local expert replication",
+        "probeep": "ProbeEP admitted expert placement",
+    }.get(algorithm, f"{algorithm.upper()} Gate / expert load")
     gate_url = relative_url(Path(case["gate_path"]), path)
     gate_csv_url = relative_url(Path(case["gate_csv_path"]), path)
     timeline_url = relative_url(Path(case["timeline_path"]), path)
@@ -176,6 +223,7 @@ def write_algorithm_dashboard(
     endpoint_summary_url = relative_url(
         Path(case["endpoint_summary_path"]), path
     )
+    comparison_url = relative_url(comparison_path, path)
     migration_rows = list(case["migration_rows"])
     migration_metric = ""
     migration_module = ""
@@ -197,7 +245,74 @@ def write_algorithm_dashboard(
             "</tr>"
             for row in migration_rows
         )
-        migration_module = f"""<details class="module" open><summary>Cross-server expert migration</summary><div class="module-body migration-content"><table><thead><tr><th>Invocation</th><th>Layer</th><th>MB</th><th>Planned experts</th><th>Admitted experts</th><th>Deferred experts</th><th>Moved routes</th><th>RDMA weights</th></tr></thead><tbody>{table_rows}</tbody></table></div></details>"""
+        migration_module = f"""<section class="migration"><h2>Cross-server expert migration</h2><div class="migration-content"><table><thead><tr><th>Invocation</th><th>Layer</th><th>MB</th><th>Planned experts</th><th>Admitted experts</th><th>Deferred experts</th><th>Moved routes</th><th>RDMA weights</th></tr></thead><tbody>{table_rows}</tbody></table></div></section>"""
+    document = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{escape(page_title)}</title>
+<style>
+:root {{ color-scheme: light; font-family: Inter, Arial, sans-serif; }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: #F4F6F8; color: #17212B; }}
+header {{ padding: 16px 20px; background: #FFFFFF; border-bottom: 1px solid #CBD3DC; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }}
+h1 {{ margin: 0; font-size: 20px; letter-spacing: 0; }}
+.metrics {{ display: flex; gap: 16px; margin-left: auto; color: #536170; font-size: 12px; flex-wrap: wrap; }}
+.back {{ width: 100%; color: #1D5E9E; font-size: 13px; }}
+main {{ padding: 14px; display: grid; gap: 12px; }}
+.modules {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
+.module, .migration {{ background: #FFFFFF; border: 1px solid #C8D0DA; }}
+.module {{ min-height: 126px; padding: 16px; display: flex; flex-direction: column; justify-content: space-between; gap: 20px; }}
+h2 {{ margin: 0; font-size: 15px; letter-spacing: 0; }}
+.module-links {{ display: flex; flex-wrap: wrap; gap: 14px; font-size: 13px; }}
+.module-links a {{ color: #1D5E9E; }}
+.primary {{ font-weight: 650; }}
+.migration h2 {{ padding: 13px 14px; border-bottom: 1px solid #D8DEE6; }}
+.migration-content {{ overflow: auto; padding: 0 12px 8px; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+th, td {{ padding: 7px 9px; border-bottom: 1px solid #E1E6EB; text-align: right; white-space: nowrap; }}
+th:first-child, td:first-child {{ text-align: left; }}
+th {{ background: #EEF2F5; color: #485563; }}
+@media (max-width: 760px) {{ .metrics {{ width: 100%; margin-left: 0; }} .modules {{ grid-template-columns: 1fr; }} }}
+</style>
+</head>
+<body>
+<header>
+<h1>{escape(page_title)}</h1>
+<div class="metrics"><span>{case['makespan_us']:.7g} us</span><span>{case['task_count']} tasks</span><span>{escape(format_bytes(int(case['logical_transfer_bytes'])))}</span><span>{case['overlap_us']:.7g} us GPU overlap sum</span>{migration_metric}</div>
+<a class="back" href="{escape(comparison_url)}">&larr; All algorithms</a>
+</header>
+<main>
+<div class="modules">
+<section class="module"><h2>{escape(gate_title)}</h2><div class="module-links"><a class="primary" href="{escape(gate_url)}">Open Gate view &rarr;</a><a href="{escape(gate_csv_url)}">Expert load CSV</a></div></section>
+<section class="module"><h2>{escape(algorithm.upper())} DAG GPU timeline</h2><div class="module-links"><a class="primary" href="{escape(timeline_url)}">Open timeline &rarr;</a></div></section>
+<section class="module"><h2>{escape(algorithm.upper())} MpRail link load</h2><div class="module-links"><a class="primary" href="{escape(link_image_url)}">Open link plot &rarr;</a><a href="{escape(link_summary_url)}">Link summary CSV</a><a href="{escape(endpoint_summary_url)}">Endpoint summary CSV</a></div></section>
+</div>
+{migration_module}
+</main>
+</body>
+</html>
+"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(document, encoding="utf-8")
+
+
+def write_dashboard(path: Path, title: str, cases: list[dict[str, object]]) -> None:
+    sections: list[str] = []
+    for case in cases:
+        algorithm = str(case["algorithm"])
+        migration_summary = ""
+        if case["migration_rows"]:
+            migration_summary = (
+                f"<span>{case['admitted_experts_total']} migrated experts</span>"
+                f"<span>{escape(format_bytes(int(case['expert_weight_bytes_total'])))} RDMA weights</span>"
+            )
+        sections.append(
+            f"""<a class="algorithm" href="{escape(str(case['algorithm_dashboard_url']))}">
+<div><strong>{escape(algorithm.upper())}</strong><div class="algorithm-metrics"><span>{case['makespan_us']:.7g} us</span><span>{case['task_count']} tasks</span><span>{escape(format_bytes(int(case['logical_transfer_bytes'])))}</span><span>{case['overlap_us']:.7g} us GPU overlap sum</span>{migration_summary}</div></div><span class="arrow">&rarr;</span>
+</a>"""
+        )
     document = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -208,115 +323,20 @@ def write_algorithm_dashboard(
 :root {{ color-scheme: light; font-family: Inter, Arial, sans-serif; }}
 * {{ box-sizing: border-box; }}
 body {{ margin: 0; background: #F4F6F8; color: #17212B; }}
-header {{ padding: 16px 20px; background: #FFFFFF; border-bottom: 1px solid #CBD3DC; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }}
-h1 {{ margin: 0; font-size: 20px; letter-spacing: 0; }}
-.metrics {{ display: flex; gap: 16px; margin-left: auto; color: #536170; font-size: 12px; flex-wrap: wrap; }}
-.actions {{ display: flex; gap: 7px; width: 100%; }}
-button {{ height: 31px; padding: 0 11px; border: 1px solid #B7C0CB; background: #FFFFFF; cursor: pointer; }}
-main {{ padding: 12px; display: grid; gap: 12px; }}
-.module {{ background: #FFFFFF; border: 1px solid #C8D0DA; }}
-.module > summary {{ padding: 11px 13px; cursor: pointer; font-size: 14px; font-weight: 650; }}
-.module-body {{ border-top: 1px solid #D8DEE6; }}
-iframe {{ display: block; width: 100%; border: 0; background: #FFFFFF; }}
-.gate-frame {{ height: 940px; }}
-.timeline-frame {{ height: 930px; }}
-.link-content {{ padding: 10px; }}
-.link-content img {{ display: block; width: 100%; height: auto; }}
-.downloads {{ display: flex; flex-wrap: wrap; gap: 16px; padding: 10px 12px; border-top: 1px solid #E0E5EA; font-size: 12px; }}
-.downloads a {{ color: #1D5E9E; }}
-.migration-content {{ overflow: auto; padding: 10px 12px; }}
-table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
-th, td {{ padding: 7px 9px; border-bottom: 1px solid #E1E6EB; text-align: right; white-space: nowrap; }}
-th:first-child, td:first-child {{ text-align: left; }}
-th {{ background: #EEF2F5; color: #485563; }}
-@media (max-width: 760px) {{ .metrics {{ width: 100%; margin-left: 0; }} .gate-frame {{ height: 860px; }} .timeline-frame {{ height: 780px; }} }}
-</style>
-</head>
-<body>
-<header>
-<h1>{escape(algorithm.upper())} / {escape(title)}</h1>
-<div class="metrics"><span>{case['makespan_us']:.7g} us</span><span>{case['task_count']} tasks</span><span>{escape(format_bytes(int(case['logical_transfer_bytes'])))}</span><span>{case['overlap_us']:.7g} us GPU overlap sum</span>{migration_metric}</div>
-<div class="actions"><button type="button" id="expand">Expand all</button><button type="button" id="collapse">Collapse all</button></div>
-</header>
-<main>
-{migration_module}
-<details class="module" open><summary>Gate / expert load before and after</summary><div class="module-body"><iframe class="gate-frame" src="{escape(gate_url)}" title="{escape(algorithm)} Gate load"></iframe><div class="downloads"><a href="{escape(gate_csv_url)}">Expert load CSV</a></div></div></details>
-<details class="module" open><summary>DAG GPU timeline</summary><div class="module-body"><iframe class="timeline-frame" src="{escape(timeline_url)}" title="{escape(algorithm)} timeline"></iframe></div></details>
-<details class="module" open><summary>MpRail link load</summary><div class="module-body link-content"><img src="{escape(link_image_url)}" alt="{escape(algorithm)} MpRail link load"><div class="downloads"><a href="{escape(link_summary_url)}">Link summary CSV</a><a href="{escape(endpoint_summary_url)}">Endpoint summary CSV</a></div></div></details>
-</main>
-<script>
-document.getElementById('expand').addEventListener('click', () => document.querySelectorAll('.module').forEach(item => item.open = true));
-document.getElementById('collapse').addEventListener('click', () => document.querySelectorAll('.module').forEach(item => item.open = false));
-</script>
-</body>
-</html>
-"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(document, encoding="utf-8")
-
-
-def write_dashboard(path: Path, title: str, cases: list[dict[str, object]]) -> None:
-    sections: list[str] = []
-    for index, case in enumerate(cases):
-        algorithm = str(case["algorithm"])
-        open_attribute = " open" if index == 0 else ""
-        migration_summary = ""
-        if case["migration_rows"]:
-            migration_summary = (
-                f"<span>{case['admitted_experts_total']} migrated experts</span>"
-                f"<span>{escape(format_bytes(int(case['expert_weight_bytes_total'])))} RDMA weights</span>"
-            )
-        sections.append(
-            f"""<details class="algorithm"{open_attribute}>
-<summary><strong>{escape(algorithm.upper())}</strong><span>{case['makespan_us']:.7g} us</span><span>{case['task_count']} tasks</span><span>{escape(format_bytes(int(case['logical_transfer_bytes'])))}</span><span>{case['overlap_us']:.7g} us GPU overlap sum</span>{migration_summary}</summary>
-<div class="algorithm-body">
-<div class="standalone-link"><a href="{escape(str(case['algorithm_dashboard_url']))}" target="_blank">Open {escape(algorithm.upper())} dashboard</a></div>
-<iframe class="algorithm-frame" src="{escape(str(case['algorithm_dashboard_url']))}" title="{escape(algorithm)} complete dashboard" loading="lazy"></iframe>
-</div>
-</details>"""
-        )
-    document = f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{escape(title)}</title>
-<style>
-:root {{ color-scheme: light; font-family: Inter, Arial, sans-serif; }}
-body {{ margin: 0; background: #F4F6F8; color: #17212B; }}
-header {{ padding: 18px 22px; background: #FFFFFF; border-bottom: 1px solid #CED5DE; display: flex; align-items: center; gap: 14px; }}
+header {{ padding: 18px 22px; background: #FFFFFF; border-bottom: 1px solid #CED5DE; }}
 h1 {{ margin: 0; font-size: 21px; }}
-.actions {{ margin-left: auto; display: flex; gap: 7px; }}
-button {{ height: 31px; padding: 0 11px; border: 1px solid #B7C0CB; background: #FFFFFF; cursor: pointer; }}
 main {{ padding: 14px; display: grid; gap: 12px; }}
-.algorithm {{ background: #FFFFFF; border: 1px solid #C8D0DA; }}
-.algorithm > summary {{ min-height: 46px; box-sizing: border-box; padding: 12px 14px; cursor: pointer; display: flex; align-items: center; gap: 20px; list-style: none; }}
-.algorithm > summary::-webkit-details-marker {{ display: none; }}
-.algorithm > summary::before {{ content: ''; width: 0; height: 0; border-top: 5px solid transparent; border-bottom: 5px solid transparent; border-left: 7px solid #485563; transition: transform 120ms ease; }}
-.algorithm[open] > summary::before {{ transform: rotate(90deg); }}
-.algorithm > summary strong {{ min-width: 90px; font-size: 15px; }}
-.algorithm > summary span {{ color: #536170; font-size: 12px; }}
-.algorithm-body {{ border-top: 1px solid #D8DEE6; }}
-iframe {{ display: block; width: 100%; border: 0; background: #FFFFFF; }}
-.algorithm-frame {{ height: 1200px; border-top: 1px solid #D8DEE6; }}
-.standalone-link {{ padding: 9px 13px; font-size: 12px; }}
-.standalone-link a {{ color: #1D5E9E; }}
-.link-load {{ margin: 12px; border: 1px solid #CCD4DD; }}
-.link-load > summary {{ padding: 10px 12px; cursor: pointer; font-weight: 650; }}
-.link-content {{ border-top: 1px solid #D8DEE6; padding: 10px; }}
-.link-content img {{ display: block; width: 100%; height: auto; }}
-.downloads {{ display: flex; gap: 16px; padding: 10px 2px 2px; font-size: 12px; }}
-.downloads a {{ color: #1D5E9E; }}
-@media (max-width: 760px) {{ .algorithm > summary {{ flex-wrap: wrap; gap: 8px 14px; }} .algorithm-frame {{ height: 900px; }} }}
+.algorithm {{ min-height: 74px; padding: 14px 16px; background: #FFFFFF; border: 1px solid #C8D0DA; color: #17212B; text-decoration: none; display: flex; align-items: center; justify-content: space-between; gap: 20px; }}
+.algorithm:hover {{ border-color: #7C8C9D; background: #FAFBFC; }}
+.algorithm strong {{ display: block; margin-bottom: 8px; font-size: 15px; }}
+.algorithm-metrics {{ display: flex; flex-wrap: wrap; gap: 8px 18px; color: #536170; font-size: 12px; }}
+.arrow {{ color: #1D5E9E; font-size: 20px; }}
+@media (max-width: 760px) {{ .algorithm {{ align-items: flex-start; }} }}
 </style>
 </head>
 <body>
-<header><h1>{escape(title)}</h1><div class="actions"><button type="button" id="expand">Expand all</button><button type="button" id="collapse">Collapse all</button></div></header>
+<header><h1>{escape(title)}</h1></header>
 <main>{''.join(sections)}</main>
-<script>
-document.getElementById('expand').addEventListener('click', () => document.querySelectorAll('.algorithm').forEach(item => item.open = true));
-document.getElementById('collapse').addEventListener('click', () => document.querySelectorAll('.algorithm').forEach(item => item.open = false));
-</script>
 </body>
 </html>
 """
@@ -367,6 +387,7 @@ def main() -> int:
         dashboard_path = Path(case["case_dir"]) / "algorithm_dashboard.html"
         write_algorithm_dashboard(
             dashboard_path,
+            output,
             args.title,
             case,
         )

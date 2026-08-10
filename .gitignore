@@ -78,3 +78,6 @@ dc_oxc_lpt_solver/.build/
 
 # Validation traffic matrices
 **/validation/**/*.cm
+
+# Paper
+paper/

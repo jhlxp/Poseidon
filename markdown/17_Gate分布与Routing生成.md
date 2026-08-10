@@ -205,6 +205,21 @@ workload/raw_data/
   decode_31.csv
 ```
 
+两类文件是同一份 raw receive 数据集的两个必需部分，不能只保留
+CSV：
+
+| 输入 | 提供的语义 | 不能单独回答的问题 |
+|---|---|---|
+| `decode_{rank}.csv` | 每层、每个 rank 的 9 个 physical slot 分别接收了多少 route | 这些 slot 分别实例化了哪个 logical expert |
+| `ET_4+4_32_9_gsm8k_r1_2k_2k_0417_al_0.json` | 每层 physical slot 到 logical expert ID 的 placement 映射 | 每个 slot 实际接收了多少 route |
+
+例如，CSV 可以说明 `rank 0 / slot 5` 的接收计数为 `115040`，
+JSON 才能说明该 slot 对应 `logical expert 255`。载入器必须同时读取
+两者，才能把 physical receive 计数还原为 logical expert 热度。
+因此，该 JSON 不是说明文件或可再生中间产物；当 provider 为
+`raw_receive_cdf` 时它是必需运行时输入。删除它后应立即报错，而不能猜测
+slot 所属的 expert。
+
 已核对的 shape：
 
 ```text
@@ -230,6 +245,19 @@ layer_list[l].device_list[r].device_expert[s]
 额外实例。但 CSV 的第 9 列不能固定解释为 replica：JSON 中 slot
 已经重排，也没有 master/replica 标记。只能根据同一 logical expert ID
 在全层 288 个 slot 中的重复出现识别额外实例；一个热专家可能有多个副本。
+
+这里不会“每个 rank 只取前 8 个 slot”。每个 rank 的 9 个 physical slot
+都会参与折叠：
+
+```text
+32 ranks * 9 physical slots = 288 physical instances
+288 physical instances      = 256 logical experts + 32 redundant instances
+288 physical receive counts --fold by JSON logical expert ID--> 256-D distribution
+```
+
+`Top-K=8` 发生在上述折叠之后：每个 token 从 256 个 logical experts 中
+选择 8 个不同的 expert。它与 physical slot 的列顺序无关，也不会丢弃
+第 9 个 slot 的接收计数。
 
 ### 6.1 先从 physical 计数折叠回 logical expert
 
@@ -437,14 +465,17 @@ gate_load/
 └── gate_load_profile_summary.json
 ```
 
-HTML 只选择 microbatch，不再单独选择 layer。对所选 MB 使用同一 load 横轴比较：
+HTML 只选择 microbatch，不再单独选择 layer。对所选 MB 使用同一 load 横轴。
+summary 中统一保存：
 
 ```text
-Before = 第一层 raw Gate assignments 的 baseline placement
-After  = 最后一层经过 NIC budget admission 后真正进入 DAG 的 execution placement
+before = 第一层 raw Gate assignments 的 baseline placement
+after  = 最后一层真正进入 DAG 的 execution placement
 ```
 
-因此 `After` 不是无网络约束的 planned placement，也不是第一层算法结果。标题必须
+只有 ProbeEP 的 `after` 需要强调 NIC budget admission；EPLB 是 physical placement，
+MoonEP 是 server-local replica placement，NCCL/DeepEP 不改变 execution placement，
+其 HTML 改用 first/final execution load 标签，不伪造 before/after 优化。标题必须
 直接标注首层/末层的 one-based layer 和内部 `layer_id`。页面先画每服务器 8 rank
 聚合负载及均值，再画 32 个 rank；每个 bar 内按 logical expert 分段。Gate 输入区域
 分别显示第一层和最后一层的 raw logical-expert histogram，它只说明输入偏斜，不代表
@@ -454,21 +485,18 @@ manifest 和 CSV/JSON 仍逐 `(layer,microbatch)` 保存各层自己的 profile�
 HTML 展示口径，不覆盖或删除中间层数据。该模块会进入可视化 ZIP，服务器 run 目录
 在 ZIP 校验成功后不保留散装 HTML。
 
-页面的 migration intents planned/admitted/deferred、before/planned/admitted server
-padded routes、remote copies 和所有通信负载统一取该 MB 的最后一层，表示本次有限层数
-实验中最接近收敛的状态，不把不同层的迁移或 bytes 累加到一起。
+所有通信负载统一取该 MB 的最后一层，不跨层累加。ProbeEP 额外取
+migration intents planned/admitted/deferred、before/planned/admitted server padded routes 和
+remote copies。
 
-HTML 同时提供三个跨服务器区域：
+HTML 的跨服务器区域按算法生成：
 
-1. `Cross-server expert copies`：所选 microbatch 最后一层实际接纳的 remote
+1. `Cross-server expert copies`：仅 ProbeEP 生成；展示所选 microbatch 最后一层实际接纳的 remote
    replica 数、distinct expert 数、expert IDs、完整权重字节和活跃 server-pair 数。
-2. `Directed server-pair load`：只取最后一层，以物理 `src_server -> dst_server` 为行画横向堆叠
-   柱状图，Dispatch、Combine 和 Expert Weight 使用三种独立颜色，共享字节横轴。
-   折叠明细表继续保留 token payloads、top-k expert routes、expert copies、moved
-   routes、expert IDs 和该方向的 TX/RX 总字节。
-3. `Per-NIC directed load`：只取最后一层，在每个有向 server pair 内按 rail/NIC 画同口径横向
-   堆叠柱状图，标签显式写出 source/destination server、NIC 和 rank。折叠明细表
-   保留 token payloads/routes/bytes、expert weight chunks/bytes 和经过该 NIC 的 expert IDs。
+2. `Directed server-pair load`：所有算法都生成 Dispatch/Combine 堆叠柱和 token
+   payload/route 明细；只有 ProbeEP 再加 Expert Weight、copies、moved routes 和 expert IDs。
+3. `Per-NIC directed load`：所有算法都保留 token payloads/routes/bytes 和 endpoint
+   总字节；只有 ProbeEP 再加 expert weight chunks/bytes 和 expert IDs。
 
 `remote_replica_count` 只按完整 remote replica 计数；一个 expert 拆成 21 个权重
 chunks 仍是 1 个 copy。NIC 表的 `expert_weight_chunks` 只表示该 NIC 承载的分片数。

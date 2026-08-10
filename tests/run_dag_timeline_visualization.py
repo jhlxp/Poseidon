@@ -516,14 +516,14 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
     )
     require(completed.returncode == 0, "多算法总览 HTML 生成失败")
     html = output.read_text(encoding="utf-8")
-    require(html.count('<details class="algorithm"') == 2,
-            "算法没有分别使用可折叠分区")
+    require(html.count('<a class="algorithm"') == 2,
+            "总览没有为每个算法生成独立导航入口")
     require("mprail_link_load_by_layer.png" not in html,
             "总览不应绕过单算法 dashboard 直接引用链路图")
-    require(html.count("algorithm_dashboard.html") == 4,
-            "总览没有为每个算法提供 dashboard 链接和 iframe")
-    require("Expand all" in html and "Collapse all" in html,
-            "总览缺少全局展开/收起按钮")
+    require(html.count("algorithm_dashboard.html") == 2,
+            "总览没有为每个算法提供唯一 dashboard 链接")
+    require("<iframe" not in html and "<img" not in html,
+            "总览不应预加载算法 dashboard 或链路图")
     require(zip_output.is_file(), "没有生成可视化 ZIP")
     with zipfile.ZipFile(zip_output) as archive:
         require(archive.testzip() is None, "可视化 ZIP 损坏")
@@ -551,6 +551,13 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
         and "mprail_link_load_by_layer.png" in nccl_dashboard,
         "单算法 dashboard 没有囊括 Gate、timeline 和链路负载",
     )
+    require(
+        "NCCL Gate / direct expert execution" in nccl_dashboard
+        and "Cross-server expert migration" not in nccl_dashboard,
+        "NCCL dashboard 混入了其他算法的模块",
+    )
+    require("<iframe" not in nccl_dashboard and "<img" not in nccl_dashboard,
+            "单算法 dashboard 不应预加载任何重量级模块")
     probeep_dashboard = (
         run_dir
         / "comparison_inputs"
@@ -559,11 +566,12 @@ def comparison_case(run_dir: Path, timeline_dir: Path) -> str:
     ).read_text(encoding="utf-8")
     require(
         "Cross-server expert migration" in probeep_dashboard
+        and "ProbeEP admitted expert placement" in probeep_dashboard
         and "1 cross-server expert moves" in probeep_dashboard
         and "84 MiB" in probeep_dashboard,
         "ProbeEP dashboard 缺少跨机 expert 数和权重字节",
     )
-    return "单算法完整 dashboard 和多算法总 dashboard 均正确打包"
+    return "总览、单算法和重量模块三级导航正确打包且不预加载"
 
 
 class Suite:
