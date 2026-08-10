@@ -11,6 +11,7 @@ full_args=()
 if [[ "${MODE}" == "full" ]]; then
     full_args=(--full --compute-config "${profile}")
 fi
+ensure_simulator
 
 run_pair() {
     local case_id="$1"
@@ -25,21 +26,21 @@ run_pair() {
         --spines-per-plane "${spines}" --links-per-spine "${links}"
     )
 
-    run_case "${case_id}_moonep" \
+    queue_case "${case_id}_moonep" \
+        "${case_id}" "${sweep}" "${gpus}" "${servers}" "${planes}" \
+        "${spines}" "${links}" moonep -- \
         python3 "${REPO_ROOT}/tests/run_dsv3_2layer_algorithms.py" \
-        "${full_args[@]}" --workers 1 --algorithms moonep \
+        --skip-build "${full_args[@]}" --workers 1 --algorithms moonep \
         --num-layers 2 --gate-provider raw_receive_cdf --gate-layer-map 0,1 \
         --gate-seed 17 --moonep-replicas-per-rank 256 "${topology_args[@]}"
-    manifest_add "${case_id}" "${sweep}" "${gpus}" "${servers}" "${planes}" \
-        "${spines}" "${links}" moonep "${LAST_RUN}"
 
-    run_case "${case_id}_probeep" \
+    queue_case "${case_id}_probeep" \
+        "${case_id}" "${sweep}" "${gpus}" "${servers}" "${planes}" \
+        "${spines}" "${links}" probeep -- \
         python3 "${REPO_ROOT}/tests/run_probeep_2layer_ratio_full.py" \
-        "${full_args[@]}" --num-layers 2 \
+        --skip-build "${full_args[@]}" --num-layers 2 \
         --gate-provider raw_receive_cdf --gate-layer-map 0,1 --gate-seed 17 \
         --controller-mode feedback "${topology_args[@]}"
-    manifest_add "${case_id}" "${sweep}" "${gpus}" "${servers}" "${planes}" \
-        "${spines}" "${links}" probeep "${LAST_RUN}"
 }
 
 for gpus in 4 8 16; do
@@ -55,6 +56,7 @@ for planes in 1 2; do
     run_pair "planes_${planes}" planes 8 "${planes}" 4 1
 done
 
+wait_for_cases
 if [[ "${PLAN_ONLY}" == "1" ]]; then
     finish_type
     exit 0

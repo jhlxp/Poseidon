@@ -81,6 +81,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use 4096 tokens/rank. Default is the 2-token functional test.",
     )
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Reuse an existing htsim_uec binary.",
+    )
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument(
         "--compute-config", type=Path, default=DEFAULT_COMPUTE_CONFIG
@@ -902,7 +907,10 @@ def main() -> int:
     simulation_dir = run_dir / "simulation"
     metrics_dir = simulation_dir / "output_metrics"
     metrics_dir.mkdir(parents=True)
-    build_simulator(run_dir)
+    if args.skip_build:
+        require(BINARY.is_file(), f"missing prebuilt HTSim binary: {BINARY}")
+    else:
+        build_simulator(run_dir)
 
     model = ModelSpec(
         name=f"dsv3_probeep_{args.num_layers}layer_dynamic_{mode.name}",
@@ -1167,6 +1175,17 @@ def main() -> int:
                 "topology": asdict(topology),
                 "topk": args.topk,
                 "htsim_process_count": 1,
+                "execution_resources": {
+                    "host_cpu_cores": int(
+                        os.environ.get("HOST_CPU_CORES", "128")
+                    ),
+                    "htsim_cores_per_process": int(
+                        os.environ.get("HTSIM_CORES_PER_PROCESS", "1")
+                    ),
+                    "max_htsim_processes": int(
+                        os.environ.get("MAX_HTSIM_PROCESSES", "100")
+                    ),
+                },
                 "controller_mode": args.controller_mode,
                 "controller_config": asdict(controller_config),
                 "weight_chunk_bytes": args.weight_chunk_bytes,
@@ -1189,6 +1208,17 @@ def main() -> int:
         "gate_layer_map": list(layer_map) if layer_map is not None else None,
         "controller_mode": args.controller_mode,
         "controller_config": asdict(controller_config),
+        "execution_resources": {
+            "host_cpu_cores": int(
+                os.environ.get("HOST_CPU_CORES", "128")
+            ),
+            "htsim_cores_per_process": int(
+                os.environ.get("HTSIM_CORES_PER_PROCESS", "1")
+            ),
+            "max_htsim_processes": int(
+                os.environ.get("MAX_HTSIM_PROCESSES", "100")
+            ),
+        },
         "nic_line_rate_gbps": args.nic_line_rate_gbps,
         "topology": asdict(topology),
         "topk": args.topk,

@@ -5,6 +5,7 @@ import argparse
 import csv
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -154,6 +155,15 @@ def main() -> int:
         "observation_count": len(observations),
         "source_manifest": str(args.manifest.resolve()),
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "execution_resources": {
+            "host_cpu_cores": int(os.environ.get("HOST_CPU_CORES", "128")),
+            "htsim_cores_per_process": int(
+                os.environ.get("HTSIM_CORES_PER_PROCESS", "1")
+            ),
+            "max_htsim_processes": int(
+                os.environ.get("MAX_HTSIM_PROCESSES", "100")
+            ),
+        },
     }
     (args.data_dir / "metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",

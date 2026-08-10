@@ -11,6 +11,7 @@ full_args=()
 if [[ "${MODE}" == "full" ]]; then
     full_args=(--full --compute-config "${profile}")
 fi
+ensure_simulator
 
 run_pair() {
     local case_id="$1"
@@ -25,25 +26,26 @@ run_pair() {
         raw_args=(--gate-layer-map 0,1)
     fi
 
-    run_case "${case_id}_moonep" \
+    queue_case "${case_id}_moonep" \
+        "${case_id}" "${provider}" "${skew_label}" "${seed}" \
+        "${tokens}" H20 moonep -- \
         python3 "${REPO_ROOT}/tests/run_dsv3_2layer_algorithms.py" \
-        "${full_args[@]}" --workers 1 --algorithms moonep --num-layers 2 \
+        --skip-build "${full_args[@]}" --workers 1 \
+        --algorithms moonep --num-layers 2 \
         --gate-provider "${provider}" --gate-seed "${seed}" \
         "${raw_args[@]}" "${provider_args[@]}" \
         --tokens-per-rank "${tokens}" --chunk-tokens "${tokens}" \
         --moonep-replicas-per-rank 256
-    manifest_add "${case_id}" "${provider}" "${skew_label}" "${seed}" \
-        "${tokens}" H20 moonep "${LAST_RUN}"
 
-    run_case "${case_id}_probeep" \
+    queue_case "${case_id}_probeep" \
+        "${case_id}" "${provider}" "${skew_label}" "${seed}" \
+        "${tokens}" H20 probeep -- \
         python3 "${REPO_ROOT}/tests/run_probeep_2layer_ratio_full.py" \
-        "${full_args[@]}" --num-layers 2 \
+        --skip-build "${full_args[@]}" --num-layers 2 \
         --gate-provider "${provider}" --gate-seed "${seed}" \
         "${raw_args[@]}" "${provider_args[@]}" \
         --tokens-per-rank "${tokens}" --chunk-tokens "${tokens}" \
         --controller-mode feedback
-    manifest_add "${case_id}" "${provider}" "${skew_label}" "${seed}" \
-        "${tokens}" H20 probeep "${LAST_RUN}"
 }
 
 run_pair balanced balanced_permuted balanced 17 4096
@@ -60,6 +62,7 @@ run_pair raw_t8192 raw_receive_cdf empirical 17 8192
 run_pair ultra_seed23 ultra_rank_zipf rank_2 23 4096 --gate-target-rank-imbalance 2
 run_pair ultra_seed41 ultra_rank_zipf rank_2 41 4096 --gate-target-rank-imbalance 2
 
+wait_for_cases
 if [[ "${PLAN_ONLY}" == "1" ]]; then
     finish_type
     exit 0

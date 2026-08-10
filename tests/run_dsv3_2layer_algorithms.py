@@ -140,6 +140,11 @@ def parse_args() -> argparse.Namespace:
         help="Parallel algorithm processes.",
     )
     parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Reuse an existing htsim_uec binary.",
+    )
+    parser.add_argument(
         "--algorithms",
         default=",".join(ALGORITHMS),
         help="Comma-separated subset of nccl,deepep,eplb,moonep,probeep.",
@@ -760,6 +765,17 @@ def write_report(
         json.dumps(
             {
                 "mode": asdict(mode),
+                "execution_resources": {
+                    "host_cpu_cores": int(
+                        os.environ.get("HOST_CPU_CORES", "128")
+                    ),
+                    "htsim_cores_per_process": int(
+                        os.environ.get("HTSIM_CORES_PER_PROCESS", "1")
+                    ),
+                    "max_htsim_processes": int(
+                        os.environ.get("MAX_HTSIM_PROCESSES", "100")
+                    ),
+                },
                 "passed": passed,
                 "total": len(results),
                 "comparison_html_in_zip": comparison_member,
@@ -868,6 +884,17 @@ def main() -> int:
                 "mode": asdict(mode),
                 "algorithms": algorithms,
                 "workers": min(args.workers, len(algorithms)),
+                "execution_resources": {
+                    "host_cpu_cores": int(
+                        os.environ.get("HOST_CPU_CORES", "128")
+                    ),
+                    "htsim_cores_per_process": int(
+                        os.environ.get("HTSIM_CORES_PER_PROCESS", "1")
+                    ),
+                    "max_htsim_processes": int(
+                        os.environ.get("MAX_HTSIM_PROCESSES", "100")
+                    ),
+                },
                 "num_layers": args.num_layers,
                 "topk": args.topk,
                 "gate": asdict(gate),
@@ -898,23 +925,31 @@ def main() -> int:
         encoding="utf-8",
     )
 
-    try:
-        build_simulator(run_dir)
-    except Exception as exc:
-        write_report(
-            run_dir,
-            mode,
-            args.num_layers,
-            [
-                {"algorithm": algorithm, "status": "failed", "error": str(exc)}
-                for algorithm in algorithms
-            ],
-            None,
-            None,
-        )
-        print(f"build failed: {exc}")
-        print(f"log directory: {run_dir}")
-        return 1
+    if args.skip_build:
+        if not BINARY.is_file():
+            raise SystemExit(f"--skip-build requested but binary is missing: {BINARY}")
+    else:
+        try:
+            build_simulator(run_dir)
+        except Exception as exc:
+            write_report(
+                run_dir,
+                mode,
+                args.num_layers,
+                [
+                    {
+                        "algorithm": algorithm,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                    for algorithm in algorithms
+                ],
+                None,
+                None,
+            )
+            print(f"build failed: {exc}")
+            print(f"log directory: {run_dir}")
+            return 1
 
     by_algorithm: dict[str, dict[str, object]] = {}
     with ProcessPoolExecutor(

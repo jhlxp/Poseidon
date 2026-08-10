@@ -398,6 +398,10 @@ forward path，backward state restoration、replica gradient reduce、HBM capaci
 schedule。静态 baseline 与动态 ProbeEP 必须来自等价 workload；ProbeEP 主结果必须使用
 同一 simulator PID 内的闭环运行，不能用静态 ProbeEP 代替。
 
+仿真运行在 128-core server 上。每个 HTSim 进程使用一个 CPU core，批量实验最多并发
+100 个 HTSim 进程，其余 28 cores 留给构建、数据处理和系统服务。并发只缩短 sweep 的
+wall-clock time，不改变单个 case 的仿真语义或报告指标。
+
 所有实验从同一个 Base Case 出发。Base Case 对应现有 EP32/1Plane 的完整 prefill/训练
 forward 配置和已经完成的五算法 H20/H100 运行。每类实验只改变一组因素；其余模型、
 Gate assignment、算法语义和仿真方法保持不变。论文只描述控制变量思想，精确配置见实验

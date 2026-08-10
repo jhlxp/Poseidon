@@ -11,6 +11,7 @@ full_args=()
 if [[ "${MODE}" == "full" ]]; then
     full_args=(--full --compute-config "${profile}")
 fi
+ensure_simulator
 
 run_variant() {
     local case_id="$1"
@@ -21,14 +22,14 @@ run_variant() {
     local target="$6"
     local chunk_bytes
     chunk_bytes="$(python3 -c "print(int(float('${chunk_mib}') * 1024 * 1024))")"
-    run_case "${case_id}" \
+    queue_case "${case_id}" \
+        "${case_id}" "${variant}" "${controller}" "${budget}" \
+        "${chunk_mib}" "${target}" H20 probeep -- \
         python3 "${REPO_ROOT}/tests/run_probeep_2layer_ratio_full.py" \
-        "${full_args[@]}" --num-layers 2 \
+        --skip-build "${full_args[@]}" --num-layers 2 \
         --gate-provider raw_receive_cdf --gate-layer-map 0,1 --gate-seed 17 \
         --controller-mode "${controller}" --initial-budget-mib "${budget}" \
         --weight-chunk-bytes "${chunk_bytes}" --target-overlap-ratio "${target}"
-    manifest_add "${case_id}" "${variant}" "${controller}" "${budget}" \
-        "${chunk_mib}" "${target}" H20 probeep "${LAST_RUN}"
 }
 
 run_variant no_remote no_remote fixed 0 4 0.9
@@ -39,6 +40,7 @@ run_variant full full_probeep feedback 16 4 0.9
 run_variant coarse_128 monolithic_weight feedback 16 128 0.9
 run_variant target_05 conservative_target feedback 16 4 0.5
 
+wait_for_cases
 if [[ "${PLAN_ONLY}" == "1" ]]; then
     finish_type
     exit 0

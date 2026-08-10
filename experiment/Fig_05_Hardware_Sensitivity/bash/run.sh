@@ -5,6 +5,7 @@ TYPE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${TYPE_DIR}/../common/run_helpers.sh"
 prepare_type "${TYPE_DIR}"
 manifest_init case_id sweep hardware nic_gbps local_gbps weight_scale algorithm source_run
+ensure_simulator
 
 run_pair() {
     local case_id="$1"
@@ -19,23 +20,23 @@ run_pair() {
         full_args=(--full --compute-config "${profile}")
     fi
 
-    run_case "${case_id}_moonep" \
+    queue_case "${case_id}_moonep" \
+        "${case_id}" "${sweep}" "${hardware}" "${nic}" "${local_bw}" \
+        "${weight_scale}" moonep -- \
         python3 "${REPO_ROOT}/tests/run_dsv3_2layer_algorithms.py" \
-        "${full_args[@]}" --workers 1 --algorithms moonep \
+        --skip-build "${full_args[@]}" --workers 1 --algorithms moonep \
         --num-layers 2 --gate-provider raw_receive_cdf --gate-layer-map 0,1 \
         --gate-seed 17 --moonep-replicas-per-rank 256 \
         --nic-line-rate-gbps "${nic}" --local-line-rate-gbps "${local_bw}"
-    manifest_add "${case_id}" "${sweep}" "${hardware}" "${nic}" "${local_bw}" \
-        "${weight_scale}" moonep "${LAST_RUN}"
 
-    run_case "${case_id}_probeep" \
+    queue_case "${case_id}_probeep" \
+        "${case_id}" "${sweep}" "${hardware}" "${nic}" "${local_bw}" \
+        "${weight_scale}" probeep -- \
         python3 "${REPO_ROOT}/tests/run_probeep_2layer_ratio_full.py" \
-        "${full_args[@]}" --num-layers 2 \
+        --skip-build "${full_args[@]}" --num-layers 2 \
         --gate-provider raw_receive_cdf --gate-layer-map 0,1 --gate-seed 17 \
         --controller-mode feedback --nic-line-rate-gbps "${nic}" \
         --local-line-rate-gbps "${local_bw}" --expert-weight-scale "${weight_scale}"
-    manifest_add "${case_id}" "${sweep}" "${hardware}" "${nic}" "${local_bw}" \
-        "${weight_scale}" probeep "${LAST_RUN}"
 }
 
 for hardware in H20 H100; do
@@ -50,6 +51,7 @@ for local_bw in 900 1800 3600 7200; do
     run_pair "local_${local_bw}" local H20 400 "${local_bw}" 1
 done
 
+wait_for_cases
 if [[ "${PLAN_ONLY}" == "1" ]]; then
     finish_type
     exit 0

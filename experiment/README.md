@@ -44,6 +44,21 @@ MODE=full bash experiment/Fig_XX_Experiment_Type/bash/run.sh
 设置 `PLAN_ONLY=1` 只打印 case matrix，不启动仿真。`quick` 只用于检查执行链，不能进入
 论文；`full` 才能标记为 paper-eligible。本轮只构造脚本，没有执行这些入口。
 
+## CPU 资源约束
+
+实验服务器有 128 个 CPU cores。HTSim 是单核进程，每个 case 固定占用 1 个 core；所有
+实验 bash 默认最多同时运行 100 个 HTSim 进程。执行器把仿真固定到 CPU 0--99，并通过
+跨脚本 slot lock 保证多个实验类型同时启动时也不突破全局 100-core 上限。CPU 100--127
+保留给 HTSim 构建、数据采集、压缩、绘图和系统服务。
+
+```bash
+MAX_HTSIM_PROCESSES=100 MODE=full bash experiment/Fig_XX_Experiment_Type/bash/run.sh
+```
+
+`MAX_HTSIM_PROCESSES` 可以调小，但不能超过 100。各 runner 使用 `--workers 1` 和
+`--skip-build`，公共入口在提交并发 case 前只构建一次 simulator。OpenMP/BLAS 线程数也
+被限制为 1，避免单个 case 暗中占用多个 core。
+
 ## 输出约定
 
 每次真实运行后生成：
