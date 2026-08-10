@@ -5,7 +5,10 @@ TYPE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${TYPE_DIR}/../common/run_helpers.sh"
 prepare_type "${TYPE_DIR}"
 
-command=(python3 "${TYPE_DIR}/benchmark.py" --mode "${MODE}" --data-dir "${TYPE_DIR}/data")
+command=(
+    taskset -c 100 python3 "${TYPE_DIR}/benchmark.py"
+    --mode "${MODE}" --data-dir "${TYPE_DIR}/data"
+)
 echo "[reference planner and analytical boundary]"
 print_command "${command[@]}"
 if [[ "${PLAN_ONLY}" == "1" ]]; then

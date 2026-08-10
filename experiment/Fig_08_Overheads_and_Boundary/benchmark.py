@@ -5,6 +5,7 @@ import argparse
 import csv
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import statistics
 import sys
@@ -62,21 +63,24 @@ def invocation(ep: int, experts: int, tokens: int, topk: int = 8) -> MoEInvocati
 def measure(ep: int, experts: int, tokens: int, chunk_mib: int, repeats: int) -> dict[str, object]:
     work = invocation(ep, experts, tokens)
     durations: list[float] = []
-    peaks: list[int] = []
     last_plan = None
     for _ in range(repeats):
         builder = ProbeEPBuilder(
             H100CostModel(),
             ProbeEPConfig(weight_chunk_bytes=chunk_mib * 1024 * 1024),
         )
-        tracemalloc.start()
         start = time.perf_counter_ns()
         last_plan = builder.plan(work)
         durations.append((time.perf_counter_ns() - start) / 1e6)
-        _, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-        peaks.append(peak)
     assert last_plan is not None
+    memory_builder = ProbeEPBuilder(
+        H100CostModel(),
+        ProbeEPConfig(weight_chunk_bytes=chunk_mib * 1024 * 1024),
+    )
+    tracemalloc.start()
+    memory_builder.plan(work)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
     return {
         "ep": ep,
         "experts": experts,
@@ -85,7 +89,7 @@ def measure(ep: int, experts: int, tokens: int, chunk_mib: int, repeats: int) ->
         "chunk_mib": chunk_mib,
         "runtime_median_ms": statistics.median(durations),
         "runtime_p95_ms": sorted(durations)[max(0, int(0.95 * len(durations)) - 1)],
-        "peak_memory_mib": max(peaks) / 2**20,
+        "peak_memory_mib": peak / 2**20,
         "planned_intents": len(last_plan.planned_intents),
         "admitted_intents": len(last_plan.admitted_intents),
         "remote_replicas": len(last_plan.remote_replicas),
@@ -152,7 +156,15 @@ def main() -> int:
         "mode": args.mode,
         "paper_eligible": args.mode == "full",
         "planner_evidence": "python_reference_planner_with_gate_generation_excluded_from_timing",
+        "memory_measurement": "separate_tracemalloc_plan_not_in_latency_samples",
         "planner_claim_boundary": "trend_only_not_online_prototype_latency",
+        "execution_resources": {
+            "host_cpu_cores": int(os.environ.get("HOST_CPU_CORES", "128")),
+            "cpu_affinity": "100",
+            "processes": 1,
+            "threads": 1,
+            "htsim_processes": 0,
+        },
         "analytical_model": {
             "expert_weight_bytes": "3 * hidden * ffn_hidden * bf16_bytes",
             "compute_flops_per_route": "6 * hidden * ffn_hidden",

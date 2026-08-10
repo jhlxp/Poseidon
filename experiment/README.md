@@ -4,6 +4,10 @@
 角度回答同一个系统问题，并由一个 `plot.py` 生成 `fig_xxa`、`fig_xxb`、`fig_xxc` 等
 子结果。完整实验思想见 `experiment/实验大纲.md`。
 
+每个 `Fig_XX_Experiment_Type/README.md` 是该类型的实验配置单，必须与同目录
+`bash/run.sh` 保持一致：固定参数、控制变量、case matrix、case 数量、采集指标和输出文件
+都在其中列出。修改 sweep 时应同时修改脚本和 README。
+
 ## Base Case
 
 所有实验默认从 `markdown/14_专用测试拓扑-EP32-1Plane.md` 定义的完整 EP32/1Plane
@@ -50,6 +54,10 @@ MODE=full bash experiment/Fig_XX_Experiment_Type/bash/run.sh
 实验 bash 默认最多同时运行 100 个 HTSim 进程。执行器把仿真固定到 CPU 0--99，并通过
 跨脚本 slot lock 保证多个实验类型同时启动时也不突破全局 100-core 上限。CPU 100--127
 保留给 HTSim 构建、数据采集、压缩、绘图和系统服务。
+
+执行语义就是一个固定容量的 worker pool：case 进入任务队列，空闲 worker 获取一个 case，
+占用一个 CPU slot 执行，结束后归还 slot 并继续取下一个任务。这里的 worker 是独立进程，
+不会在一个 HTSim case 内再开并行仿真线程。
 
 ```bash
 MAX_HTSIM_PROCESSES=100 MODE=full bash experiment/Fig_XX_Experiment_Type/bash/run.sh

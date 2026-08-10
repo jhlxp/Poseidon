@@ -34,7 +34,7 @@ run_variant() {
 
 run_variant no_remote no_remote fixed 0 4 0.9
 run_variant fixed_8 fixed_conservative fixed 8 4 0.9
-run_variant fixed_64 compute_only_aggressive fixed 64 4 0.9
+run_variant fixed_64 fixed_aggressive fixed 64 4 0.9
 run_variant fine_1 fine_weight_chunks feedback 16 1 0.9
 run_variant full full_probeep feedback 16 4 0.9
 run_variant coarse_128 monolithic_weight feedback 16 128 0.9
