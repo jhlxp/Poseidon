@@ -64,6 +64,7 @@ class RunMode:
     simulation_end_us: int
     timeout_seconds: int
     compute_config: Path | None
+    nic_line_rate_gbps: float
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,23 @@ class GateRun:
     layer_map: tuple[int, ...] | None
 
 
+@dataclass(frozen=True)
+class TopologyRun:
+    gpus_per_server: int = 8
+    planes: int = 1
+    spines_per_plane: int = 4
+    links_per_spine: int = 1
+    local_line_rate_gbps: float = 7200.0
+
+    def __post_init__(self) -> None:
+        if self.gpus_per_server <= 0 or 32 % self.gpus_per_server:
+            raise ValueError("gpus_per_server must be a positive divisor of 32")
+        if self.planes <= 0 or self.spines_per_plane <= 0:
+            raise ValueError("planes and spines_per_plane must be positive")
+        if self.links_per_spine <= 0 or self.local_line_rate_gbps <= 0:
+            raise ValueError("topology rates and link counts must be positive")
+
+
 def mode_config(full: bool) -> RunMode:
     if full:
         return RunMode(
@@ -89,6 +107,7 @@ def mode_config(full: bool) -> RunMode:
             simulation_end_us=1_000_000,
             timeout_seconds=1200,
             compute_config=DEFAULT_COMPUTE_CONFIG,
+            nic_line_rate_gbps=400.0,
         )
     return RunMode(
         name="smoke",
@@ -98,6 +117,7 @@ def mode_config(full: bool) -> RunMode:
         simulation_end_us=5000,
         timeout_seconds=180,
         compute_config=None,
+        nic_line_rate_gbps=400.0,
     )
 
 
@@ -166,6 +186,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Override the mode's HTSim end time without changing token count.",
     )
+    parser.add_argument("--nic-line-rate-gbps", type=float, default=400.0)
+    parser.add_argument("--local-line-rate-gbps", type=float, default=7200.0)
+    parser.add_argument("--gpus-per-server", type=int, default=8)
+    parser.add_argument("--planes", type=int, default=1)
+    parser.add_argument("--spines-per-plane", type=int, default=4)
+    parser.add_argument("--links-per-spine", type=int, default=1)
+    parser.add_argument("--tokens-per-rank", type=int)
+    parser.add_argument("--chunk-tokens", type=int)
+    parser.add_argument("--topk", type=int, default=8)
     parser.add_argument(
         "--compute-config",
         type=Path,
@@ -214,7 +243,12 @@ def build_simulator(run_dir: Path) -> None:
     (run_dir / "构建.log").write_text("\n".join(chunks), encoding="utf-8")
 
 
-def execute_htsim(case_dir: Path, workload_dir: Path, mode: RunMode) -> Path:
+def execute_htsim(
+    case_dir: Path,
+    workload_dir: Path,
+    mode: RunMode,
+    topology: TopologyRun,
+) -> Path:
     simulation_dir = case_dir / "simulation"
     metrics_dir = simulation_dir / "output_metrics"
     metrics_dir.mkdir(parents=True)
@@ -222,12 +256,12 @@ def execute_htsim(case_dir: Path, workload_dir: Path, mode: RunMode) -> Path:
     command = [
         str(BINARY),
         "-topology", "mprail",
-        "-mprail_planes", "1",
-        "-mprail_gpus_per_server", "8",
-        "-mprail_l1_eps_per_plane", "4",
-        "-mprail_l0_l1_links_per_spine", "1",
-        "-linkspeed", "400000",
-        "-local_linkspeed", "7200000",
+        "-mprail_planes", str(topology.planes),
+        "-mprail_gpus_per_server", str(topology.gpus_per_server),
+        "-mprail_l1_eps_per_plane", str(topology.spines_per_plane),
+        "-mprail_l0_l1_links_per_spine", str(topology.links_per_spine),
+        "-linkspeed", str(int(round(mode.nic_line_rate_gbps * 1000.0))),
+        "-local_linkspeed", str(int(round(topology.local_line_rate_gbps * 1000.0))),
         "-local_latency_ns", "50",
         "-hop_latency", "0.1",
         "-switch_latency", "0.02",
@@ -276,6 +310,7 @@ def run_visualizations(
     algorithm: str,
     mode: RunMode,
     num_layers: int,
+    topology: TopologyRun = TopologyRun(),
 ) -> None:
     timeline_dir = case_dir / "timeline"
     timeline_command = [
@@ -284,7 +319,7 @@ def run_visualizations(
         "--workload-dir", str(workload_dir),
         "--htsim-log", str(log_path),
         "--output-dir", str(timeline_dir),
-        "--gpus-per-server", "8",
+        "--gpus-per-server", str(topology.gpus_per_server),
         "--ranks", "0-31",
         "--title", f"{algorithm.upper()} / DSV3 {num_layers}-layer / {mode.name}",
     ]
@@ -308,7 +343,7 @@ def run_visualizations(
         str(LINK_LOAD),
         "--metrics-dir", str(case_dir / "simulation" / "output_metrics"),
         "--output-dir", str(link_dir),
-        "--planes", "1",
+        "--planes", str(topology.planes),
         "--title", f"{algorithm.upper()} / DSV3 {num_layers}-layer / {mode.name}",
     ]
     link_result = subprocess.run(
@@ -586,6 +621,8 @@ def run_algorithm(
     moonep_replicas_per_rank: int,
     probeep_weight_chunk_bytes: int,
     num_layers: int,
+    topk: int,
+    topology: TopologyRun,
 ) -> dict[str, object]:
     case_dir = root_dir / "algorithms" / algorithm
     case_dir.mkdir(parents=True)
@@ -598,14 +635,14 @@ def run_algorithm(
             num_kv_heads=128,
             head_dim=128,
             num_experts=256,
-            topk=8,
+            topk=topk,
             sequence_length=4096,
             num_layers=num_layers,
             micro_batches=2,
         )
         placement = Placement(
             32,
-            8,
+            topology.gpus_per_server,
             make_contiguous_expert_placement(model.num_experts, 32),
         )
         cost_model = (
@@ -624,6 +661,7 @@ def run_algorithm(
                 token_padding=128,
                 probeep_route_chunk_tokens=mode.chunk_tokens,
                 probeep_weight_chunk_bytes=probeep_weight_chunk_bytes,
+                probeep_nic_line_rate_gbps=mode.nic_line_rate_gbps,
                 gate_provider=create_gate_provider(
                     gate.provider,
                     seed=gate.seed,
@@ -643,7 +681,7 @@ def run_algorithm(
         )
         workload_dir = case_dir / "workload"
         emit_workload(result.graph, workload_dir, metadata=result.metadata)
-        log_path = execute_htsim(case_dir, workload_dir, mode)
+        log_path = execute_htsim(case_dir, workload_dir, mode, topology)
         run_visualizations(
             case_dir,
             workload_dir,
@@ -651,6 +689,7 @@ def run_algorithm(
             algorithm,
             mode,
             num_layers,
+            topology,
         )
         summary = validate_case(
             case_dir,
@@ -746,6 +785,14 @@ def main() -> int:
         raise SystemExit("--moonep-replicas-per-rank must be non-negative")
     if args.probeep_weight_chunk_bytes <= 0:
         raise SystemExit("--probeep-weight-chunk-bytes must be positive")
+    if args.nic_line_rate_gbps <= 0:
+        raise SystemExit("--nic-line-rate-gbps must be positive")
+    if args.tokens_per_rank is not None and args.tokens_per_rank <= 0:
+        raise SystemExit("--tokens-per-rank must be positive")
+    if args.chunk_tokens is not None and args.chunk_tokens <= 0:
+        raise SystemExit("--chunk-tokens must be positive")
+    if args.topk <= 0 or args.topk > 256:
+        raise SystemExit("--topk must be in [1, 256]")
     if args.num_layers < 2:
         raise SystemExit("--num-layers must be at least 2")
     algorithms = tuple(
@@ -758,6 +805,21 @@ def main() -> int:
         raise SystemExit(f"unsupported algorithms: {sorted(unsupported)}")
 
     mode = mode_config(args.full)
+    mode = replace(mode, nic_line_rate_gbps=args.nic_line_rate_gbps)
+    if args.tokens_per_rank is not None:
+        mode = replace(mode, tokens_per_rank=args.tokens_per_rank)
+    if args.chunk_tokens is not None:
+        mode = replace(mode, chunk_tokens=args.chunk_tokens)
+    try:
+        topology = TopologyRun(
+            gpus_per_server=args.gpus_per_server,
+            planes=args.planes,
+            spines_per_plane=args.spines_per_plane,
+            links_per_spine=args.links_per_spine,
+            local_line_rate_gbps=args.local_line_rate_gbps,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if args.full:
         compute_config = args.compute_config.resolve()
         if not compute_config.is_file():
@@ -807,17 +869,20 @@ def main() -> int:
                 "algorithms": algorithms,
                 "workers": min(args.workers, len(algorithms)),
                 "num_layers": args.num_layers,
+                "topk": args.topk,
                 "gate": asdict(gate),
                 "moonep_replicas_per_rank": args.moonep_replicas_per_rank,
                 "probeep_weight_chunk_bytes": args.probeep_weight_chunk_bytes,
                 "topology": {
                     "ranks": 32,
-                    "servers": 4,
-                    "gpus_per_server": 8,
-                    "planes": 1,
-                    "leaf": 8,
-                    "spine": 4,
-                    "rdma_gbps": 400,
+                    "servers": 32 // topology.gpus_per_server,
+                    "gpus_per_server": topology.gpus_per_server,
+                    "planes": topology.planes,
+                    "leaf": topology.gpus_per_server,
+                    "spine": topology.spines_per_plane,
+                    "links_per_spine": topology.links_per_spine,
+                    "rdma_gbps": mode.nic_line_rate_gbps,
+                    "local_gbps": topology.local_line_rate_gbps,
                     "mtu_bytes": 4150,
                     "queue_packets": 128,
                     "queue_bytes": 531200,
@@ -865,6 +930,8 @@ def main() -> int:
                 args.moonep_replicas_per_rank,
                 args.probeep_weight_chunk_bytes,
                 args.num_layers,
+                args.topk,
+                topology,
             ): algorithm
             for algorithm in algorithms
         }

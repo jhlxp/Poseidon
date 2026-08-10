@@ -63,6 +63,13 @@ tests/data/empirical_pooled_distribution_plot.png
 !pysrc/compute_profiles/*.json
 !tests/data/empirical_pooled_distribution.csv
 !tests/data_eplb/empirical_pooled_distribution.csv
+!experiment/Fig_*/data/*.csv
+!experiment/Fig_*/data/*.json
+!experiment/Fig_*/png/*.png
+!experiment/Fig_*/pdf/*.pdf
+!experiment/Fig_*/artifact/*.json
+!experiment/Fig_*/artifact/*.csv
+!experiment/Fig_*/artifact/*.zip
 
 # LaTeX build products
 *.aux
@@ -79,5 +86,6 @@ dc_oxc_lpt_solver/.build/
 # Validation traffic matrices
 **/validation/**/*.cm
 
-# Paper
-paper/
+# Paper references stay local; the ProbeEP outline is part of this repository.
+paper/*
+!paper/ProbeEP论文大纲.md

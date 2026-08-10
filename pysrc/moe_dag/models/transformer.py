@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Literal
 
 from ..algorithms import (
@@ -38,6 +39,7 @@ class TransformerWorkloadConfig:
     token_padding: int = 128
     probeep_route_chunk_tokens: int = 0
     probeep_weight_chunk_bytes: int = 4 * 1024 * 1024
+    probeep_expert_weight_scale: float = 1.0
     probeep_initial_nic_budget_bytes: int = 16 * 1024 * 1024
     probeep_nic_line_rate_gbps: float = 400.0
     probeep_target_overlap_ratio: float = 0.90
@@ -68,6 +70,11 @@ class TransformerWorkloadConfig:
             )
         if self.probeep_weight_chunk_bytes <= 0:
             raise ValidationError("probeep_weight_chunk_bytes must be positive")
+        if (
+            not isfinite(self.probeep_expert_weight_scale)
+            or self.probeep_expert_weight_scale <= 0
+        ):
+            raise ValidationError("probeep_expert_weight_scale must be positive")
         if self.probeep_nic_budget_by_dispatch is not None:
             for scope, budgets in self.probeep_nic_budget_by_dispatch.items():
                 if (
@@ -171,6 +178,7 @@ def build_transformer_workload(
                     config.probeep_route_chunk_tokens or config.chunk_tokens
                 ),
                 weight_chunk_bytes=config.probeep_weight_chunk_bytes,
+                expert_weight_scale=config.probeep_expert_weight_scale,
                 nic_controller=ProbeNICControllerConfig(
                     initial_budget_bytes=(
                         config.probeep_initial_nic_budget_bytes

@@ -42,11 +42,12 @@ from moe_dag.models import (  # noqa: E402
     TransformerWorkloadConfig,
 )
 from tests.run_dsv3_2layer_algorithms import (  # noqa: E402
+    TopologyRun,
     build_simulator,
     mode_config,
     run_visualizations,
 )
-from workload.gate import create_gate_provider  # noqa: E402
+from workload.gate import GATE_PROVIDER_NAMES, create_gate_provider  # noqa: E402
 
 
 BINARY = ROOT / "htsim" / "sim" / "build-mprail" / "datacenter" / "htsim_uec"
@@ -61,11 +62,6 @@ RAW_PLACEMENT = (
 )
 NUM_RANKS = 32
 NUM_MICROBATCHES = 2
-CONTROLLER_CONFIG = ProbeNICControllerConfig(
-    initial_budget_bytes=16 * 1024 * 1024,
-    nic_line_rate_gbps=400.0,
-    target_overlap_ratio=0.90,
-)
 TASK_START_RE = re.compile(r"DAG_TASK_START task=(\d+).* time_us=([0-9.eE+-]+)")
 TASK_DONE_RE = re.compile(r"DAG_TASK_DONE task=(\d+).* time_us=([0-9.eE+-]+)")
 OBSERVATION_RE = re.compile(
@@ -94,6 +90,39 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated raw receive layers; defaults to 0..N-1.",
     )
     parser.add_argument("--gate-seed", type=int, default=17)
+    parser.add_argument(
+        "--gate-provider",
+        choices=GATE_PROVIDER_NAMES,
+        default="raw_receive_cdf",
+    )
+    parser.add_argument("--gate-rank-alpha", type=float)
+    parser.add_argument("--gate-local-alpha", type=float, default=4.0)
+    parser.add_argument(
+        "--gate-target-rank-imbalance", type=float, default=2.0
+    )
+    parser.add_argument("--gate-fast-skew", type=float, default=0.8)
+    parser.add_argument(
+        "--controller-mode",
+        choices=("feedback", "fixed"),
+        default="feedback",
+    )
+    parser.add_argument("--initial-budget-mib", type=float, default=16.0)
+    parser.add_argument("--target-overlap-ratio", type=float, default=0.90)
+    parser.add_argument("--nic-line-rate-gbps", type=float, default=400.0)
+    parser.add_argument("--local-line-rate-gbps", type=float, default=7200.0)
+    parser.add_argument("--gpus-per-server", type=int, default=8)
+    parser.add_argument("--planes", type=int, default=1)
+    parser.add_argument("--spines-per-plane", type=int, default=4)
+    parser.add_argument("--links-per-spine", type=int, default=1)
+    parser.add_argument("--tokens-per-rank", type=int)
+    parser.add_argument("--chunk-tokens", type=int)
+    parser.add_argument("--topk", type=int, default=8)
+    parser.add_argument(
+        "--weight-chunk-bytes", type=int, default=4 * 1024 * 1024
+    )
+    parser.add_argument("--expert-weight-scale", type=float, default=1.0)
+    parser.add_argument("--simulation-end-us", type=int)
+    parser.add_argument("--link-sample-us", type=int)
     parser.add_argument(
         "--skip-visualizations",
         action="store_true",
@@ -301,16 +330,18 @@ def _command(
     workload_dir: Path,
     simulation_dir: Path,
     end_us: int,
+    nic_line_rate_gbps: float,
+    topology: TopologyRun,
 ) -> list[str]:
     return [
         str(BINARY),
         "-topology", "mprail",
-        "-mprail_planes", "1",
-        "-mprail_gpus_per_server", "8",
-        "-mprail_l1_eps_per_plane", "4",
-        "-mprail_l0_l1_links_per_spine", "1",
-        "-linkspeed", "400000",
-        "-local_linkspeed", "7200000",
+        "-mprail_planes", str(topology.planes),
+        "-mprail_gpus_per_server", str(topology.gpus_per_server),
+        "-mprail_l1_eps_per_plane", str(topology.spines_per_plane),
+        "-mprail_l0_l1_links_per_spine", str(topology.links_per_spine),
+        "-linkspeed", str(int(round(nic_line_rate_gbps * 1000.0))),
+        "-local_linkspeed", str(int(round(topology.local_line_rate_gbps * 1000.0))),
         "-local_latency_ns", "50",
         "-hop_latency", "0.1",
         "-switch_latency", "0.02",
@@ -343,6 +374,7 @@ def _write_observations(
         "local_weight_bytes", "migration_tx_total_bytes",
         "migration_rx_total_bytes", "global_network_to_compute_ratio",
         "global_adjustment_factor", "network_bottleneck_ranks",
+        "controller_mode", "controller_applied",
     ]
     with (run_dir / "probeep_dispatch_observations.csv").open(
         "w", newline="", encoding="utf-8"
@@ -481,6 +513,8 @@ def _validate_runtime(
     dispatch_records: list[dict[str, object]],
     combine_records: list[dict[str, object]],
     require_remote_migration: bool,
+    controller_mode: str,
+    fixed_budget: tuple[int, ...],
 ) -> dict[str, object]:
     require(len(starts) == len(emitter.task_ids), "not every task started")
     require(len(dones) == len(emitter.task_ids), "not every task completed")
@@ -587,9 +621,14 @@ def _validate_runtime(
         for micro_batch in range(NUM_MICROBATCHES):
             previous = records_by_scope[(layer - 1, micro_batch)]
             invocation = _invocation_metadata(builder, layer, micro_batch)
+            expected_budget = (
+                list(fixed_budget)
+                if controller_mode == "fixed"
+                else previous["controller_update"]["budget_after"]
+            )
             require(
                 list(invocation["nic_budget_before"])
-                == previous["controller_update"]["budget_after"],
+                == expected_budget,
                 f"Layer {layer}/MB{micro_batch} did not consume previous feedback",
             )
     weight_byte_conservation_checks = 0
@@ -798,12 +837,53 @@ def _package(run_dir: Path, layers: int) -> Path:
 def main() -> int:
     args = parse_args()
     require(args.num_layers >= 2, "dynamic wavefront test needs at least two layers")
-    layer_map = (
-        tuple(int(value.strip()) for value in args.gate_layer_map.split(","))
-        if args.gate_layer_map else tuple(range(args.num_layers))
+    require(args.initial_budget_mib >= 0, "initial budget must be non-negative")
+    require(
+        args.tokens_per_rank is None or args.tokens_per_rank > 0,
+        "tokens per rank must be positive",
     )
-    require(len(layer_map) == args.num_layers, "gate layer map length mismatch")
+    require(
+        args.chunk_tokens is None or args.chunk_tokens > 0,
+        "chunk tokens must be positive",
+    )
+    require(args.weight_chunk_bytes > 0, "weight chunk bytes must be positive")
+    require(args.expert_weight_scale > 0, "expert weight scale must be positive")
+    require(args.nic_line_rate_gbps > 0, "NIC line rate must be positive")
+    require(args.topk > 0 and args.topk <= 256, "topk must be in [1, 256]")
+    require(
+        0 < args.target_overlap_ratio <= 1,
+        "target overlap ratio must be in (0, 1]",
+    )
+    layer_map = None
+    if args.gate_layer_map:
+        layer_map = tuple(
+            int(value.strip()) for value in args.gate_layer_map.split(",")
+        )
+        require(len(layer_map) == args.num_layers,
+                "gate layer map length mismatch")
+    elif args.gate_provider == "raw_receive_cdf":
+        layer_map = tuple(range(args.num_layers))
     mode = mode_config(args.full)
+    try:
+        topology = TopologyRun(
+            gpus_per_server=args.gpus_per_server,
+            planes=args.planes,
+            spines_per_plane=args.spines_per_plane,
+            links_per_spine=args.links_per_spine,
+            local_line_rate_gbps=args.local_line_rate_gbps,
+        )
+    except ValueError as exc:
+        raise AssertionError(str(exc)) from exc
+    if args.tokens_per_rank is not None:
+        mode = replace(mode, tokens_per_rank=args.tokens_per_rank)
+    if args.chunk_tokens is not None:
+        mode = replace(mode, chunk_tokens=args.chunk_tokens)
+    if args.simulation_end_us is not None:
+        require(args.simulation_end_us > 0, "simulation end must be positive")
+        mode = replace(mode, simulation_end_us=args.simulation_end_us)
+    if args.link_sample_us is not None:
+        require(args.link_sample_us > 0, "link sample must be positive")
+        mode = replace(mode, link_sample_us=args.link_sample_us)
     if args.full:
         compute_path = args.compute_config.resolve()
         require(compute_path.is_file(), f"missing compute config: {compute_path}")
@@ -832,14 +912,14 @@ def main() -> int:
         num_kv_heads=128,
         head_dim=128,
         num_experts=256,
-        topk=8,
+        topk=args.topk,
         sequence_length=4096,
         num_layers=args.num_layers,
         micro_batches=2,
     )
     placement = Placement(
         NUM_RANKS,
-        8,
+        topology.gpus_per_server,
         make_contiguous_expert_placement(model.num_experts, NUM_RANKS),
     )
     builder = IncrementalTransformerWorkloadBuilder(
@@ -851,11 +931,20 @@ def main() -> int:
             chunk_tokens=mode.chunk_tokens,
             token_padding=128,
             probeep_route_chunk_tokens=mode.chunk_tokens,
-            probeep_weight_chunk_bytes=4 * 1024 * 1024,
-            probeep_target_overlap_ratio=0.90,
+            probeep_weight_chunk_bytes=args.weight_chunk_bytes,
+            probeep_expert_weight_scale=args.expert_weight_scale,
+            probeep_initial_nic_budget_bytes=int(
+                round(args.initial_budget_mib * 1024 * 1024)
+            ),
+            probeep_nic_line_rate_gbps=args.nic_line_rate_gbps,
+            probeep_target_overlap_ratio=args.target_overlap_ratio,
             gate_provider=create_gate_provider(
-                "raw_receive_cdf",
+                args.gate_provider,
                 seed=args.gate_seed,
+                rank_alpha=args.gate_rank_alpha,
+                local_alpha=args.gate_local_alpha,
+                target_rank_imbalance=args.gate_target_rank_imbalance,
+                fast_skew=args.gate_fast_skew,
                 raw_placement_json=RAW_PLACEMENT,
                 layer_map=layer_map,
             ),
@@ -865,7 +954,13 @@ def main() -> int:
         ),
         cost_model=cost_model,
     )
-    controller = ProbeNICController(NUM_RANKS, CONTROLLER_CONFIG)
+    controller_config = ProbeNICControllerConfig(
+        initial_budget_bytes=int(round(args.initial_budget_mib * 1024 * 1024)),
+        nic_line_rate_gbps=args.nic_line_rate_gbps,
+        target_overlap_ratio=args.target_overlap_ratio,
+    )
+    controller = ProbeNICController(NUM_RANKS, controller_config)
+    fixed_budget = (controller_config.initial_budget_bytes,) * NUM_RANKS
     emitter = DynamicDagEmitter(workload_dir, NUM_RANKS)
     first = builder.build_next_layer({
         0: controller.budgets_for("attention"),
@@ -882,7 +977,13 @@ def main() -> int:
         observations=probeep_weight_dispatch_observations(builder.graph, 0),
     )
 
-    command = _command(workload_dir, simulation_dir, mode.simulation_end_us)
+    command = _command(
+        workload_dir,
+        simulation_dir,
+        mode.simulation_end_us,
+        args.nic_line_rate_gbps,
+        topology,
+    )
     env = os.environ.copy()
     env["HTSIM_LINK_LOAD_SAMPLE"] = "1"
     env["HTSIM_LINK_LOAD_SAMPLE_US"] = str(mode.link_sample_us)
@@ -949,6 +1050,8 @@ def main() -> int:
             "global_adjustment_factor": update.global_adjustment_factor,
             "network_bottleneck_ranks": list(update.bottleneck_ranks),
             "controller_update": update.manifest(),
+            "controller_mode": args.controller_mode,
+            "controller_applied": args.controller_mode == "feedback",
         }
         records.append(record)
         layer, micro_batch = divmod(observation_id, 2)
@@ -960,10 +1063,15 @@ def main() -> int:
             continue
 
         previous = builder.layer_results[layer]
-        current: IncrementalLayerResult = builder.build_next_layer({
-            0: controller.budgets_for("attention"),
-            1: controller.budgets_for("moe"),
-        })
+        next_budgets = (
+            {
+                0: controller.budgets_for("attention"),
+                1: controller.budgets_for("moe"),
+            }
+            if args.controller_mode == "feedback"
+            else {0: fixed_budget, 1: fixed_budget}
+        )
+        current: IncrementalLayerResult = builder.build_next_layer(next_budgets)
         current_keys = tuple(
             key
             for key in current.new_task_keys
@@ -1020,7 +1128,11 @@ def main() -> int:
         dones=dones,
         dispatch_records=records,
         combine_records=combine_records,
-        require_remote_migration=args.full,
+        require_remote_migration=(
+            args.full and args.controller_mode == "feedback"
+        ),
+        controller_mode=args.controller_mode,
+        fixed_budget=fixed_budget,
     )
     metadata["dynamic_dag"]["runtime_validation"] = runtime_validation
     emitter.finalize(graph_name=model.name, metadata=metadata)
@@ -1030,6 +1142,7 @@ def main() -> int:
         "# ProbeEP 动态 DAG 测试\n\n"
         f"- 模式：`{mode.name}`，{mode.tokens_per_rank} tokens/rank。\n"
         f"- 层数：{args.num_layers}；Dispatch observations：{len(records)}。\n"
+        f"- controller：`{args.controller_mode}`；NIC：{args.nic_line_rate_gbps:g} Gbps。\n"
         "- HTSim 进程数：1；EventList 和网络/CC 状态未重置。\n"
         f"- append 批次：{args.num_layers}；`DAG_SUMMARY` 数量：1。\n"
         f"- makespan：{float(summary_match.group(1)):.3f} us。\n"
@@ -1048,8 +1161,16 @@ def main() -> int:
                 "mode": asdict(mode),
                 "num_layers": args.num_layers,
                 "gate_layer_map": layer_map,
+                "gate_provider": args.gate_provider,
+                "gate_seed": args.gate_seed,
                 "hardware": hardware,
+                "topology": asdict(topology),
+                "topk": args.topk,
                 "htsim_process_count": 1,
+                "controller_mode": args.controller_mode,
+                "controller_config": asdict(controller_config),
+                "weight_chunk_bytes": args.weight_chunk_bytes,
+                "expert_weight_scale": args.expert_weight_scale,
             },
             ensure_ascii=False,
             indent=2,
@@ -1057,11 +1178,37 @@ def main() -> int:
         ) + "\n",
         encoding="utf-8",
     )
+    summary = {
+        "status": "passed",
+        "mode": mode.name,
+        "hardware": hardware,
+        "num_layers": args.num_layers,
+        "tokens_per_rank_per_microbatch": mode.tokens_per_rank,
+        "gate_provider": args.gate_provider,
+        "gate_seed": args.gate_seed,
+        "gate_layer_map": list(layer_map) if layer_map is not None else None,
+        "controller_mode": args.controller_mode,
+        "controller_config": asdict(controller_config),
+        "nic_line_rate_gbps": args.nic_line_rate_gbps,
+        "topology": asdict(topology),
+        "topk": args.topk,
+        "weight_chunk_bytes": args.weight_chunk_bytes,
+        "expert_weight_scale": args.expert_weight_scale,
+        "makespan_us": float(summary_match.group(1)),
+        "task_count": len(emitter.task_ids),
+        "dispatch_observation_count": len(records),
+        "remote_replica_count": runtime_validation["remote_replica_count"],
+        "runtime_validation": runtime_validation,
+    }
+    (run_dir / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     if not args.skip_visualizations:
         run_visualizations(
             run_dir, workload_dir, log_path, "probeep_dynamic", mode,
-            args.num_layers,
+            args.num_layers, topology,
         )
         _write_dashboard(
             run_dir / "probeep_dynamic_dashboard.html",

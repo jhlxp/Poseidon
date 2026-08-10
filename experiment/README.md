@@ -1,129 +1,79 @@
-# AE 实验复现目录规范
+# ProbeEP 实验
 
-本目录用于放置论文/报告中每一张图对应的可复现实验材料。组织原则是：
-每张图一个独立目录，目录内包含一键运行脚本、实验日志、最终图片、画图代码和该图的复现说明。
-AE 审查时可以只进入目标 `Fig_xx/` 目录，运行其中的 `bash/run.sh` 并检查生成的 log 与图。
+这里的 `Fig_XX` 表示一类 evaluation experiment，不表示一张单独的图。每个类型从多个
+角度回答同一个系统问题，并由一个 `plot.py` 生成 `fig_xxa`、`fig_xxb`、`fig_xxc` 等
+子结果。完整实验思想见 `experiment/实验大纲.md`。
 
-## 目录结构
+## Base Case
+
+所有实验默认从 `markdown/14_专用测试拓扑-EP32-1Plane.md` 定义的完整 EP32/1Plane
+prefill/训练 forward 配置出发，Gate 语义遵守
+`markdown/17_Gate分布与Routing生成.md`。已完成的 H20/H100 五算法 Base Case 位于：
+
+```text
+test_logs/run_20260809_234100_h20_h100_2layer_5algo_full
+```
+
+每个敏感性实验只改变自己声明的一组因素。其余配置必须继承 Base Case，并在
+`data/metadata.json` 中记录差异。
+
+## 目录约定
 
 ```text
 experiment/
 ├── README.md
-├── Fig_01/
-│   ├── bash/
-│   │   └── run.sh
-│   ├── log/
-│   │   └── README.md
-│   ├── png/
-│   │   └── fig_01.png
-│   ├── pdf/
-│   │   └── fig_01.pdf
-│   ├── plot.py
-│   └── README.md
-├── Fig_02/
-│   ├── bash/
-│   │   └── run.sh
-│   ├── log/
-│   ├── png/
-│   ├── pdf/
-│   ├── plot.py
-│   └── README.md
-└── Fig_xx/
-    ├── bash/
-    │   └── run.sh
-    ├── log/
-    ├── png/
-    ├── pdf/
-    ├── plot.py
-    └── README.md
+├── 实验大纲.md
+├── common/
+│   ├── collect_results.py
+│   ├── package_artifacts.py
+│   ├── plotting.py
+│   └── run_helpers.sh
+└── Fig_XX_Experiment_Type/
+    ├── README.md          # 问题、控制变量、组内证据、解释边界
+    ├── bash/run.sh        # 该实验类型的完整 case matrix
+    ├── collect.py         # 类型专用数据提取；可选
+    └── plot.py            # 一次生成该类型的全部子结果
 ```
 
-## 每个 Fig 目录的内容
-
-| 文件/目录 | 作用 | AE 检查点 |
-|---|---|---|
-| `bash/run.sh` | 一键运行本图实验，完成仿真/统计/画图，并把 stdout/stderr 写入 `log/` | `bash bash/run.sh` 可以从干净状态重建该图 |
-| `log/` | 保存本实验运行日志、关键中间统计和错误信息 | 日志文件名包含日期或 case 名，能追踪每个子实验 |
-| `png/` | 保存本实验最终 PNG 结果图 | 图名与论文图号一致，例如 `fig_01.png` |
-| `pdf/` | 保存本实验最终 PDF 结果图 | 图名与论文图号一致，例如 `fig_01.pdf` |
-| `plot.py` | 本实验专用画图脚本，只依赖本目录或仓库内明确路径 | 重新执行后能覆盖生成 `png/` 与 `pdf/` 中的结果 |
-| `README.md` | 本实验说明，解释目标、命令、输入、输出和预期结果 | AE 不读源码也能知道如何复现和验证 |
-
-## `bash/run.sh` 约定
-
-每个 `bash/run.sh` 建议满足以下约定：
+运行入口统一为：
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FIG_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REPO_ROOT="$(cd "${FIG_DIR}/../.." && pwd)"
-
-mkdir -p "${FIG_DIR}/log" "${FIG_DIR}/png" "${FIG_DIR}/pdf"
-
-# 1. 生成或运行本图需要的实验。
-# 2. 将日志写入 "${FIG_DIR}/log/"。
-# 3. 调用 "${FIG_DIR}/plot.py" 生成 "${FIG_DIR}/png/" 和 "${FIG_DIR}/pdf/" 下的图。
+MODE=full bash experiment/Fig_XX_Experiment_Type/bash/run.sh
 ```
 
-建议脚本支持从仓库根目录或 `Fig_xx/` 目录内运行，所有输出路径都使用 `SCRIPT_DIR`
-或 `FIG_DIR` 作为锚点，避免 AE 因当前工作目录不同而复现失败。
+设置 `PLAN_ONLY=1` 只打印 case matrix，不启动仿真。`quick` 只用于检查执行链，不能进入
+论文；`full` 才能标记为 paper-eligible。本轮只构造脚本，没有执行这些入口。
 
-## 单图 `README.md` 模板
+## 输出约定
 
-每个 `Fig_xx/README.md` 建议使用以下结构：
+每次真实运行后生成：
 
-````markdown
-# Fig_XX: <图标题>
-
-## 目标
-
-说明本图验证的问题、对应论文/报告中的图号，以及主要对比对象。
-
-## 一键复现
-
-```bash
-bash bash/run.sh
+```text
+data/       # 绘图所需 CSV/JSON，长期保留
+png/        # 600 dpi PNG
+pdf/        # vector PDF
+artifact/   # source_runs.csv、logs.zip、html.zip
 ```
 
-## 输入与配置
+`data/` 不混放 HTML 或日志。命令日志和源运行日志进入 `logs.zip`；交互式页面进入
+`html.zip`。`source_runs.csv` 保存每个 case 对应的原始 `test_logs/run_*`，保证结果可追溯。
 
-- workload:
-- topology:
-- algorithm/case:
-- key parameters:
+## 绘图规范
 
-## 输出
+- `figsize=(5, 4)`，不设置 title；
+- PNG 600 dpi，同时输出 PDF；
+- `bbox_inches="tight"`，`pad_inches=0.02`；
+- 字体优先 Arial，缺失时回退 Times New Roman；
+- label 22 pt，tick 19 pt，legend 20 pt；
+- legend 放不进主图时单独输出 `legend.png` 和 `legend.pdf`；
+- 画图脚本只能消费 `data/`，禁止内置论文数字或生成随机趋势。
 
-- log: `log/<日志文件>`
-- png: `png/fig_xx.png`
-- pdf: `pdf/fig_xx.pdf`
+## 证据边界
 
-## 预期结果
+- `simulation`：HTSim/DAG 的 packet-level 执行结果；
+- `trace_analysis`：对 Gate 或既有仿真 artifact 的统计；
+- `analytical_model`：解释 break-even 区域，不代替端到端结果；
+- `reference_planner`：Python reference implementation 的结构与开销，不代表 prototype。
 
-说明 AE 应该检查的趋势、数值范围或关键结论。
-
-## 备注
-
-记录运行时间、机器需求、随机种子、已知限制或可选的快速/完整模式。
-````
-
-## 命名建议
-
-- 图目录统一使用 `Fig_01`、`Fig_02`、`Fig_03` 这样的两位编号。
-- 最终图统一命名为 `png/fig_01.png`、`pdf/fig_01.pdf`，子图可使用
-  `png/fig_01a.png`、`pdf/fig_01a.pdf`。
-- 日志建议命名为 `run.log`、`simulation.log`、`plot.log`，多 case 可使用
-  `case_name.log`。
-- 如果某张图有多个仿真 case，可以在 `Fig_xx/` 下增加 `data/` 或 `cases/`，
-  但最终 AE 入口仍保持为 `bash/run.sh`。
-
-## AE 审查流程
-
-1. 进入目标图目录：`cd experiment/Fig_XX`
-2. 运行一键脚本：`bash bash/run.sh`
-3. 检查 `log/` 中是否有完整运行日志且无异常退出。
-4. 检查 `png/` 与 `pdf/` 中是否生成对应结果图。
-5. 阅读本图 `README.md`，确认结果趋势与预期结果一致。
+当前端到端模型是 forward path。backward、梯度归并、HBM 容量和真实 kernel contention
+必须由 Prototype 补证，不能从仿真结果外推。

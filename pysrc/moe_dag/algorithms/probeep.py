@@ -463,6 +463,7 @@ class ProbeEPConfig:
     chunk_tokens: int = 128
     route_chunk_tokens: int = 128
     weight_chunk_bytes: int = 4 * 1024 * 1024
+    expert_weight_scale: float = 1.0
     overlap_expert_compute: bool = True
     payload_metadata_sample_limit: int = 8
     nic_controller: ProbeNICControllerConfig = ProbeNICControllerConfig()
@@ -476,6 +477,11 @@ class ProbeEPConfig:
             raise ValidationError("route_chunk_tokens must be positive")
         if self.weight_chunk_bytes <= 0:
             raise ValidationError("weight_chunk_bytes must be positive")
+        if (
+            not isfinite(self.expert_weight_scale)
+            or self.expert_weight_scale <= 0
+        ):
+            raise ValidationError("expert_weight_scale must be positive")
         if self.payload_metadata_sample_limit < 0:
             raise ValidationError(
                 "payload_metadata_sample_limit must be non-negative"
@@ -941,7 +947,7 @@ class ProbeEPBuilder:
                 key,
                 prefetch.source_rank,
                 prefetch.destination_rank,
-                invocation.expert_weight_bytes,
+                self._expert_weight_bytes(invocation),
                 "expert_weight_prefetch",
                 f"{invocation.invocation_id}:probe:local_prefetch",
                 predecessors=predecessors,
@@ -1274,6 +1280,10 @@ class ProbeEPBuilder:
                 ],
                 "route_chunk_tokens": self.config.route_chunk_tokens,
                 "weight_chunk_bytes": self.config.weight_chunk_bytes,
+                "expert_weight_scale": self.config.expert_weight_scale,
+                "effective_expert_weight_bytes": self._expert_weight_bytes(
+                    invocation
+                ),
                 "token_padding": self.config.token_padding,
                 "scale_out_transport": "deepep_hierarchical",
                 "token_payload_policy": {
@@ -1730,7 +1740,7 @@ class ProbeEPBuilder:
         next_rx = list(assigned_rx)
         next_pair_load = list(pair_load)
         chunks: list[WeightChunkPlan] = []
-        remaining = invocation.expert_weight_bytes
+        remaining = self._expert_weight_bytes(invocation)
         offset = 0
         while remaining:
             chunk_bytes = min(self.config.weight_chunk_bytes, remaining)
@@ -1981,6 +1991,15 @@ class ProbeEPBuilder:
             overlaps_communication=self.config.overlap_expert_compute,
             token_count=1,
         ).duration_us
+
+    def _expert_weight_bytes(self, invocation: MoEInvocation) -> int:
+        return max(
+            1,
+            int(ceil(
+                invocation.expert_weight_bytes
+                * self.config.expert_weight_scale
+            )),
+        )
 
     @staticmethod
     def _compute_reference_times(
